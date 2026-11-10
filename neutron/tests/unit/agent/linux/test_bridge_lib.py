@@ -15,9 +15,12 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import mock
+from unittest import mock
+
+from oslo_utils import netutils
 
 from neutron.agent.linux import bridge_lib
+from neutron.privileged.agent.linux import ip_lib as priv_lib
 from neutron.tests import base
 
 
@@ -28,32 +31,58 @@ class BridgeLibTest(base.BaseTestCase):
     _IF_NAME = 'test-if'
 
     def setUp(self):
-        super(BridgeLibTest, self).setUp()
+        super().setUp()
+        mock.patch.object(netutils, 'is_ipv6_enabled',
+                          return_value=True).start()
         ip_wrapper = mock.patch('neutron.agent.linux.ip_lib.IPWrapper').start()
         self.execute = ip_wrapper.return_value.netns.execute
+        self.create_p = mock.patch.object(priv_lib, 'create_interface')
+        self.create = self.create_p.start()
+        self.delete_p = mock.patch.object(priv_lib, 'delete_interface')
+        self.delete = self.delete_p.start()
 
     def _verify_bridge_mock(self, cmd):
         self.execute.assert_called_once_with(cmd, run_as_root=True)
         self.execute.reset_mock()
 
-    def _test_br(self, namespace=None):
-        br = bridge_lib.BridgeDevice.addbr(self._BR_NAME, namespace)
-        self.assertEqual(namespace, br.namespace)
-        self._verify_bridge_mock(['brctl', 'addbr', self._BR_NAME])
+    def _verify_bridge_sysctl_mock(self, cmd):
+        self.execute.assert_called_once_with(cmd, run_as_root=True,
+                                             log_fail_as_error=True)
+        self.execute.reset_mock()
 
-        br.addif(self._IF_NAME)
-        self._verify_bridge_mock(
-            ['brctl', 'addif', self._BR_NAME, self._IF_NAME])
+    def test_is_bridged_interface(self):
+        def exists(path):
+            return path == "/sys/class/net/tapOK/brport"
+        with mock.patch('os.path.exists', side_effect=exists):
+            self.assertTrue(bridge_lib.is_bridged_interface("tapOK"))
+            self.assertFalse(bridge_lib.is_bridged_interface("tapKO"))
 
-        br.delif(self._IF_NAME)
-        self._verify_bridge_mock(
-            ['brctl', 'delif', self._BR_NAME, self._IF_NAME])
+    def test_get_interface_bridge(self):
+        with mock.patch('os.readlink', side_effect=["prefix/br0", OSError()]):
+            br = bridge_lib.BridgeDevice.get_interface_bridge('tap0')
+            self.assertIsInstance(br, bridge_lib.BridgeDevice)
+            self.assertEqual("br0", br.name)
 
-        br.delbr()
-        self._verify_bridge_mock(['brctl', 'delbr', self._BR_NAME])
+            br = bridge_lib.BridgeDevice.get_interface_bridge('tap0')
+            self.assertIsNone(br)
 
-    def test_addbr_with_namespace(self):
-        self._test_br(self._NAMESPACE)
+    def test_addbr_exists(self):
+        self.create.side_effect = priv_lib.InterfaceAlreadyExists
+        bridge_lib.BridgeDevice.addbr(self._BR_NAME)
+        bridge_lib.BridgeDevice.addbr(self._BR_NAME)
 
-    def test_addbr_without_namespace(self):
-        self._test_br()
+    def test_owns_interface(self):
+        br = bridge_lib.BridgeDevice('br-int')
+
+        def exists(path):
+            return path == "/sys/class/net/br-int/brif/abc"
+        with mock.patch('os.path.exists', side_effect=exists):
+            self.assertTrue(br.owns_interface("abc"))
+            self.assertFalse(br.owns_interface("def"))
+
+    def test_get_interfaces(self):
+        br = bridge_lib.BridgeDevice('br-int')
+        interfaces = ["tap1", "tap2"]
+        with mock.patch('os.listdir', side_effect=[interfaces, OSError()]):
+            self.assertEqual(interfaces, br.get_interfaces())
+            self.assertEqual([], br.get_interfaces())

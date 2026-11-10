@@ -13,40 +13,36 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import errno
-import fcntl
 import glob
 import grp
+from http import client as httplib
 import os
 import pwd
 import shlex
 import socket
-import struct
-import tempfile
+import socketserver
+import subprocess
 import threading
+import time
 
-import eventlet
-from eventlet.green import subprocess
-from eventlet import greenthread
+from neutron_lib import exceptions
+from neutron_lib.utils import helpers
 from oslo_config import cfg
 from oslo_log import log as logging
-from oslo_log import loggers
 from oslo_rootwrap import client
+from oslo_utils import encodeutils
 from oslo_utils import excutils
-from six.moves import http_client as httplib
+from oslo_utils import fileutils
+import psutil
 
-from neutron.agent.common import config
-from neutron.common import constants
 from neutron.common import utils
-from neutron.i18n import _LE
-from neutron import wsgi
-
+from neutron.conf.agent import common as config
+from neutron.privileged.agent.linux import utils as priv_utils
 
 LOG = logging.getLogger(__name__)
-config.register_root_helper(cfg.CONF)
 
 
-class RootwrapDaemonHelper(object):
+class RootwrapDaemonHelper:
     __client = None
     __lock = threading.Lock()
 
@@ -64,7 +60,7 @@ class RootwrapDaemonHelper(object):
 
 
 def addl_env_args(addl_env):
-    """Build arugments for adding additional environment vars with env"""
+    """Build arguments for adding additional environment vars with env"""
 
     # NOTE (twilson) If using rootwrap, an EnvFilter should be set up for the
     # command instead of a CommandFilter.
@@ -79,20 +75,35 @@ def create_process(cmd, run_as_root=False, addl_env=None):
     The return value will be a tuple of the process object and the
     list of command arguments used to create it.
     """
-    cmd = map(str, addl_env_args(addl_env) + cmd)
+    cmd = list(map(str, addl_env_args(addl_env) + cmd))
     if run_as_root:
+        # NOTE(ralonsoh): to be removed once the migration to privsep
+        # execution is done.
         cmd = shlex.split(config.get_root_helper(cfg.CONF)) + cmd
     LOG.debug("Running command: %s", cmd)
-    obj = utils.subprocess_popen(cmd, shell=False,
-                                 stdin=subprocess.PIPE,
-                                 stdout=subprocess.PIPE,
-                                 stderr=subprocess.PIPE)
-
+    # pylint: disable=consider-using-with
+    obj = subprocess.Popen(  # noqa: S603
+        cmd,
+        shell=False,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE
+    )
     return obj, cmd
 
 
+def _execute_process(cmd, _process_input, addl_env, run_as_root):
+    obj, cmd = create_process(cmd, run_as_root=run_as_root, addl_env=addl_env)
+    _stdout, _stderr = obj.communicate(_process_input)
+    returncode = obj.returncode
+    obj.stdin.close()
+    _stdout = helpers.safe_decode_utf8(_stdout)
+    _stderr = helpers.safe_decode_utf8(_stderr)
+    return _stdout, _stderr, returncode
+
+
 def execute_rootwrap_daemon(cmd, process_input, addl_env):
-    cmd = map(str, addl_env_args(addl_env) + cmd)
+    cmd = list(map(str, addl_env_args(addl_env) + cmd))
     # NOTE(twilson) oslo_rootwrap.daemon will raise on filter match
     # errors, whereas oslo_rootwrap.cmd converts them to return codes.
     # In practice, no neutron code should be trying to execute something that
@@ -100,137 +111,166 @@ def execute_rootwrap_daemon(cmd, process_input, addl_env):
     # just logging the execution error.
     LOG.debug("Running command (rootwrap daemon): %s", cmd)
     client = RootwrapDaemonHelper.get_client()
-    return client.execute(cmd, process_input)
+    try:
+        returncode, _stdout, _stderr = client.execute(cmd, process_input)
+    except Exception:
+        with excutils.save_and_reraise_exception():
+            LOG.error("Rootwrap error running command: %s", cmd)
+
+    _stdout = helpers.safe_decode_utf8(_stdout)
+    _stderr = helpers.safe_decode_utf8(_stderr)
+    return _stdout, _stderr, returncode
 
 
 def execute(cmd, process_input=None, addl_env=None,
             check_exit_code=True, return_stderr=False, log_fail_as_error=True,
-            extra_ok_codes=None, run_as_root=False):
+            extra_ok_codes=None, run_as_root=False, privsep_exec=False):
     try:
-        if run_as_root and cfg.CONF.AGENT.root_helper_daemon:
-            returncode, _stdout, _stderr = (
-                execute_rootwrap_daemon(cmd, process_input, addl_env))
+        if process_input is not None:
+            _process_input = encodeutils.to_utf8(process_input)
         else:
-            obj, cmd = create_process(cmd, run_as_root=run_as_root,
-                                      addl_env=addl_env)
-            _stdout, _stderr = obj.communicate(process_input)
-            returncode = obj.returncode
-            obj.stdin.close()
+            _process_input = None
 
-        m = _("\nCommand: {cmd}\nExit code: {code}\nStdin: {stdin}\n"
-              "Stdout: {stdout}\nStderr: {stderr}").format(
-                  cmd=cmd,
-                  code=returncode,
-                  stdin=process_input or '',
-                  stdout=_stdout,
-                  stderr=_stderr)
+        if run_as_root and privsep_exec:
+            _stdout, _stderr, returncode = priv_utils.execute_process(
+                cmd, _process_input, addl_env)
+        elif run_as_root and cfg.CONF.AGENT.root_helper_daemon:
+            _stdout, _stderr, returncode = execute_rootwrap_daemon(
+                cmd, process_input, addl_env)
+        else:
+            _stdout, _stderr, returncode = _execute_process(
+                cmd, _process_input, addl_env, run_as_root)
 
         extra_ok_codes = extra_ok_codes or []
-        if returncode and returncode in extra_ok_codes:
-            returncode = None
+        if returncode and returncode not in extra_ok_codes:
+            msg = ("Exit code: %(returncode)d; "
+                   "Cmd: %(cmd)s; "
+                   "Stdin: %(stdin)s; "
+                   "Stdout: %(stdout)s; "
+                   "Stderr: %(stderr)s" % {
+                       'returncode': returncode,
+                       'cmd': cmd,
+                       'stdin': process_input or '',
+                       'stdout': _stdout,
+                       'stderr': _stderr})
 
-        if returncode and log_fail_as_error:
-            LOG.error(m)
-        else:
-            LOG.debug(m)
-
-        if returncode and check_exit_code:
-            raise RuntimeError(m)
+            if log_fail_as_error:
+                LOG.error(msg)
+            if check_exit_code:
+                raise exceptions.ProcessExecutionError(msg,
+                                                       returncode=returncode)
     finally:
         # NOTE(termie): this appears to be necessary to let the subprocess
         #               call clean something up in between calls, without
         #               it two execute calls in a row hangs the second one
-        greenthread.sleep(0)
+        time.sleep(0)
 
     return (_stdout, _stderr) if return_stderr else _stdout
 
 
-def get_interface_mac(interface):
-    MAC_START = 18
-    MAC_END = 24
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    info = fcntl.ioctl(s.fileno(), 0x8927,
-        struct.pack('256s', interface[:constants.DEVICE_NAME_MAX_LEN]))
-    return ''.join(['%02x:' % ord(char)
-                    for char in info[MAC_START:MAC_END]])[:-1]
+def find_child_pids(pid, recursive=False):
+    """Retrieve a list of the pids of child processes of the given pid.
 
-
-def replace_file(file_name, data):
-    """Replaces the contents of file_name with data in a safe manner.
-
-    First write to a temp file and then rename. Since POSIX renames are
-    atomic, the file is unlikely to be corrupted by competing writes.
-
-    We create the tempfile on the same device to ensure that it can be renamed.
+    It can also find all children through the hierarchy if recursive=True
     """
-
-    base_dir = os.path.dirname(os.path.abspath(file_name))
-    tmp_file = tempfile.NamedTemporaryFile('w+', dir=base_dir, delete=False)
-    tmp_file.write(data)
-    tmp_file.close()
-    os.chmod(tmp_file.name, 0o644)
-    os.rename(tmp_file.name, file_name)
-
-
-def find_child_pids(pid):
-    """Retrieve a list of the pids of child processes of the given pid."""
-
     try:
-        raw_pids = execute(['ps', '--ppid', pid, '-o', 'pid='],
-                           log_fail_as_error=False)
-    except RuntimeError as e:
-        # Unexpected errors are the responsibility of the caller
-        with excutils.save_and_reraise_exception() as ctxt:
-            # Exception has already been logged by execute
-            no_children_found = 'Exit code: 1' in str(e)
-            if no_children_found:
-                ctxt.reraise = False
-                return []
-    return [x.strip() for x in raw_pids.split('\n') if x.strip()]
+        process = psutil.Process(pid=int(pid))
+    except psutil.NoSuchProcess:
+        return []
+
+    child_pids = [str(p.pid) for p in process.children()]
+    if recursive:
+        for child in child_pids:
+            child_pids += find_child_pids(child, recursive=True)
+    return child_pids
 
 
-def ensure_dir(dir_path):
-    """Ensure a directory with 755 permissions mode."""
+def pgrep(
+        command: str,
+        entire_command_line: bool = True
+) -> str | None:
+    cmd = ['pgrep']
+    if entire_command_line:
+        cmd += ['-f']
+    cmd += [command]
     try:
-        os.makedirs(dir_path, 0o755)
-    except OSError as e:
-        # If the directory already existed, don't raise the error.
-        if e.errno != errno.EEXIST:
+        result = execute(cmd).strip()
+    except exceptions.ProcessExecutionError:
+        return None
+
+    return result if result else None
+
+
+def find_parent_pid(pid):
+    """Retrieve the pid of the parent process of the given pid.
+
+    If the pid doesn't exist in the system, this function will return
+    None
+    """
+    process = psutil.Process(pid=int(pid))
+    if process:
+        return str(process.parent().pid)
+    return None
+
+
+def get_process_count_by_name(name):
+    """Find the process count by name."""
+    return len([p for p in psutil.process_iter(['name']) if
+                p.info['name'] == name])
+
+
+def find_fork_top_parent(pid):
+    """Retrieve the pid of the top parent of the given pid through a fork.
+
+    This function will search the top parent with its same cmdline. If the
+    given pid has no parent, its own pid will be returned
+    """
+    while True:
+        ppid = find_parent_pid(pid)
+        if (ppid and ppid != pid and
+                pid_invoked_with_cmdline(ppid, get_cmdline_from_pid(pid))):
+            pid = ppid
+        else:
+            return pid
+
+
+def kill_process(pid, signal, run_as_root=False):
+    """Kill the process with the given pid using the given signal."""
+    try:
+        execute(['kill', '-%d' % signal, pid], run_as_root=run_as_root,
+                privsep_exec=True)
+    except exceptions.ProcessExecutionError:
+        if process_is_running(pid):
             raise
 
 
 def _get_conf_base(cfg_root, uuid, ensure_conf_dir):
-    #TODO(mangelajo): separate responsibilities here, ensure_conf_dir
-    #                 should be a separate function
+    # TODO(mangelajo): separate responsibilities here, ensure_conf_dir
+    #                  should be a separate function
     conf_dir = os.path.abspath(os.path.normpath(cfg_root))
     conf_base = os.path.join(conf_dir, uuid)
     if ensure_conf_dir:
-        ensure_dir(conf_dir)
+        fileutils.ensure_tree(conf_dir, mode=0o755)
     return conf_base
 
 
 def get_conf_file_name(cfg_root, uuid, cfg_file, ensure_conf_dir=False):
     """Returns the file name for a given kind of config file."""
     conf_base = _get_conf_base(cfg_root, uuid, ensure_conf_dir)
-    return "%s.%s" % (conf_base, cfg_file)
+    return f"{conf_base}.{cfg_file}"
 
 
 def get_value_from_file(filename, converter=None):
 
     try:
-        with open(filename, 'r') as f:
+        with open(filename) as f:
             try:
                 return converter(f.read()) if converter else f.read()
             except ValueError:
-                LOG.error(_LE('Unable to convert value in %s'), filename)
-    except IOError:
-        LOG.debug('Unable to access %s', filename)
-
-
-def get_value_from_conf_file(cfg_root, uuid, cfg_file, converter=None):
-    """A helper function to read a value from one of a config file."""
-    file_name = get_conf_file_name(cfg_root, uuid, cfg_file)
-    return get_value_from_file(file_name, converter)
+                LOG.error('Unable to convert value in %s', filename)
+    except OSError as error:
+        LOG.debug('Unable to access %(filename)s; Error: %(error)s',
+                  {'filename': filename, 'error': error})
 
 
 def remove_conf_files(cfg_root, uuid):
@@ -239,15 +279,15 @@ def remove_conf_files(cfg_root, uuid):
         os.unlink(file_path)
 
 
-def get_root_helper_child_pid(pid, run_as_root=False):
-    """
-    Get the lowest child pid in the process hierarchy
+def get_root_helper_child_pid(pid, expected_cmd, run_as_root=False):
+    """Get the first non root_helper child pid in the process hierarchy.
 
     If root helper was used, two or more processes would be created:
 
      - a root helper process (e.g. sudo myscript)
      - possibly a rootwrap script (e.g. neutron-rootwrap)
      - a child process (e.g. myscript)
+     - possibly its child processes
 
     Killing the root helper process will leave the child process
     running, re-parented to init, so the only way to ensure that both
@@ -255,18 +295,17 @@ def get_root_helper_child_pid(pid, run_as_root=False):
     """
     pid = str(pid)
     if run_as_root:
-        try:
-            pid = find_child_pids(pid)[0]
-        except IndexError:
-            # Process is already dead
-            return None
         while True:
             try:
                 # We shouldn't have more than one child per process
                 # so keep getting the children of the first one
                 pid = find_child_pids(pid)[0]
             except IndexError:
-                # Last process in the tree, return it
+                return  # We never found the child pid with expected_cmd
+
+            # If we've found a pid with no root helper, return it.
+            # If we continue, we can find transient children.
+            if pid_invoked_with_cmdline(pid, expected_cmd):
                 break
     return pid
 
@@ -286,14 +325,44 @@ def remove_abs_path(cmd):
     return cmd
 
 
+def process_is_running(pid):
+    """Find if the given PID is running in the system.
+
+    """
+    return pid and os.path.exists('/proc/%s' % pid)
+
+
 def get_cmdline_from_pid(pid):
-    if pid is None or not os.path.exists('/proc/%s' % pid):
+    if not process_is_running(pid):
         return []
-    with open('/proc/%s/cmdline' % pid, 'r') as f:
-        return f.readline().split('\0')[:-1]
+    # NOTE(jh): Even after the above check, the process may terminate
+    # before the open below happens
+    try:
+        with open('/proc/%s/cmdline' % pid) as f:
+            cmdline = f.readline().split('\0')[:-1]
+    except OSError:
+        return []
+
+    # NOTE(slaweq): sometimes it may happen that values in
+    # /proc/{pid}/cmdline are separated by space instead of NUL char,
+    # in such case we would have everything in one element of cmdline_args
+    # list and it would not match to expected cmd so we need to try to
+    # split it by spaces
+    if len(cmdline) == 1:
+        cmdline = cmdline[0].split(' ')
+
+    LOG.debug("Found cmdline %s for process with PID %s.", cmdline, pid)
+    return cmdline
 
 
-def cmd_matches_expected(cmd, expected_cmd):
+def cmd_matches_expected(cmd, expected_cmd, process_name):
+    if process_name and cmd and cmd[0] == process_name:
+        # If Neutron has defined the title (setproctitle) of the running
+        # process, the "ps" output will be "<process_name> (cmd)"
+        cmd = cmd[1:]
+        cmd[0] = cmd[0].strip('(')
+        cmd[-1] = cmd[-1].strip(')')
+
     abs_cmd = remove_abs_path(cmd)
     abs_expected_cmd = remove_abs_path(expected_cmd)
     if abs_cmd != abs_expected_cmd:
@@ -304,28 +373,12 @@ def cmd_matches_expected(cmd, expected_cmd):
     return abs_cmd == abs_expected_cmd
 
 
-def pid_invoked_with_cmdline(pid, expected_cmd):
+def pid_invoked_with_cmdline(pid, expected_cmd, process_name=None):
     """Validate process with given pid is running with provided parameters
 
     """
     cmd = get_cmdline_from_pid(pid)
-    return cmd_matches_expected(cmd, expected_cmd)
-
-
-def wait_until_true(predicate, timeout=60, sleep=1, exception=None):
-    """
-    Wait until callable predicate is evaluated as True
-
-    :param predicate: Callable deciding whether waiting should continue.
-    Best practice is to instantiate predicate with functools.partial()
-    :param timeout: Timeout in seconds how long should function wait.
-    :param sleep: Polling interval for results in seconds.
-    :param exception: Exception class for eventlet.Timeout.
-    (see doc for eventlet.Timeout for more information)
-    """
-    with eventlet.timeout.Timeout(timeout, exception):
-        while not predicate():
-            eventlet.sleep(sleep)
+    return cmd_matches_expected(cmd, expected_cmd, process_name)
 
 
 def ensure_directory_exists_without_file(path):
@@ -338,7 +391,7 @@ def ensure_directory_exists_without_file(path):
                 if not os.path.exists(path):
                     ctxt.reraise = False
     else:
-        ensure_dir(dirname)
+        fileutils.ensure_tree(dirname, mode=0o755)
 
 
 def is_effective_user(user_id_or_name):
@@ -359,8 +412,29 @@ def is_effective_group(group_id_or_name):
     return group_id_or_name == effective_group_name
 
 
+def delete_if_exists(path, run_as_root=False):
+    """Delete a path, executed as normal user or with elevated privileges"""
+    if run_as_root:
+        priv_utils.delete_if_exists(path)
+    else:
+        fileutils.delete_if_exists(path)
+
+
+def read_if_exists(path: str, run_as_root=False) -> str:
+    """Return the content of a text file as a string
+
+    The output includes the empty lines too. If the file does not exist,
+    returns an empty string.
+    It could be called with elevated permissions (root).
+    """
+    if run_as_root:
+        return priv_utils.read_file(path)
+    return utils.read_file(path)
+
+
 class UnixDomainHTTPConnection(httplib.HTTPConnection):
     """Connection class for HTTP over UNIX domain socket."""
+
     def __init__(self, host, port=None, strict=None, timeout=None,
                  proxy_info=None):
         httplib.HTTPConnection.__init__(self, host, port, strict)
@@ -374,36 +448,34 @@ class UnixDomainHTTPConnection(httplib.HTTPConnection):
         self.sock.connect(self.socket_path)
 
 
-class UnixDomainHttpProtocol(eventlet.wsgi.HttpProtocol):
-    def __init__(self, request, client_address, server):
-        if client_address == '':
-            client_address = ('<local>', 0)
-        # base class is old-style, so super does not work properly
-        eventlet.wsgi.HttpProtocol.__init__(self, request, client_address,
-                                            server)
-
-
-class UnixDomainWSGIServer(wsgi.Server):
-    def __init__(self, name):
-        self._socket = None
-        self._launcher = None
+class UnixDomainWSGIThreadServer:
+    def __init__(self, name, application, file_socket):
+        self._name = name
+        self._application = application
+        self._file_socket = file_socket
         self._server = None
-        super(UnixDomainWSGIServer, self).__init__(name)
 
-    def start(self, application, file_socket, workers, backlog, mode=None):
-        self._socket = eventlet.listen(file_socket,
-                                       family=socket.AF_UNIX,
-                                       backlog=backlog)
-        if mode is not None:
-            os.chmod(file_socket, mode)
+    def run(self):
+        self._server = socketserver.ThreadingUnixStreamServer(
+            self._file_socket, self._application)
 
-        self._launch(application, workers=workers)
+    def wait(self):
+        self._server.serve_forever()
 
-    def _run(self, application, socket):
-        """Start a WSGI service in a new green thread."""
-        logger = logging.getLogger('eventlet.wsgi.server')
-        eventlet.wsgi.server(socket,
-                             application,
-                             max_size=self.num_threads,
-                             protocol=UnixDomainHttpProtocol,
-                             log=loggers.WritableLogger(logger))
+
+def get_attr(pyroute2_obj, attr_name):
+    """Get an attribute in a pyroute object
+
+    pyroute2 object attributes are stored under a key called 'attrs'. This key
+    contains a tuple of tuples. E.g.:
+      pyroute2_obj = {'attrs': (('TCA_KIND': 'htb'),
+                                ('TCA_OPTIONS': {...}))}
+
+    :param pyroute2_obj: (dict) pyroute2 object
+    :param attr_name: (string) first value of the tuple we are looking for
+    :return: (object) second value of the tuple, None if the tuple doesn't
+             exist
+    """
+    rule_attrs = pyroute2_obj.get('attrs', [])
+    for attr in (attr for attr in rule_attrs if attr[0] == attr_name):
+        return attr[1]

@@ -1,4 +1,3 @@
-# Copyright (c) 2013 Intel Corporation.
 # All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -13,82 +12,60 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from testtools import matchers
-from webob import exc
+from oslo_config import cfg
+import webob
 
-from neutron.api import api_common as common
+from neutron.api import api_common
 from neutron.tests import base
 
 
-class FakeController(common.NeutronController):
-    _resource_name = 'fake'
+class PrepareUrlTestCase(base.BaseTestCase):
+
+    def test_no_configured_prefix(self):
+        self.assertFalse(cfg.CONF.network_link_prefix)
+        requrl = 'http://neutron.example/sub/ports.json?test=1'
+        # should be unchanged
+        self.assertEqual(requrl, api_common.prepare_url(requrl))
+
+    def test_configured_prefix(self):
+        cfg.CONF.set_override('network_link_prefix', 'http://quantum.example')
+        requrl = 'http://neutron.example/sub/ports.json?test=1'
+        expected = 'http://quantum.example/sub/ports.json?test=1'
+        self.assertEqual(expected, api_common.prepare_url(requrl))
 
 
-class APICommonTestCase(base.BaseTestCase):
-    def setUp(self):
-        super(APICommonTestCase, self).setUp()
-        self.controller = FakeController(None)
+class GetPathUrlTestCase(base.BaseTestCase):
 
-    def test_prepare_request_body(self):
-        body = {
-            'fake': {
-                'name': 'terminator',
-                'model': 'T-800',
-            }
-        }
-        params = [
-            {'param-name': 'name',
-             'required': True},
-            {'param-name': 'model',
-             'required': True},
-            {'param-name': 'quote',
-             'required': False,
-             'default-value': "i'll be back"},
-        ]
-        expect = {
-            'fake': {
-                'name': 'terminator',
-                'model': 'T-800',
-                'quote': "i'll be back",
-            }
-        }
-        actual = self.controller._prepare_request_body(body, params)
-        self.assertThat(expect, matchers.Equals(actual))
+    def test_no_headers(self):
+        base_http_url = 'http://neutron.example/sub/ports.json'
+        base_https_url = 'https://neutron.example/sub/ports.json'
+        path = ''
 
-    def test_prepare_request_body_none(self):
-        body = None
-        params = [
-            {'param-name': 'quote',
-             'required': False,
-             'default-value': "I'll be back"},
-        ]
-        expect = {
-            'fake': {
-                'quote': "I'll be back",
-            }
-        }
-        actual = self.controller._prepare_request_body(body, params)
-        self.assertThat(expect, matchers.Equals(actual))
+        http_req = webob.Request.blank(path, base_url=base_http_url)
+        https_req = webob.Request.blank(path, base_url=base_https_url)
 
-    def test_prepare_request_body_keyerror(self):
-        body = {'t2': {}}
-        params = []
-        self.assertRaises(exc.HTTPBadRequest,
-                          self.controller._prepare_request_body,
-                          body,
-                          params)
+        # should be unchanged
+        self.assertEqual(base_http_url, api_common.get_path_url(http_req))
+        self.assertEqual(base_https_url, api_common.get_path_url(https_req))
 
-    def test_prepare_request_param_value_none(self):
-        body = {
-            'fake': {
-                'name': None,
-            }
-        }
-        params = [
-            {'param-name': 'name',
-             'required': True},
-        ]
-        self.assertRaises(exc.HTTPBadRequest,
-                          self.controller._prepare_request_body,
-                          body,
-                          params)
+    def test_http_to_https(self):
+        base_url = 'http://neutron.example/sub/ports.json'
+        path = ''
+
+        request = webob.Request.blank(
+            path, base_url=base_url, headers={'X-Forwarded-Proto': 'https'})
+
+        path_url = api_common.get_path_url(request)
+        # should replace http:// with https://
+        self.assertTrue(path_url.startswith("https://"))
+
+    def test_https_to_http(self):
+        base_url = 'https://neutron.example/sub/ports.json'
+        path = ''
+
+        request = webob.Request.blank(
+            path, base_url=base_url, headers={'X-Forwarded-Proto': 'http'})
+
+        path_url = api_common.get_path_url(request)
+        # should replace https:// with http://
+        self.assertTrue(path_url.startswith("http://"))

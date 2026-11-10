@@ -12,16 +12,16 @@
 
 from oslo_log import log as logging
 
+from neutron.agent.l3 import dvr_fip_ns
 from neutron.agent.l3 import dvr_snat_ns
 from neutron.agent.l3 import namespaces
 from neutron.agent.linux import external_process
 from neutron.agent.linux import ip_lib
-from neutron.i18n import _LE
 
 LOG = logging.getLogger(__name__)
 
 
-class NamespaceManager(object):
+class NamespaceManager:
 
     """Keeps track of namespaces that need to be cleaned up.
 
@@ -42,17 +42,22 @@ class NamespaceManager(object):
     agent restarts gracefully.
     """
 
-    def __init__(self, agent_conf, driver, clean_stale, metadata_driver=None):
+    ns_prefix_to_class_map = {
+        namespaces.NS_PREFIX: namespaces.RouterNamespace,
+        dvr_snat_ns.SNAT_NS_PREFIX: dvr_snat_ns.SnatNamespace,
+        dvr_fip_ns.FIP_NS_PREFIX: dvr_fip_ns.FipNamespace,
+    }
+
+    def __init__(self, agent_conf, driver, metadata_driver=None):
         """Initialize the NamespaceManager.
 
         :param agent_conf: configuration from l3 agent
         :param driver: to perform operations on devices
-        :param clean_stale: Whether to try to clean stale namespaces
         :param metadata_driver: used to cleanup stale metadata proxy processes
         """
         self.agent_conf = agent_conf
         self.driver = driver
-        self._clean_stale = clean_stale
+        self._clean_stale = True
         self.metadata_driver = metadata_driver
         if metadata_driver:
             self.process_monitor = external_process.ProcessMonitor(
@@ -81,29 +86,15 @@ class NamespaceManager(object):
             _ns_prefix, ns_id = self.get_prefix_and_id(ns)
             if ns_id in self._ids_to_keep:
                 continue
-            if _ns_prefix == namespaces.NS_PREFIX:
-                ns = namespaces.RouterNamespace(ns_id,
-                                                self.agent_conf,
-                                                self.driver,
-                                                use_ipv6=False)
-            else:
-                ns = dvr_snat_ns.SnatNamespace(ns_id,
-                                               self.agent_conf,
-                                               self.driver,
-                                               use_ipv6=False)
-            try:
-                if self.metadata_driver:
-                    # cleanup stale metadata proxy processes first
-                    self.metadata_driver.destroy_monitored_metadata_proxy(
-                        self.process_monitor, ns_id, self.agent_conf)
-                ns.delete()
-            except RuntimeError:
-                LOG.exception(_LE('Failed to destroy stale namespace %s'), ns)
+            self._cleanup(_ns_prefix, ns_id)
 
         return True
 
     def keep_router(self, router_id):
         self._ids_to_keep.add(router_id)
+
+    def keep_ext_net(self, ext_net_id):
+        self._ids_to_keep.add(ext_net_id)
 
     def get_prefix_and_id(self, ns_name):
         """Get the prefix and id from the namespace name.
@@ -112,7 +103,7 @@ class NamespaceManager(object):
         :returns: tuple with prefix and id or None if no prefix matches
         """
         prefix = namespaces.get_prefix_from_ns_name(ns_name)
-        if prefix in (namespaces.NS_PREFIX, dvr_snat_ns.SNAT_NS_PREFIX):
+        if prefix in self.ns_prefix_to_class_map:
             identifier = namespaces.get_id_from_ns_name(ns_name)
             return (prefix, identifier)
 
@@ -123,11 +114,32 @@ class NamespaceManager(object):
     def list_all(self):
         """Get a set of all namespaces on host managed by this manager."""
         try:
-            root_ip = ip_lib.IPWrapper()
-
-            namespaces = root_ip.get_namespaces()
-            return set(ns for ns in namespaces if self.is_managed(ns))
+            namespaces = ip_lib.list_network_namespaces()
+            return {ns for ns in namespaces if self.is_managed(ns)}
         except RuntimeError:
-            LOG.exception(_LE('RuntimeError in obtaining namespace list for '
-                              'namespace cleanup.'))
+            LOG.exception('RuntimeError in obtaining namespace list for '
+                          'namespace cleanup.')
             return set()
+
+    def ensure_router_cleanup(self, router_id):
+        """Performs cleanup for a router"""
+        for ns in self.list_all():
+            if ns.endswith(router_id):
+                ns_prefix, ns_id = self.get_prefix_and_id(ns)
+                self._cleanup(ns_prefix, ns_id)
+
+    def ensure_snat_cleanup(self, router_id):
+        prefix = dvr_snat_ns.SNAT_NS_PREFIX
+        self._cleanup(prefix, router_id)
+
+    def _cleanup(self, ns_prefix, ns_id):
+        ns_class = self.ns_prefix_to_class_map[ns_prefix]
+        ns = ns_class(ns_id, self.agent_conf, self.driver, use_ipv6=False)
+        try:
+            if self.metadata_driver:
+                # cleanup stale metadata proxy processes first
+                self.metadata_driver.destroy_monitored_metadata_proxy(
+                    self.process_monitor, ns_id, self.agent_conf, ns.name)
+            ns.delete()
+        except RuntimeError:
+            LOG.exception('Failed to destroy stale namespace %s', ns)

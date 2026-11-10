@@ -16,32 +16,35 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import uuid
+from unittest import mock
 
-import mock
+from neutron_lib import fixture
 from oslo_config import cfg
+from oslo_utils import uuidutils
 from webob import exc
 import webtest
 
 from neutron.api import extensions
-from neutron.api.v2 import attributes
+from neutron.conf import quota as quota_conf
+from neutron import manager
 from neutron import quota
-from neutron.tests import tools
 from neutron.tests.unit.api import test_extensions
 from neutron.tests.unit.api.v2 import test_base
 from neutron.tests.unit import testlib_api
 
 
+CORE_PLUGIN = 'neutron.db.db_base_plugin_v2.NeutronDbPluginV2'
+
+
 class ExtensionTestCase(testlib_api.WebTestCase):
 
-    def _setUpExtension(self, plugin, service_type,
-                        resource_attribute_map, extension_class,
+    def setup_extension(self, plugin, service_type,
+                        extension_class,
                         resource_prefix, plural_mappings=None,
                         translate_resource_name=False,
                         allow_pagination=False, allow_sorting=False,
                         supported_extension_aliases=None,
-                        use_quota=False,
-                        ):
+                        use_quota=False):
 
         self._resource_prefix = resource_prefix
         self._plural_mappings = plural_mappings or {}
@@ -50,14 +53,13 @@ class ExtensionTestCase(testlib_api.WebTestCase):
         # Ensure existing ExtensionManager is not used
         extensions.PluginAwareExtensionManager._instance = None
 
-        self.useFixture(tools.AttributeMapMemento())
+        self.useFixture(fixture.APIDefinitionFixture())
 
         # Create the default configurations
         self.config_parse()
 
-        #just stubbing core plugin with plugin
-        self.setup_coreplugin(plugin)
-        cfg.CONF.set_override('core_plugin', plugin)
+        core_plugin = CORE_PLUGIN if service_type else plugin
+        self.setup_coreplugin(core_plugin, load_plugins=False)
         if service_type:
             cfg.CONF.set_override('service_plugins', [plugin])
 
@@ -66,33 +68,28 @@ class ExtensionTestCase(testlib_api.WebTestCase):
         instance = self.plugin.return_value
         if service_type:
             instance.get_plugin_type.return_value = service_type
+        manager.init()
+
         if supported_extension_aliases is not None:
             instance.supported_extension_aliases = supported_extension_aliases
         if allow_pagination:
-            cfg.CONF.set_override('allow_pagination', True)
             # instance.__native_pagination_support = True
             native_pagination_attr_name = ("_%s__native_pagination_support"
                                            % instance.__class__.__name__)
             setattr(instance, native_pagination_attr_name, True)
         if allow_sorting:
-            cfg.CONF.set_override('allow_sorting', True)
             # instance.__native_sorting_support = True
             native_sorting_attr_name = ("_%s__native_sorting_support"
                                         % instance.__class__.__name__)
             setattr(instance, native_sorting_attr_name, True)
         if use_quota:
             quota.QUOTAS._driver = None
-            cfg.CONF.set_override('quota_driver', 'neutron.quota.ConfDriver',
+            cfg.CONF.set_override('quota_driver', quota_conf.QUOTA_DB_DRIVER,
                                   group='QUOTAS')
+        setattr(instance, 'path_prefix', resource_prefix)
 
-        class ExtensionTestExtensionManager(object):
+        class ExtensionTestExtensionManager:
             def get_resources(self):
-                # Add the resources to the global attribute map
-                # This is done here as the setup process won't
-                # initialize the main API router which extends
-                # the global attribute map
-                attributes.RESOURCE_ATTRIBUTE_MAP.update(
-                    resource_attribute_map)
                 return extension_class.get_resources()
 
             def get_actions(self):
@@ -107,7 +104,7 @@ class ExtensionTestCase(testlib_api.WebTestCase):
 
     def _test_entity_delete(self, entity):
         """Does the entity deletion based on naming convention."""
-        entity_id = str(uuid.uuid4())
+        entity_id = uuidutils.generate_uuid()
         path = self._resource_prefix + '/' if self._resource_prefix else ''
         path += self._plural_mappings.get(entity, entity + 's')
         if self._translate_resource_name:
@@ -116,4 +113,4 @@ class ExtensionTestCase(testlib_api.WebTestCase):
             test_base._get_path(path, id=entity_id, fmt=self.fmt))
         delete_entity = getattr(self.plugin.return_value, "delete_" + entity)
         delete_entity.assert_called_with(mock.ANY, entity_id)
-        self.assertEqual(res.status_int, exc.HTTPNoContent.code)
+        self.assertEqual(exc.HTTPNoContent.code, res.status_int)

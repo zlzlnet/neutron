@@ -13,36 +13,39 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import abc
+import copy
+import subprocess
+import sys
+from unittest import mock
 
-import mock
+import fixtures
+from neutron_lib import context
+from neutron_lib import exceptions
+from neutron_lib.plugins import constants as lib_const
+from neutron_lib.plugins import directory
+from neutron_lib.services import base as service_base
 from oslo_config import cfg
 from oslo_log import log as logging
 from oslo_serialization import jsonutils
+from oslo_service import wsgi as base_wsgi
 import routes
-import six
+import testtools
 import webob
 import webob.exc as webexc
 import webtest
 
-import neutron
 from neutron.api import extensions
-from neutron.api.v2 import attributes
+from neutron.api import wsgi
 from neutron.common import config
-from neutron.common import exceptions
-from neutron.db import db_base_plugin_v2
-from neutron import manager
 from neutron.plugins.common import constants
-from neutron.plugins.ml2 import plugin as ml2_plugin
 from neutron import quota
 from neutron.tests import base
 from neutron.tests.unit.api.v2 import test_base
+from neutron.tests.unit import dummy_plugin
 from neutron.tests.unit import extension_stubs as ext_stubs
 import neutron.tests.unit.extensions
 from neutron.tests.unit.extensions import extendedattribute as extattr
 from neutron.tests.unit import testlib_api
-from neutron import wsgi
-
 
 LOG = logging.getLogger(__name__)
 _uuid = test_base._uuid
@@ -50,17 +53,39 @@ _get_path = test_base._get_path
 extensions_path = ':'.join(neutron.tests.unit.extensions.__path__)
 
 
-class ExtensionsTestApp(wsgi.Router):
+class CustomExtensionCheckMapMemento(fixtures.Fixture):
+    """Create a copy of the custom extension support check map so it can be
+    restored during test cleanup.
+    """
 
-    def __init__(self, options={}):
+    def _setUp(self):
+        self._map_contents_backup = copy.deepcopy(
+            extensions.EXTENSION_SUPPORTED_CHECK_MAP
+        )
+        self._plugin_agnostic_extensions_backup = set(
+            extensions._PLUGIN_AGNOSTIC_EXTENSIONS
+        )
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        extensions.EXTENSION_SUPPORTED_CHECK_MAP = self._map_contents_backup
+        extensions._PLUGIN_AGNOSTIC_EXTENSIONS = (
+            self._plugin_agnostic_extensions_backup
+        )
+
+
+class ExtensionsTestApp(base_wsgi.Router):
+
+    def __init__(self, options=None):
+        options = options or {}
         mapper = routes.Mapper()
         controller = ext_stubs.StubBaseAppController()
         mapper.resource("dummy_resource", "/dummy_resources",
                         controller=controller)
-        super(ExtensionsTestApp, self).__init__(mapper)
+        super().__init__(mapper)
 
 
-class FakePluginWithExtension(db_base_plugin_v2.NeutronDbPluginV2):
+class FakePluginWithExtension(service_base.ServicePluginBase):
     """A fake plugin used only for extension testing in this file."""
 
     supported_extension_aliases = ["FOXNSOX"]
@@ -68,46 +93,47 @@ class FakePluginWithExtension(db_base_plugin_v2.NeutronDbPluginV2):
     def method_to_support_foxnsox_extension(self, context):
         self._log("method_to_support_foxnsox_extension", context)
 
+    def get_plugin_type(self):
+        pass
 
-class PluginInterfaceTest(base.BaseTestCase):
-    def test_issubclass_hook(self):
-        class A(object):
-            def f(self):
-                pass
+    def get_plugin_description(self):
+        pass
 
-        class B(extensions.PluginInterface):
-            @abc.abstractmethod
-            def f(self):
-                pass
 
-        self.assertTrue(issubclass(A, B))
+class ExtensionPathTest(base.BaseTestCase):
 
-    def test_issubclass_hook_class_without_abstract_methods(self):
-        class A(object):
-            def f(self):
-                pass
+    def setUp(self):
+        super().setUp()
+        self.base_path = extensions.get_extensions_path()
 
-        class B(extensions.PluginInterface):
-            def f(self):
-                pass
+    def test_get_extensions_path_with_plugins(self):
+        cfg.CONF.set_override('api_extensions_path',
+                              'neutron/tests/unit/extensions')
+        path = extensions.get_extensions_path(
+            {lib_const.CORE: FakePluginWithExtension()})
+        self.assertEqual(path,
+                         '%s:neutron/tests/unit/extensions' % self.base_path)
 
-        self.assertFalse(issubclass(A, B))
+    def test_get_extensions_path_no_extensions(self):
+        # Reset to default value, as it's overridden by base class
+        cfg.CONF.set_override('api_extensions_path', '')
+        path = extensions.get_extensions_path()
+        self.assertEqual(path, self.base_path)
 
-    def test_issubclass_hook_not_all_methods_implemented(self):
-        class A(object):
-            def f(self):
-                pass
+    def test_get_extensions_path_single_extension(self):
+        cfg.CONF.set_override('api_extensions_path', 'path1')
+        path = extensions.get_extensions_path()
+        self.assertEqual(path, '%s:path1' % self.base_path)
 
-        class B(extensions.PluginInterface):
-            @abc.abstractmethod
-            def f(self):
-                pass
+    def test_get_extensions_path_multiple_extensions(self):
+        cfg.CONF.set_override('api_extensions_path', 'path1:path2')
+        path = extensions.get_extensions_path()
+        self.assertEqual(path, '%s:path1:path2' % self.base_path)
 
-            @abc.abstractmethod
-            def g(self):
-                pass
-
-        self.assertFalse(issubclass(A, B))
+    def test_get_extensions_path_duplicate_extensions(self):
+        cfg.CONF.set_override('api_extensions_path', 'path1:path1')
+        path = extensions.get_extensions_path()
+        self.assertEqual(path, '%s:path1' % self.base_path)
 
 
 class ResourceExtensionTest(base.BaseTestCase):
@@ -126,24 +152,28 @@ class ResourceExtensionTest(base.BaseTestCase):
         def custom_member_action(self, request, id):
             return {'member_action': 'value'}
 
+        def custom_collection_method(self, request, **kwargs):
+            return {'collection': 'value'}
+
         def custom_collection_action(self, request, **kwargs):
             return {'collection': 'value'}
 
     class DummySvcPlugin(wsgi.Controller):
-            def get_plugin_type(self):
-                return constants.DUMMY
+        @classmethod
+        def get_plugin_type(cls):
+            return dummy_plugin.DUMMY_SERVICE_TYPE
 
-            def index(self, request, **kwargs):
-                return "resource index"
+        def index(self, request, **kwargs):
+            return "resource index"
 
-            def custom_member_action(self, request, **kwargs):
-                return {'member_action': 'value'}
+        def custom_member_action(self, request, **kwargs):
+            return {'member_action': 'value'}
 
-            def collection_action(self, request, **kwargs):
-                return {'collection': 'value'}
+        def collection_action(self, request, **kwargs):
+            return {'collection': 'value'}
 
-            def show(self, request, id):
-                return {'data': {'id': id}}
+        def show(self, request, id):
+            return {'data': {'id': id}}
 
     def test_exceptions_notimplemented(self):
         controller = self.ResourceExtensionController()
@@ -158,7 +188,7 @@ class ResourceExtensionTest(base.BaseTestCase):
         try:
             test_app.get("/tweedles/some_id/notimplemented_function")
             # Shouldn't be reached
-            self.assertTrue(False)
+            self.fail()
         except webtest.AppError as e:
             self.assertIn('501', str(e))
 
@@ -168,7 +198,7 @@ class ResourceExtensionTest(base.BaseTestCase):
         test_app = _setup_extensions_test_app(SimpleExtensionManager(res_ext))
         index_response = test_app.get("/tweedles")
         self.assertEqual(200, index_response.status_int)
-        self.assertEqual("resource index", index_response.body)
+        self.assertEqual(b"resource index", index_response.body)
 
         show_response = test_app.get("/tweedles/25266")
         self.assertEqual({'data': {'id': "25266"}}, show_response.json)
@@ -178,8 +208,9 @@ class ResourceExtensionTest(base.BaseTestCase):
             def index(self, request):
                 return ""
 
-            def get_plugin_type(self):
-                return constants.DUMMY
+            @classmethod
+            def get_plugin_type(cls):
+                return dummy_plugin.DUMMY_SERVICE_TYPE
 
         res_ext = extensions.ResourceExtension(
             'tweedles', DummySvcPlugin(), path_prefix="/dummy_svc")
@@ -221,8 +252,7 @@ class ResourceExtensionTest(base.BaseTestCase):
 
     def test_plugin_prefix_with_parent_resource(self):
         controller = self.DummySvcPlugin()
-        parent = dict(member_name="tenant",
-                      collection_name="tenants")
+        parent = {'member_name': "tenant", 'collection_name': "tenants"}
         member = {'custom_member_action': "GET"}
         collections = {'collection_action': "GET"}
         res_ext = extensions.ResourceExtension('tweedles', controller, parent,
@@ -309,7 +339,7 @@ class ResourceExtensionTest(base.BaseTestCase):
     def test_resource_ext_for_nested_resource_custom_collection_action(self):
         controller = self.ResourceExtensionController()
         collections = {'custom_collection_action': "GET"}
-        parent = dict(collection_name='beetles', member_name='beetle')
+        parent = {'collection_name': 'beetles', 'member_name': 'beetle'}
         res_ext = extensions.ResourceExtension('tweedles', controller,
                                                collection_actions=collections,
                                                parent=parent)
@@ -320,6 +350,80 @@ class ResourceExtensionTest(base.BaseTestCase):
 
         self.assertEqual(200, response.status_int)
         self.assertEqual(jsonutils.loads(response.body)['collection'], "value")
+
+    def test_resource_extension_for_get_custom_collection_method(self):
+        controller = self.ResourceExtensionController()
+        collections = {'custom_collection_method': "GET"}
+        res_ext = extensions.ResourceExtension('tweedles', controller,
+                                               collection_methods=collections)
+        test_app = _setup_extensions_test_app(SimpleExtensionManager(res_ext))
+
+        response = test_app.get("/tweedles")
+
+        self.assertEqual(200, response.status_int)
+        self.assertEqual("value", jsonutils.loads(response.body)['collection'])
+
+    def test_resource_extension_for_put_custom_collection_method(self):
+        controller = self.ResourceExtensionController()
+        collections = {'custom_collection_method': "PUT"}
+        res_ext = extensions.ResourceExtension('tweedles', controller,
+                                               collection_methods=collections)
+        test_app = _setup_extensions_test_app(SimpleExtensionManager(res_ext))
+
+        response = test_app.put("/tweedles")
+
+        self.assertEqual(200, response.status_int)
+        self.assertEqual('value', jsonutils.loads(response.body)['collection'])
+
+    def test_resource_extension_for_post_custom_collection_method(self):
+        controller = self.ResourceExtensionController()
+        collections = {'custom_collection_method': "POST"}
+        res_ext = extensions.ResourceExtension('tweedles', controller,
+                                               collection_methods=collections)
+        test_app = _setup_extensions_test_app(SimpleExtensionManager(res_ext))
+
+        response = test_app.post("/tweedles")
+
+        self.assertEqual(200, response.status_int)
+        self.assertEqual('value', jsonutils.loads(response.body)['collection'])
+
+    def test_resource_extension_for_delete_custom_collection_method(self):
+        controller = self.ResourceExtensionController()
+        collections = {'custom_collection_method': "DELETE"}
+        res_ext = extensions.ResourceExtension('tweedles', controller,
+                                               collection_methods=collections)
+        test_app = _setup_extensions_test_app(SimpleExtensionManager(res_ext))
+
+        response = test_app.delete("/tweedles")
+
+        self.assertEqual(200, response.status_int)
+        self.assertEqual('value', jsonutils.loads(response.body)['collection'])
+
+    def test_resource_ext_for_formatted_req_on_custom_collection_method(self):
+        controller = self.ResourceExtensionController()
+        collections = {'custom_collection_method': "GET"}
+        res_ext = extensions.ResourceExtension('tweedles', controller,
+                                               collection_methods=collections)
+        test_app = _setup_extensions_test_app(SimpleExtensionManager(res_ext))
+
+        response = test_app.get("/tweedles.json")
+
+        self.assertEqual(200, response.status_int)
+        self.assertEqual("value", jsonutils.loads(response.body)['collection'])
+
+    def test_resource_ext_for_nested_resource_custom_collection_method(self):
+        controller = self.ResourceExtensionController()
+        collections = {'custom_collection_method': "GET"}
+        parent = {'collection_name': 'beetles', 'member_name': 'beetle'}
+        res_ext = extensions.ResourceExtension('tweedles', controller,
+                                               collection_methods=collections,
+                                               parent=parent)
+        test_app = _setup_extensions_test_app(SimpleExtensionManager(res_ext))
+
+        response = test_app.get("/beetles/beetle_id/tweedles")
+
+        self.assertEqual(200, response.status_int)
+        self.assertEqual("value", jsonutils.loads(response.body)['collection'])
 
     def test_resource_extension_with_custom_member_action_and_attr_map(self):
         controller = self.ResourceExtensionController()
@@ -355,30 +459,30 @@ class ResourceExtensionTest(base.BaseTestCase):
 class ActionExtensionTest(base.BaseTestCase):
 
     def setUp(self):
-        super(ActionExtensionTest, self).setUp()
+        super().setUp()
         self.extension_app = _setup_extensions_test_app()
 
     def test_extended_action_for_adding_extra_data(self):
         action_name = 'FOXNSOX:add_tweedle'
-        action_params = dict(name='Beetle')
+        action_params = {'name': 'Beetle'}
         req_body = jsonutils.dumps({action_name: action_params})
         response = self.extension_app.post('/dummy_resources/1/action',
                                            req_body,
                                            content_type='application/json')
-        self.assertEqual("Tweedle Beetle Added.", response.body)
+        self.assertEqual(b"Tweedle Beetle Added.", response.body)
 
     def test_extended_action_for_deleting_extra_data(self):
         action_name = 'FOXNSOX:delete_tweedle'
-        action_params = dict(name='Bailey')
+        action_params = {'name': 'Bailey'}
         req_body = jsonutils.dumps({action_name: action_params})
         response = self.extension_app.post("/dummy_resources/1/action",
                                            req_body,
                                            content_type='application/json')
-        self.assertEqual("Tweedle Bailey Deleted.", response.body)
+        self.assertEqual(b"Tweedle Bailey Deleted.", response.body)
 
     def test_returns_404_for_non_existent_action(self):
         non_existent_action = 'blah_action'
-        action_params = dict(name="test")
+        action_params = {'name': "test"}
         req_body = jsonutils.dumps({non_existent_action: action_params})
 
         response = self.extension_app.post("/dummy_resources/1/action",
@@ -390,7 +494,7 @@ class ActionExtensionTest(base.BaseTestCase):
 
     def test_returns_404_for_non_existent_resource(self):
         action_name = 'add_tweedle'
-        action_params = dict(name='Beetle')
+        action_params = {'name': 'Beetle'}
         req_body = jsonutils.dumps({action_name: action_params})
 
         response = self.extension_app.post("/asdf/1/action", req_body,
@@ -418,7 +522,7 @@ class RequestExtensionTest(base.BaseTestCase):
         def extend_response_data(req, res):
             data = jsonutils.loads(res.body)
             data['FOXNSOX:extended_key'] = req.GET.get('extended_key')
-            res.body = jsonutils.dumps(data)
+            res.body = jsonutils.dump_as_bytes(data)
             return res
 
         app = self._setup_app_with_request_handler(extend_response_data, 'GET')
@@ -444,7 +548,7 @@ class RequestExtensionTest(base.BaseTestCase):
         def _update_handler(req, res):
             data = jsonutils.loads(res.body)
             data['uneditable'] = req.params['uneditable']
-            res.body = jsonutils.dumps(data)
+            res.body = jsonutils.dump_as_bytes(data)
             return res
 
         base_app = webtest.TestApp(setup_base_app(self))
@@ -466,16 +570,92 @@ class RequestExtensionTest(base.BaseTestCase):
         return _setup_extensions_test_app(manager)
 
 
+class ExtensionsImportsTest(base.BaseTestCase):
+
+    def test_openstacksdk_not_imported(self):
+        # Run in a fresh interpreter: the test process may already have
+        # imported openstack. Only ProjectIdMiddleware needs it.
+        code = ('import sys\n'
+                'import neutron.api.extensions\n'
+                'import neutron.common.utils\n'
+                'print(",".join(m for m in sys.modules\n'
+                '               if m == "openstack" or\n'
+                '               m.startswith("openstack.")))\n')
+        out = subprocess.check_output(  # noqa: S603
+            [sys.executable, '-c', code], text=True)
+        self.assertEqual('', out.strip())
+
+
+class ProjectIdMiddlewareTest(base.BaseTestCase):
+
+    def setUp(self):
+        super().setUp()
+        mock.patch.object(extensions, '_NOVA_CONNECTION', None).start()
+        mock.patch.object(extensions.ks_loading,
+                          'load_auth_from_conf_options').start()
+        mock.patch.object(extensions.ks_loading,
+                          'load_session_from_conf_options').start()
+        self.conn = mock.patch(
+            'openstack.connection.Connection').start().return_value
+        self.app = extensions.ProjectIdMiddleware(
+            webob.Response(body=b'ok'))
+
+    def _get(self, project):
+        return webob.Request.blank(
+            '/?project_id=%s' % project).get_response(self.app)
+
+    def test_project_exists(self):
+        self.conn.get_project.return_value = mock.Mock()
+        self.assertEqual(200, self._get('project1').status_code)
+        self.conn.get_project.assert_called_once_with('project1')
+
+    def test_project_missing(self):
+        self.conn.get_project.return_value = None
+        self.assertEqual(404, self._get('project1').status_code)
+        self.conn.get_project.assert_called_once_with('project1')
+
+
 class ExtensionManagerTest(base.BaseTestCase):
+
+    def test_optional_extensions_no_error(self):
+        ext_mgr = extensions.ExtensionManager('')
+        attr_map = {}
+        ext_mgr.add_extension(ext_stubs.StubExtension('foo_alias',
+                                                      optional=['cats']))
+        ext_mgr.extend_resources("2.0", attr_map)
+        self.assertIn('foo_alias', ext_mgr.extensions)
+
+    def test_missing_required_extensions_raise_error(self):
+        ext_mgr = extensions.ExtensionManager('')
+        attr_map = {}
+        ext_mgr.add_extension(ext_stubs.StubExtensionWithReqs('foo_alias'))
+        self.assertRaises(exceptions.ExtensionsNotFound,
+                          ext_mgr.extend_resources, "2.0", attr_map)
+
+    def test_missing_required_extensions_gracefully_error(self):
+        ext_mgr = extensions.ExtensionManager('')
+        attr_map = {}
+        default_ext = list(constants.DEFAULT_SERVICE_PLUGINS.values())[0]
+        ext_mgr.add_extension(ext_stubs.StubExtensionWithReqs(default_ext))
+        ext_mgr.extend_resources("2.0", attr_map)
+        # none of the default extensions should be loaded as their
+        # requirements are not satisfied, and yet we do not fail.
+        self.assertFalse(ext_mgr.extensions)
+
+    def test__check_faulty_extensions_raise_not_default_ext(self):
+        ext_mgr = extensions.ExtensionManager('')
+        with testtools.ExpectedException(exceptions.ExtensionsNotFound):
+            ext_mgr._check_faulty_extensions({'foo'})
 
     def test_invalid_extensions_are_not_registered(self):
 
-        class InvalidExtension(object):
+        class InvalidExtension:
             """Invalid extension.
 
             This Extension doesn't implement extension methods :
             get_name, get_description and get_updated
             """
+
             def get_alias(self):
                 return "invalid_extension"
 
@@ -486,12 +666,122 @@ class ExtensionManagerTest(base.BaseTestCase):
         self.assertIn('valid_extension', ext_mgr.extensions)
         self.assertNotIn('invalid_extension', ext_mgr.extensions)
 
+    def test_assignment_of_attr_map(self):
+        """Unit test for bug 1443342
+
+        In this bug, an extension that extended multiple resources with the
+        same dict would cause future extensions to inadvertently modify the
+        resources of all of the resources since they were referencing the same
+        dictionary.
+        """
+
+        class MultiResourceExtension(ext_stubs.StubExtension):
+            """Generated Extended Resources.
+
+            This extension's extended resource will assign
+            to more than one resource.
+            """
+
+            def get_extended_resources(self, version):
+                EXTENDED_TIMESTAMP = {
+                    'created_at': {'allow_post': False, 'allow_put': False,
+                                   'is_visible': True}}
+                EXTENDED_RESOURCES = ["ext1", "ext2"]
+                attrs = {}
+                for resources in EXTENDED_RESOURCES:
+                    attrs[resources] = EXTENDED_TIMESTAMP
+
+                return attrs
+
+        class AttrExtension(ext_stubs.StubExtension):
+            def get_extended_resources(self, version):
+                attrs = {
+                    self.alias: {
+                        '%s-attr' % self.alias: {'allow_post': False,
+                                                 'allow_put': False,
+                                                 'is_visible': True}}}
+                return attrs
+
+        ext_mgr = extensions.ExtensionManager('')
+        attr_map = {}
+        ext_mgr.add_extension(MultiResourceExtension('timestamp'))
+        ext_mgr.extend_resources("2.0", attr_map)
+        ext_mgr.add_extension(AttrExtension("ext1"))
+        ext_mgr.add_extension(AttrExtension("ext2"))
+        ext_mgr.extend_resources("2.0", attr_map)
+        self.assertIn('created_at', attr_map['ext2'])
+        self.assertIn('created_at', attr_map['ext1'])
+        # now we need to make sure the attrextensions didn't leak across
+        self.assertNotIn('ext1-attr', attr_map['ext2'])
+        self.assertNotIn('ext2-attr', attr_map['ext1'])
+
+    def test_extension_extends_sub_resource(self):
+        """Unit test for bug 1722842
+
+        Check that an extension can extend a sub-resource
+        """
+        RESOURCE = "test_resource"
+        SUB_RESOURCE_NAME = "test_sub_resource"
+        INITIAL_PARAM = "dummy_param1"
+        ADDITIONAL_PARAM = "dummy_param2"
+
+        SUB_RESOURCE = {
+            'parent': {'member_name': RESOURCE},
+            'parameters': {
+                INITIAL_PARAM: {'allow_post': False,
+                                'allow_put': False,
+                                'validate': {'type:uuid': None},
+                                'is_visible': True}
+            }
+        }
+
+        class BaseExtension(ext_stubs.StubExtension):
+
+            def get_extended_resources(self, version):
+                return {
+                     SUB_RESOURCE_NAME: SUB_RESOURCE
+                }
+
+        class ExtensionExtendingASubresource(ext_stubs.StubExtension):
+
+            def get_extended_resources(self, version):
+                return {
+                    SUB_RESOURCE_NAME: {
+                        'parameters': {
+                            ADDITIONAL_PARAM: {'allow_post': False,
+                                               'allow_put': False,
+                                               'validate': {'type:uuid': None},
+                                               'is_visible': True}
+                        }
+                    }
+                }
+
+            def get_required_extensions(self):
+                return ['base_extension']
+
+        ext_mgr = extensions.ExtensionManager('')
+        attr_map = {}
+        ext_mgr.add_extension(BaseExtension('base_extension'))
+        ext_mgr.add_extension(
+            ExtensionExtendingASubresource())
+        ext_mgr.extend_resources("2.0", attr_map)
+
+        # check that the parent descriptor is untouched
+        self.assertEqual(SUB_RESOURCE['parent'],
+                         attr_map[SUB_RESOURCE_NAME]['parent'])
+        # check that the initial attribute is still here
+        self.assertIn(INITIAL_PARAM,
+                      attr_map[SUB_RESOURCE_NAME]['parameters'])
+        # check that the new attribute is here as well
+        self.assertIn(ADDITIONAL_PARAM,
+                      attr_map[SUB_RESOURCE_NAME]['parameters'])
+
 
 class PluginAwareExtensionManagerTest(base.BaseTestCase):
 
     def test_unsupported_extensions_are_not_loaded(self):
         stub_plugin = ext_stubs.StubPlugin(supported_extensions=["e1", "e3"])
-        plugin_info = {constants.CORE: stub_plugin}
+        plugin_info = {lib_const.CORE: stub_plugin}
         with mock.patch("neutron.api.extensions.PluginAwareExtensionManager."
                         "check_if_plugin_extensions_loaded"):
             ext_mgr = extensions.PluginAwareExtensionManager('', plugin_info)
@@ -505,14 +795,13 @@ class PluginAwareExtensionManagerTest(base.BaseTestCase):
             self.assertIn("e3", ext_mgr.extensions)
 
     def test_extensions_are_not_loaded_for_plugins_unaware_of_extensions(self):
-        class ExtensionUnawarePlugin(object):
+        class ExtensionUnawarePlugin:
             """This plugin does not implement supports_extension method.
 
             Extensions will not be loaded when this plugin is used.
             """
-            pass
 
-        plugin_info = {constants.CORE: ExtensionUnawarePlugin()}
+        plugin_info = {lib_const.CORE: ExtensionUnawarePlugin()}
         ext_mgr = extensions.PluginAwareExtensionManager('', plugin_info)
         ext_mgr.add_extension(ext_stubs.StubExtension("e1"))
 
@@ -520,11 +809,11 @@ class PluginAwareExtensionManagerTest(base.BaseTestCase):
 
     def test_extensions_not_loaded_for_plugin_without_expected_interface(self):
 
-        class PluginWithoutExpectedIface(object):
+        class PluginWithoutExpectedIface:
             """Does not implement get_foo method as expected by extension."""
             supported_extension_aliases = ["supported_extension"]
 
-        plugin_info = {constants.CORE: PluginWithoutExpectedIface()}
+        plugin_info = {lib_const.CORE: PluginWithoutExpectedIface()}
         with mock.patch("neutron.api.extensions.PluginAwareExtensionManager."
                         "check_if_plugin_extensions_loaded"):
             ext_mgr = extensions.PluginAwareExtensionManager('', plugin_info)
@@ -535,14 +824,20 @@ class PluginAwareExtensionManagerTest(base.BaseTestCase):
 
     def test_extensions_are_loaded_for_plugin_with_expected_interface(self):
 
-        class PluginWithExpectedInterface(object):
+        class PluginWithExpectedInterface(service_base.ServicePluginBase):
             """Implements get_foo method as expected by extension."""
             supported_extension_aliases = ["supported_extension"]
 
-            def get_foo(self, bar=None):
+            def get_foo(self, ext=None):
                 pass
 
-        plugin_info = {constants.CORE: PluginWithExpectedInterface()}
+            def get_plugin_type(self):
+                pass
+
+            def get_plugin_description(self):
+                pass
+
+        plugin_info = {lib_const.CORE: PluginWithExpectedInterface()}
         with mock.patch("neutron.api.extensions.PluginAwareExtensionManager."
                         "check_if_plugin_extensions_loaded"):
             ext_mgr = extensions.PluginAwareExtensionManager('', plugin_info)
@@ -557,9 +852,8 @@ class PluginAwareExtensionManagerTest(base.BaseTestCase):
 
             This will work with any plugin implementing NeutronPluginBase
             """
-            pass
         stub_plugin = ext_stubs.StubPlugin(supported_extensions=["e1"])
-        plugin_info = {constants.CORE: stub_plugin}
+        plugin_info = {lib_const.CORE: stub_plugin}
 
         with mock.patch("neutron.api.extensions.PluginAwareExtensionManager."
                         "check_if_plugin_extensions_loaded"):
@@ -574,11 +868,12 @@ class PluginAwareExtensionManagerTest(base.BaseTestCase):
 
             This will work with any plugin implementing NeutronPluginBase
             """
+
             def get_plugin_interface(self):
                 return None
 
         stub_plugin = ext_stubs.StubPlugin(supported_extensions=["e1"])
-        plugin_info = {constants.CORE: stub_plugin}
+        plugin_info = {lib_const.CORE: stub_plugin}
         with mock.patch("neutron.api.extensions.PluginAwareExtensionManager."
                         "check_if_plugin_extensions_loaded"):
             ext_mgr = extensions.PluginAwareExtensionManager('', plugin_info)
@@ -592,7 +887,7 @@ class PluginAwareExtensionManagerTest(base.BaseTestCase):
                 return None
 
         stub_plugin = ext_stubs.StubPlugin(supported_extensions=["e1"])
-        plugin_info = {constants.DUMMY: stub_plugin}
+        plugin_info = {dummy_plugin.DUMMY_SERVICE_TYPE: stub_plugin}
         with mock.patch("neutron.api.extensions.PluginAwareExtensionManager."
                         "check_if_plugin_extensions_loaded"):
             ext_mgr = extensions.PluginAwareExtensionManager('', plugin_info)
@@ -603,16 +898,57 @@ class PluginAwareExtensionManagerTest(base.BaseTestCase):
     def test_unloaded_supported_extensions_raises_exception(self):
         stub_plugin = ext_stubs.StubPlugin(
             supported_extensions=["unloaded_extension"])
-        plugin_info = {constants.CORE: stub_plugin}
+        plugin_info = {lib_const.CORE: stub_plugin}
         self.assertRaises(exceptions.ExtensionsNotFound,
                           extensions.PluginAwareExtensionManager,
                           '', plugin_info)
+
+    def test_custom_supported_implementation(self):
+        self.useFixture(CustomExtensionCheckMapMemento())
+
+        class FakePlugin:
+            pass
+
+        class FakeExtension(ext_stubs.StubExtension):
+            extensions.register_custom_supported_check(
+                'stub_extension', lambda: True, plugin_agnostic=True
+            )
+
+        ext = FakeExtension()
+
+        plugin_info = {lib_const.CORE: FakePlugin()}
+        ext_mgr = extensions.PluginAwareExtensionManager('', plugin_info)
+        ext_mgr.add_extension(ext)
+        self.assertIn("stub_extension", ext_mgr.extensions)
+
+        extensions.register_custom_supported_check(
+            'stub_extension', lambda: False, plugin_agnostic=True
+        )
+        ext_mgr = extensions.PluginAwareExtensionManager('', plugin_info)
+        ext_mgr.add_extension(ext)
+        self.assertNotIn("stub_extension", ext_mgr.extensions)
+
+    def test_custom_supported_implementation_plugin_specific(self):
+        self.useFixture(CustomExtensionCheckMapMemento())
+
+        class FakePlugin:
+            pass
+
+        class FakeExtension(ext_stubs.StubExtension):
+            extensions.register_custom_supported_check(
+                'stub_plugin_extension', lambda: True, plugin_agnostic=False
+            )
+
+        plugin_info = {lib_const.CORE: FakePlugin()}
+        self.assertRaises(
+            exceptions.ExtensionsNotFound,
+            extensions.PluginAwareExtensionManager, '', plugin_info)
 
 
 class ExtensionControllerTest(testlib_api.WebTestCase):
 
     def setUp(self):
-        super(ExtensionControllerTest, self).setUp()
+        super().setUp()
         self.test_app = _setup_extensions_test_app()
 
     def test_index_gets_all_registerd_extensions(self):
@@ -651,7 +987,7 @@ def setup_extensions_middleware(extension_manager=None):
     extension_manager = (extension_manager or
                          extensions.PluginAwareExtensionManager(
                              extensions_path,
-                             {constants.CORE: FakePluginWithExtension()}))
+                             {lib_const.CORE: FakePluginWithExtension()}))
     base.BaseTestCase.config_parse()
     app = config.load_paste_app('extensions_test_app')
     return extensions.ExtensionMiddleware(app, ext_mgr=extension_manager)
@@ -661,7 +997,7 @@ def _setup_extensions_test_app(extension_manager=None):
     return webtest.TestApp(setup_extensions_middleware(extension_manager))
 
 
-class SimpleExtensionManager(object):
+class SimpleExtensionManager:
 
     def __init__(self, resource_ext=None, action_ext=None, request_ext=None):
         self.resource_ext = resource_ext
@@ -687,15 +1023,14 @@ class SimpleExtensionManager(object):
         return request_extensions
 
 
-class ExtensionExtendedAttributeTestPlugin(
-    ml2_plugin.Ml2Plugin):
+class ExtensionExtendedAttributeTestPlugin:
 
     supported_extension_aliases = [
         'ext-obj-test', "extended-ext-attr"
     ]
 
     def __init__(self, configfile=None):
-        super(ExtensionExtendedAttributeTestPlugin, self)
+        super()
         self.objs = []
         self.objh = {}
 
@@ -716,7 +1051,7 @@ class ExtensionExtendedAttributeTestPlugin(
 
 class ExtensionExtendedAttributeTestCase(base.BaseTestCase):
     def setUp(self):
-        super(ExtensionExtendedAttributeTestCase, self).setUp()
+        super().setUp()
         plugin = (
             "neutron.tests.unit.api.test_extensions."
             "ExtensionExtendedAttributeTestPlugin"
@@ -729,7 +1064,7 @@ class ExtensionExtendedAttributeTestCase(base.BaseTestCase):
 
         ext_mgr = extensions.PluginAwareExtensionManager(
             extensions_path,
-            {constants.CORE: ExtensionExtendedAttributeTestPlugin}
+            {lib_const.CORE: ExtensionExtendedAttributeTestPlugin()}
         )
         ext_mgr.extend_resources("2.0", {})
         extensions.PluginAwareExtensionManager._instance = ext_mgr
@@ -737,27 +1072,14 @@ class ExtensionExtendedAttributeTestCase(base.BaseTestCase):
         app = config.load_paste_app('extensions_test_app')
         self._api = extensions.ExtensionMiddleware(app, ext_mgr=ext_mgr)
 
-        self._tenant_id = "8c70909f-b081-452d-872b-df48e6c355d1"
-        # Save the global RESOURCE_ATTRIBUTE_MAP
-        self.saved_attr_map = {}
-        for res, attrs in six.iteritems(attributes.RESOURCE_ATTRIBUTE_MAP):
-            self.saved_attr_map[res] = attrs.copy()
-        # Add the resources to the global attribute map
-        # This is done here as the setup process won't
-        # initialize the main API router which extends
-        # the global attribute map
-        attributes.RESOURCE_ATTRIBUTE_MAP.update(
-            extattr.EXTENDED_ATTRIBUTES_2_0)
-        self.agentscheduler_dbMinxin = manager.NeutronManager.get_plugin()
-        self.addCleanup(self.restore_attribute_map)
+        self._project_id = "8c70909f-b081-452d-872b-df48e6c355d1"
+
+        self.agentscheduler_dbMinxin = directory.get_plugin()
 
         quota.QUOTAS._driver = None
-        cfg.CONF.set_override('quota_driver', 'neutron.quota.ConfDriver',
+        cfg.CONF.set_override('quota_driver',
+                              'neutron.db.quota.driver_null.DbQuotaDriverNull',
                               group='QUOTAS')
-
-    def restore_attribute_map(self):
-        # Restore the original RESOURCE_ATTRIBUTE_MAP
-        attributes.RESOURCE_ATTRIBUTE_MAP = self.saved_attr_map
 
     def _do_request(self, method, path, data=None, params=None, action=None):
         content_type = 'application/json'
@@ -768,6 +1090,8 @@ class ExtensionExtendedAttributeTestCase(base.BaseTestCase):
         req = testlib_api.create_request(
             path, body, content_type,
             method, query_string=params)
+        req.environ['neutron.context'] = context.Context(
+            '', self._project_id, roles=['member', 'reader'])
         res = req.get_response(self._api)
         if res.status_code >= 400:
             raise webexc.HTTPClientError(detail=res.body, code=res.status_code)
@@ -777,7 +1101,7 @@ class ExtensionExtendedAttributeTestCase(base.BaseTestCase):
     def _ext_test_resource_create(self, attr=None):
         data = {
             "ext_test_resource": {
-                "tenant_id": self._tenant_id,
+                "project_id": self._project_id,
                 "name": "test",
                 extattr.EXTENDED_ATTRIBUTE: attr
             }
@@ -797,6 +1121,6 @@ class ExtensionExtendedAttributeTestCase(base.BaseTestCase):
         obj = self._ext_test_resource_create(attr)
         obj_id = obj['id']
         res = self._do_request('GET', _get_path(
-            'ext_test_resources/{0}'.format(obj_id)))
+            f'ext_test_resources/{obj_id}'))
         obj2 = res['ext_test_resource']
         self.assertEqual(obj2[extattr.EXTENDED_ATTRIBUTE], attr)

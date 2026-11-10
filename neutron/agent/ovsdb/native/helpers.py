@@ -12,18 +12,23 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from neutron.agent.common import utils
+from oslo_config import cfg
+
+from neutron.conf.agent import ovs_conf as agent_ovs_conf
+from neutron.conf.plugins.ml2.drivers import ovs_conf as ml2_ovs_conf
+from neutron.privileged.agent.ovsdb.native import helpers as priv_helpers
 
 
-def _connection_to_manager_uri(conn_uri):
-    proto, addr = conn_uri.split(':', 1)
-    if ':' in addr:
-        ip, port = addr.split(':', 1)
-        return 'p%s:%s:%s' % (proto, port, ip)
-    else:
-        return 'p%s:%s' % (proto, addr)
+agent_ovs_conf.register_ovs_agent_opts(cfg.CONF)
+ml2_ovs_conf.register_ovs_opts(cfg=cfg.CONF)
 
 
-def enable_connection_uri(conn_uri):
-    manager_uri = _connection_to_manager_uri(conn_uri)
-    utils.execute(['ovs-vsctl', 'set-manager', manager_uri], run_as_root=True)
+def enable_connection_uri(conn_uri, **kwargs):
+    # Read the options on each call, not at import: neutron-ovn-agent imports
+    # this module before it has parsed its configuration files.
+    kwargs.setdefault('log_fail_as_error', False)
+    kwargs.setdefault('check_exit_code', True)
+    kwargs.setdefault('timeout', cfg.CONF.OVS.ovsdb_timeout)
+    kwargs.setdefault('inactivity_probe',
+                      cfg.CONF.OVS.of_inactivity_probe * 1000)
+    return priv_helpers.enable_connection_uri(conn_uri, **kwargs)

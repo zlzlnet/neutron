@@ -38,29 +38,16 @@ check_pot_files_errors () {
     # obsolete entries duplicate normal entries. Prevent obsolete
     # entries to slip in
     find neutron -type f -regex '.*\.pot?' \
-                 -print0|xargs -0 -n 1 msgfmt --check-format \
-                 -o /dev/null
+        -print0|xargs -0 -n 1 msgfmt --check-format \
+        -o /dev/null
     if [ "$?" -ne 0 ]; then
         echo "PO files syntax is not correct!" >>$FAILURES
-    fi
-}
-
-
-check_identical_policy_files () {
-    # For unit tests, we maintain their own policy.json file to make test suite
-    # independent of whether it's executed from the neutron source tree or from
-    # site-packages installation path. We don't want two copies of the same
-    # file to diverge, so checking that they are identical
-    diff etc/policy.json neutron/tests/etc/policy.json 2>&1 > /dev/null
-    if [ "$?" -ne 0 ]; then
-        echo "policy.json files must be identical!" >>$FAILURES
     fi
 }
 
 # Add your checks here...
 check_no_symlinks_allowed
 check_pot_files_errors
-check_identical_policy_files
 
 # Fail, if there are emitted failures
 if [ -f $FAILURES ]; then

@@ -1,0 +1,364 @@
+# The controller and compute1 nodes need nested virtualization to boot
+# advanced (non-cirros) guests with KVM instead of the much slower qemu.
+# The nested-virt-8GB label is only offered by ovh and vexxhost.
+#
+# All five nodes build an inter-node VXLAN fabric over private IPs, so the
+# whole nodeset must run in a single cloud provider. To let more than one
+# provider satisfy the job (avoiding random NODE_FAILUREs when one lacks
+# capacity), the leaf/spine label in each alternative is paired with one
+# that a nested-virt-8GB capable provider also offers, so a single provider
+# can fulfil the alternative:
+#   - 32GB leafs -> vexxhost
+#   - 16GB leafs -> vexxhost
+#   - 8GB  leafs -> ovh
+# The alternatives are defined inline (anonymous nodesets) rather than by
+# name, which is the form used by Zuul's own documentation and tests.
+# See https://zuul-ci.org/docs/zuul/latest/config/nodeset.html#attr-nodeset.alternatives
+- nodeset:
+    name: neutron-five-node-resolute-bgp-v2
+    alternatives:
+      - nodes:
+          - name: controller
+            label: ubuntu-resolute-nested-virt-8GB
+          - name: compute1
+            label: ubuntu-resolute-nested-virt-8GB
+          - name: leaf-1
+            label: ubuntu-resolute-32GB
+          - name: leaf-2
+            label: ubuntu-resolute-32GB
+          - name: spine
+            label: ubuntu-resolute-32GB
+        groups: &neutron_bgp_groups
+          - name: controller
+            nodes:
+              - controller
+          # Nodes running the compute service
+          - name: compute
+            nodes:
+              - controller
+              - compute1
+          - name: subnode
+            nodes:
+              - spine
+              - compute1
+          - name: leafs
+            nodes:
+              - leaf-1
+              - leaf-2
+          - name: tempest
+            nodes:
+              - spine
+          # This group name is chosen to sort after "subnode" alphabetically,
+          # so that its group-vars take precedence over the subnode group-vars
+          # from the devstack base job (Ansible resolves same-level group
+          # conflicts by alphabetical order, last wins).
+          - name: zbgp_compute
+            nodes:
+              - compute1
+      - nodes:
+          - name: controller
+            label: ubuntu-resolute-nested-virt-8GB
+          - name: compute1
+            label: ubuntu-resolute-nested-virt-8GB
+          - name: leaf-1
+            label: ubuntu-resolute-16GB
+          - name: leaf-2
+            label: ubuntu-resolute-16GB
+          - name: spine
+            label: ubuntu-resolute-16GB
+        groups: *neutron_bgp_groups
+      - nodes:
+          - name: controller
+            label: ubuntu-resolute-nested-virt-8GB
+          - name: compute1
+            label: ubuntu-resolute-nested-virt-8GB
+          - name: leaf-1
+            label: ubuntu-resolute-8GB
+          - name: leaf-2
+            label: ubuntu-resolute-8GB
+          - name: spine
+            label: ubuntu-resolute-8GB
+        groups: *neutron_bgp_groups
+
+- job:
+    name: neutron-ovn-bgp-tempest-multinode-base
+    abstract: true
+    parent: neutron-tempest-plugin-ovn
+    nodeset: neutron-five-node-resolute-bgp-v2
+    timeout: 10800
+    post-timeout: 9600
+    required-projects:
+      - openstack/devstack
+    vars:
+      devstack_localrc:
+        CIRROS_VERSION: 0.6.3
+        DEFAULT_IMAGE_NAME: cirros-0.6.3-x86_64-uec
+        DEFAULT_IMAGE_FILE_NAME: cirros-0.6.3-x86_64-uec.tar.gz
+        ENABLE_TLS: True
+        PUBLIC_SUBNET_ENABLE_DHCP: True
+        OVN_BUILD_FROM_SOURCE: True
+        OVN_BRANCH: v26.03.3
+        OVS_BRANCH: v3.7.1
+        ENABLE_FRR: True
+        Q_ASSIGN_GATEWAY_TO_PUBLIC_BRIDGE: false
+      devstack_services:
+        tls-proxy: true
+        tempest: false
+      devstack_plugins:
+        neutron: https://opendev.org/openstack/neutron
+        neutron-tempest-plugin: https://opendev.org/openstack/neutron-tempest-plugin
+      zuul_copy_output:
+        '/var/log/frr': 'logs'
+        '/var/log/ovn': 'logs'
+        '/var/log/openvswitch': 'logs'
+        '/var/lib/ovn': 'logs'
+        '/etc/frr': 'logs'
+      devstack_local_conf:
+        post-config:
+          "/$NEUTRON_CORE_PLUGIN_CONF":
+            ovn:
+              enable_distributed_floating_ip: True
+    pre-run: playbooks/configure_bgp_networking.yaml
+    post-run: playbooks/collect_bgp_diagnostics.yaml
+    group-vars:
+      # The tempest and zbgp_compute groups sort after subnode, so their
+      # devstack_localrc replaces (not merges with) the subnode group-vars.
+      # We must repeat the base subnode settings needed by stack.sh.
+      tempest:
+        devstack_localrc: &subnode_localrc
+          CIRROS_VERSION: 0.6.3
+          DEFAULT_IMAGE_NAME: cirros-0.6.3-x86_64-uec
+          DEFAULT_IMAGE_FILE_NAME: cirros-0.6.3-x86_64-uec.tar.gz
+          DATABASE_PASSWORD: secretdatabase
+          RABBIT_PASSWORD: secretrabbit
+          ADMIN_PASSWORD: secretadmin
+          SERVICE_PASSWORD: secretservice
+          GLANCE_HOSTPORT: "{{ hostvars['controller']['nodepool']['private_ipv4'] }}:9292"
+          Q_HOST: "{{ hostvars['controller']['nodepool']['private_ipv4'] }}"
+          DATABASE_HOST: "{{ hostvars['controller']['nodepool']['private_ipv4'] }}"
+          RABBIT_HOST: "{{ hostvars['controller']['nodepool']['private_ipv4'] }}"
+          SERVICE_HOST: "{{ hostvars['controller']['nodepool']['private_ipv4'] }}"
+          HOST_IP: "{{ hostvars[inventory_hostname]['nodepool']['private_ipv4'] }}"
+          LOGFILE: /opt/stack/logs/devstacklog.txt
+          LOG_COLOR: false
+          VERBOSE: true
+          VERBOSE_NO_TIMESTAMP: true
+          LIBS_FROM_GIT: neutron-tempest-plugin
+          OVN_BUILD_FROM_SOURCE: False
+          Q_PLUGIN: "noop"
+          SERVICES_FOR_TEMPEST: neutron,nova,keystone,glance
+          IMAGE_URLS: https://cloud-images.ubuntu.com/minimal/releases/jammy/release/ubuntu-22.04-minimal-cloudimg-amd64.img
+          ADVANCED_IMAGE_NAME: ubuntu-22.04-minimal-cloudimg-amd64
+          ADVANCED_INSTANCE_TYPE: ntp_image_256M
+          ADVANCED_INSTANCE_USER: ubuntu
+          CUSTOMIZE_IMAGE: true
+          BUILD_TIMEOUT: 784
+          LIVE_MIGRATION_AVAILABLE: True
+          USE_BLOCK_MIGRATION_FOR_LIVE_MIGRATION: True
+        devstack_plugins:
+          neutron-tempest-plugin: https://opendev.org/openstack/neutron-tempest-plugin
+        devstack_services:
+          tls-proxy: true
+          tempest: true
+          etcd3: false
+          mysql: false
+          c-api: false
+          c-bak: false
+          c-sch: false
+          c-vol: false
+          cinder: false
+          n-api: false
+          n-api-meta: false
+          n-cond: false
+          n-cpu: false
+          n-novnc: false
+          n-sch: false
+          placement-api: false
+          br-ex-tcpdump: false
+          br-int-flows: false
+          q-ovn-agent: false
+          ovn-bgp: false
+          ovn-controller: false
+          ovn-northd: false
+          ovs-vswitchd: false
+          ovsdb-server: false
+          neutron-dns: false
+          neutron-log: false
+          neutron-qos: false
+          neutron-segments: false
+          neutron-trunk: false
+          neutron-uplink-status-propagation: false
+          neutron-network-segment-range: false
+          neutron-port-forwarding: false
+          neutron-conntrack-helper: false
+          neutron-tag-ports-during-bulk-creation: false
+          neutron-ndp-proxy: false
+          neutron-subnet-external-network: false
+          neutron-port-trusted-vif: false
+        devstack_local_conf:
+          post-config: {}
+          test-config:
+            $TEMPEST_CONFIG:
+              service_available:
+                neutron: True
+                nova: True
+                glance: True
+                key: True
+              compute:
+                min_compute_nodes: 2
+              neutron_plugin_options:
+                firewall_driver: ovn
+        tempest_concurrency: 4
+        tempest_test_regex: "\
+          (^neutron_tempest_plugin.api.test_ovn_bgp)|\
+          (^neutron_tempest_plugin.scenario)|\
+          (^tempest.scenario.test_server_basic_ops.TestServerBasicOps)|\
+          (^tempest.scenario.test_network_basic_ops)|\
+          (^tempest.scenario.test_network_advanced_server_ops)|\
+          (^tempest.scenario.test_network_v6)"
+        # Excluded tests and reasons:
+        # - test_port_forwardings: FIP port forwarding not supported
+        #     by OVN BGP Agent
+        # - test_multiple_gws: creates its own FRR/BFD on br-ex,
+        #     conflicts with the BGP spine-leaf fabric
+        # - test_snat_external_ip, test_default_sec_grp_scenarios,
+        #   test_connectivity_between_vms_on_different_networks,
+        #   test_network_basic_ops, test_subnet_details:
+        #     ping external gw IP from VM, which is not reachable
+        #     with the current BGP implementation
+        # - test_server_connectivity_rebuild: rebuilds with
+        #     image_ref_alt (ubuntu 2.2GB) which exceeds m1.nano
+        #     1GB disk; also image_alt_ssh_user mismatches
+        # - test_multicast: multicast not forwarded across the
+        #     routed spine-leaf fabric
+        # - test_vlan_transparency: not relevant to BGP validation,
+        #     too slow (1000s+) and risks job timeout
+        tempest_exclude_regex: "\
+          (^neutron_tempest_plugin.scenario.test_port_forwardings)|\
+          (^neutron_tempest_plugin.scenario.test_multiple_gws)|\
+          (^neutron_tempest_plugin.scenario.test_floatingip.DefaultSnatToExternal.test_snat_external_ip)|\
+          (^neutron_tempest_plugin.scenario.*test_default_sec_grp_scenarios)|\
+          (^tempest.scenario.test_network_basic_ops.TestNetworkBasicOps.test_connectivity_between_vms_on_different_networks)|\
+          (^tempest.scenario.test_network_basic_ops.TestNetworkBasicOps.test_network_basic_ops)|\
+          (^tempest.scenario.test_network_basic_ops.TestNetworkBasicOps.test_subnet_details)|\
+          (^tempest.scenario.test_network_advanced_server_ops.TestNetworkAdvancedServerOps.test_server_connectivity_rebuild)|\
+          (^neutron_tempest_plugin.scenario.test_multicast)|\
+          (^neutron_tempest_plugin.scenario.test_vlan_transparency)"
+      zbgp_compute:
+        devstack_localrc:
+          <<: *subnode_localrc
+          Q_PLUGIN: ml2
+          NOVA_VNC_ENABLED: true
+          ENABLE_CHASSIS_AS_GW: false
+          LIBVIRT_TYPE: kvm
+          OVN_BUILD_FROM_SOURCE: True
+          OVN_BRANCH: v26.03.3
+          OVS_BRANCH: v3.7.1
+          ENABLE_FRR: True
+          Q_ASSIGN_GATEWAY_TO_PUBLIC_BRIDGE: false
+        devstack_plugins:
+          neutron: https://opendev.org/openstack/neutron
+        devstack_services:
+          # Subnode base services
+          n-cpu: true
+          placement-client: true
+          memory_tracker: true
+          file_tracker: true
+          tls-proxy: true
+          dstat: false
+          horizon: false
+          tempest: false
+          # OVN services
+          q-ovn-agent: true
+          ovn-controller: true
+          ovs-vswitchd: true
+          ovsdb-server: true
+          ovn-northd: false
+          br-ex-tcpdump: false
+          br-int-flows: true
+          # Cinder services
+          c-api: false
+          c-bak: false
+          c-sch: false
+          c-vol: false
+          cinder: false
+          # Swift services
+          s-account: false
+          s-container-sync: false
+          s-container: false
+          s-object: false
+          s-proxy: false
+        devstack_local_conf:
+          post-config:
+            "/$NEUTRON_CORE_PLUGIN_CONF":
+              ovn:
+                enable_distributed_floating_ip: True
+
+- job:
+    name: neutron-ovn-bgp-tempest-multinode
+    parent: neutron-ovn-bgp-tempest-multinode-base
+    vars:
+      devstack_localrc:
+        FRR_USE_BFD: True
+        FRR_BGP_ROUTER_ID: '172.24.4.1'
+        FRR_BGP_IPV6_SRC: '2001:db8::2'
+        OVN_AGENT_EXTENSIONS: 'metadata,ovn-bgp'
+        NEUTRON_BGP_PEER_BRIDGES: 'br-bgp-0,br-bgp-1'
+      devstack_services:
+        q-ovn-bgp: true
+    group-vars:
+      zbgp_compute:
+        devstack_localrc:
+          FRR_USE_BFD: True
+          FRR_BGP_ROUTER_ID: '172.24.4.2'
+          FRR_BGP_IPV6_SRC: '2001:db8::3'
+          OVN_AGENT_EXTENSIONS: 'metadata,ovn-bgp'
+          NEUTRON_BGP_PEER_BRIDGES: 'br-bgp-0,br-bgp-1'
+
+- job:
+    name: neutron-ovn-evpn-tempest-multinode
+    parent: neutron-ovn-bgp-tempest-multinode-base
+    nodeset: neutron-five-node-resolute-bgp-v2
+    vars:
+      enable_evpn: true
+      # OVN discovers remote VTEPs from FDB entries and defaults
+      # to DEFAULT_VXLAN_PORT (4789) when no port is specified.
+      # The EVPN tunnel must match this port for bindings to be
+      # created. Infrastructure tunnels use evpn_vxlan_port + 1.
+      # Per-VNI spine dataplane is provisioned dynamically by
+      # tempest (EVPNVNIProvisioner).
+      evpn_vxlan_port: 4789
+      evpn_loopback_ip: '99.98.2.1'
+      devstack_localrc:
+        FRR_USE_EVPN: True
+        OVN_AGENT_EXTENSIONS: 'metadata,ovn-evpn'
+        OVN_EVPN_BGP_AS: 64999
+        OVN_EVPN_BGP_LOCAL_INTERFACE: br-bgp-0
+        OVN_EVPN_LOCAL_IP: "{{ evpn_loopback_ip }}"
+        OVN_EVPN_VXLAN_PORT: "{{ evpn_vxlan_port }}"
+      devstack_services:
+        q-ovn-evpn: true
+    group-vars:
+      tempest:
+        tempest_test_regex: "\
+          (^neutron_tempest_plugin.scenario.test_evpn)|\
+          (^neutron_tempest_plugin.api.test_evpn)"
+        tempest_exclude_regex: ""
+        # Spine VTEP/datapath IP (lo). Activates EVPNVNIProvisioner
+        # so scenario tests allocate VNIs and create per-VNI VRF/VXLAN.
+        devstack_local_conf:
+          test-config:
+            $TEMPEST_CONFIG:
+              neutron_plugin_options:
+                evpn_vtep_ip: 172.31.1.1
+                evpn_datapath_ip: 172.31.1.1
+                evpn_vxlan_port: 4789
+      zbgp_compute:
+        evpn_loopback_ip: '99.98.2.2'
+        devstack_localrc:
+          FRR_USE_EVPN: True
+          OVN_AGENT_EXTENSIONS: 'metadata,ovn-evpn'
+          OVN_EVPN_BGP_AS: 64999
+          OVN_EVPN_BGP_LOCAL_INTERFACE: br-bgp-0
+          OVN_EVPN_LOCAL_IP: "{{ evpn_loopback_ip }}"
+          OVN_EVPN_VXLAN_PORT: "{{ evpn_vxlan_port }}"

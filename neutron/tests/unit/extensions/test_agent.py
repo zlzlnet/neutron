@@ -13,28 +13,23 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import copy
 import time
 
+from neutron_lib.api.definitions import agent as agent_apidef
+from neutron_lib.api.definitions import agent_sort_key as agent_sort_key_apidef
+from neutron_lib import constants
+from neutron_lib import context
 from oslo_config import cfg
-from oslo_log import log as logging
-from oslo_utils import timeutils
 from oslo_utils import uuidutils
 from webob import exc
 
-from neutron.api.v2 import attributes
-from neutron.common import constants
-from neutron import context
 from neutron.db import agents_db
 from neutron.db import db_base_plugin_v2
 from neutron.extensions import agent
 from neutron.tests.common import helpers
-from neutron.tests import tools
+from neutron.tests.common import test_db_base_plugin_v2
 from neutron.tests.unit.api.v2 import test_base
-from neutron.tests.unit.db import test_db_base_plugin_v2
 
-
-LOG = logging.getLogger(__name__)
 
 _uuid = uuidutils.generate_uuid
 _get_path = test_base._get_path
@@ -42,19 +37,11 @@ L3_HOSTA = 'hosta'
 DHCP_HOSTA = 'hosta'
 L3_HOSTB = 'hostb'
 DHCP_HOSTC = 'hostc'
-LBAAS_HOSTA = 'hosta'
-LBAAS_HOSTB = 'hostb'
 
 
-class AgentTestExtensionManager(object):
+class AgentTestExtensionManager:
 
     def get_resources(self):
-        # Add the resources to the global attribute map
-        # This is done here as the setup process won't
-        # initialize the main API router which extends
-        # the global attribute map
-        attributes.RESOURCE_ATTRIBUTE_MAP.update(
-            agent.RESOURCE_ATTRIBUTE_MAP)
         return agent.Agent.get_resources()
 
     def get_actions(self):
@@ -67,22 +54,22 @@ class AgentTestExtensionManager(object):
 # This plugin class is just for testing
 class TestAgentPlugin(db_base_plugin_v2.NeutronDbPluginV2,
                       agents_db.AgentDbMixin):
-    supported_extension_aliases = ["agent"]
+    supported_extension_aliases = [agent_apidef.ALIAS,
+                                   agent_sort_key_apidef.ALIAS]
 
 
-class AgentDBTestMixIn(object):
+class AgentDBTestMixIn:
 
     def _list_agents(self, expected_res_status=None,
-                     neutron_context=None,
                      query_string=None):
         agent_res = self._list('agents',
-                               neutron_context=neutron_context,
-                               query_params=query_string)
+                               query_params=query_string,
+                               as_admin=True)
         if expected_res_status:
-            self.assertEqual(agent_res.status_int, expected_res_status)
+            self.assertEqual(expected_res_status, agent_res.status_int)
         return agent_res
 
-    def _register_agent_states(self, lbaas_agents=False):
+    def _register_agent_states(self):
         """Register two L3 agents and two DHCP agents."""
         l3_hosta = helpers._get_l3_agent_dict(
             L3_HOSTA, constants.L3_AGENT_MODE_LEGACY)
@@ -95,26 +82,17 @@ class AgentDBTestMixIn(object):
         helpers.register_dhcp_agent(host=DHCP_HOSTA)
         helpers.register_dhcp_agent(host=DHCP_HOSTC)
 
-        res = [l3_hosta, l3_hostb, dhcp_hosta, dhcp_hostc]
-        if lbaas_agents:
-            lbaas_hosta = {
-                'binary': 'neutron-loadbalancer-agent',
-                'host': LBAAS_HOSTA,
-                'topic': 'LOADBALANCER_AGENT',
-                'configurations': {'device_drivers': ['haproxy_ns']},
-                'agent_type': constants.AGENT_TYPE_LOADBALANCER}
-            lbaas_hostb = copy.deepcopy(lbaas_hosta)
-            lbaas_hostb['host'] = LBAAS_HOSTB
-            callback = agents_db.AgentExtRpcCallback()
-            callback.report_state(self.adminContext,
-                                  agent_state={'agent_state': lbaas_hosta},
-                                  time=timeutils.strtime())
-            callback.report_state(self.adminContext,
-                                  agent_state={'agent_state': lbaas_hostb},
-                                  time=timeutils.strtime())
-            res += [lbaas_hosta, lbaas_hostb]
+        return [l3_hosta, l3_hostb, dhcp_hosta, dhcp_hostc]
 
-        return res
+    def _register_dvr_agents(self):
+        dvr_snat_agent = helpers.register_l3_agent(
+            host=L3_HOSTA, agent_mode=constants.L3_AGENT_MODE_DVR_SNAT)
+        dvr_agent = helpers.register_l3_agent(
+            host=L3_HOSTB, agent_mode=constants.L3_AGENT_MODE_DVR)
+        return [dvr_snat_agent, dvr_agent]
+
+    def _register_l3_agent(self, host):
+        helpers.register_l3_agent(host)
 
 
 class AgentDBTestCase(AgentDBTestMixIn,
@@ -123,47 +101,43 @@ class AgentDBTestCase(AgentDBTestMixIn,
 
     def setUp(self):
         plugin = 'neutron.tests.unit.extensions.test_agent.TestAgentPlugin'
-        # for these tests we need to enable overlapping ips
-        cfg.CONF.set_default('allow_overlapping_ips', True)
-        self.useFixture(tools.AttributeMapMemento())
         ext_mgr = AgentTestExtensionManager()
-        super(AgentDBTestCase, self).setUp(plugin=plugin, ext_mgr=ext_mgr)
+        super().setUp(plugin=plugin, ext_mgr=ext_mgr)
         self.adminContext = context.get_admin_context()
 
     def test_create_agent(self):
         data = {'agent': {}}
-        _req = self.new_create_request('agents', data, self.fmt)
-        _req.environ['neutron.context'] = context.Context(
-            '', 'tenant_id')
+        _req = self.new_create_request('agents', data, self.fmt, as_admin=True)
         res = _req.get_response(self.ext_api)
-        self.assertEqual(res.status_int, exc.HTTPBadRequest.code)
+        self.assertEqual(exc.HTTPBadRequest.code, res.status_int)
 
     def test_list_agent(self):
         agents = self._register_agent_states()
-        res = self._list('agents')
+        res = self._list('agents', as_admin=True)
         self.assertEqual(len(agents), len(res['agents']))
 
     def test_show_agent(self):
         self._register_agent_states()
         agents = self._list_agents(
-            query_string='binary=neutron-l3-agent')
+            query_string='binary=' + constants.AGENT_PROCESS_L3)
         self.assertEqual(2, len(agents['agents']))
-        agent = self._show('agents', agents['agents'][0]['id'])
-        self.assertEqual('neutron-l3-agent', agent['agent']['binary'])
+        agent = self._show('agents', agents['agents'][0]['id'], as_admin=True)
+        self.assertEqual(constants.AGENT_PROCESS_L3, agent['agent']['binary'])
 
     def test_update_agent(self):
         self._register_agent_states()
         agents = self._list_agents(
-            query_string='binary=neutron-l3-agent&host=' + L3_HOSTB)
+            query_string=('binary=' + constants.AGENT_PROCESS_L3 +
+                          '&host=' + L3_HOSTB))
         self.assertEqual(1, len(agents['agents']))
         com_id = agents['agents'][0]['id']
-        agent = self._show('agents', com_id)
+        agent = self._show('agents', com_id, as_admin=True)
         new_agent = {}
         new_agent['agent'] = {}
         new_agent['agent']['admin_state_up'] = False
         new_agent['agent']['description'] = 'description'
-        self._update('agents', com_id, new_agent)
-        agent = self._show('agents', com_id)
+        self._update('agents', com_id, new_agent, as_admin=True)
+        agent = self._show('agents', com_id, as_admin=True)
         self.assertFalse(agent['agent']['admin_state_up'])
         self.assertEqual('description', agent['agent']['description'])
 
@@ -172,5 +146,68 @@ class AgentDBTestCase(AgentDBTestMixIn,
         self._register_agent_states()
         time.sleep(1.5)
         agents = self._list_agents(
-            query_string='binary=neutron-l3-agent&host=' + L3_HOSTB)
+            query_string=('binary=' + constants.AGENT_PROCESS_L3 +
+                          '&host=' + L3_HOSTB))
         self.assertFalse(agents['agents'][0]['alive'])
+
+    def test_list_agents_sorted_by_host_asc(self):
+        agents = self._register_agent_states()
+        res = self._list(
+            "agents", as_admin=True, query_params="sort_key=host&sort_dir=asc"
+        )
+
+        hosts = [agent['host'] for agent in res['agents']]
+        self.assertEqual(['hosta', 'hosta', 'hostb', 'hostc'], hosts)
+        self.assertEqual(len(agents), len(res['agents']))
+
+    def test_list_agents_sorted_by_host_desc(self):
+        agents = self._register_agent_states()
+        res = self._list(
+            "agents", as_admin=True, query_params="sort_key=host&sort_dir=desc"
+        )
+
+        hosts = [agent['host'] for agent in res['agents']]
+        self.assertEqual(['hostc', 'hostb', 'hosta', 'hosta'], hosts)
+        self.assertEqual(len(agents), len(res['agents']))
+
+    def test_list_agents_with_invalid_sort_key(self):
+        self._register_agent_states()
+
+        invalid_key = "foo"
+        res = self._list(
+            "agents",
+            query_params=f"sort_key={invalid_key}&sort_dir=asc",
+            as_admin=True,
+            expected_code=exc.HTTPBadRequest.code,
+        )
+
+        expected_error_message = (
+            f"['{invalid_key}'] is invalid attribute for sort_keys"
+        )
+
+        self.assertEqual(
+            expected_error_message, res["NeutronError"]["message"]
+        )
+
+    def test_list_agents_with_sort_key_without_sort_dir(self):
+        self._register_agent_states()
+
+        res = self._list('agents',
+                query_params='sort_key=host',
+                as_admin=True,
+                expected_code=exc.HTTPBadRequest.code)
+
+        expected_error_message = (
+            "The number of sort_keys and sort_dirs must be same"
+        )
+
+        self.assertEqual(
+            expected_error_message, res["NeutronError"]["message"]
+        )
+
+    def test_list_agents_with_limit(self):
+        self._register_agent_states()
+
+        res = self._list_agents(query_string='limit=2')
+
+        self.assertEqual(2, len(res['agents']))

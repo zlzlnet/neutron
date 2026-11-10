@@ -15,10 +15,12 @@
 
 import abc
 
+from neutron_lib.api import extensions as api_extensions
+from neutron_lib.services import base
 from oslo_serialization import jsonutils
 
 from neutron.api import extensions
-from neutron import wsgi
+from neutron.api import wsgi
 
 
 class FoxInSocksController(wsgi.Controller):
@@ -27,14 +29,14 @@ class FoxInSocksController(wsgi.Controller):
         return "Try to say this Mr. Knox, sir..."
 
 
-class FoxInSocksPluginInterface(extensions.PluginInterface):
+class FoxInSocksPluginInterface(base.ServicePluginBase, metaclass=abc.ABCMeta):
 
     @abc.abstractmethod
     def method_to_support_foxnsox_extension(self):
         pass
 
 
-class Foxinsocks(object):
+class Foxinsocks(api_extensions.ExtensionDescriptor):
 
     def __init__(self):
         pass
@@ -73,11 +75,11 @@ class Foxinsocks(object):
         request_exts = []
 
         def _goose_handler(req, res):
-            #NOTE: This only handles JSON responses.
+            # NOTE: This only handles JSON responses.
             # You can use content type header to test for XML.
             data = jsonutils.loads(res.body)
             data['FOXNSOX:googoose'] = req.GET.get('chewing')
-            res.body = jsonutils.dumps(data)
+            res.body = jsonutils.dump_as_bytes(data)
             return res
 
         req_ext1 = extensions.RequestExtension('GET', '/dummy_resources/:(id)',
@@ -85,11 +87,11 @@ class Foxinsocks(object):
         request_exts.append(req_ext1)
 
         def _bands_handler(req, res):
-            #NOTE: This only handles JSON responses.
+            # NOTE: This only handles JSON responses.
             # You can use content type header to test for XML.
             data = jsonutils.loads(res.body)
             data['FOXNSOX:big_bands'] = 'Pig Bands!'
-            res.body = jsonutils.dumps(data)
+            res.body = jsonutils.dump_as_bytes(data)
             return res
 
         req_ext2 = extensions.RequestExtension('GET', '/dummy_resources/:(id)',
@@ -98,9 +100,9 @@ class Foxinsocks(object):
         return request_exts
 
     def _add_tweedle_handler(self, input_dict, req, id):
-        return "Tweedle {0} Added.".format(
+        return "Tweedle {} Added.".format(
             input_dict['FOXNSOX:add_tweedle']['name'])
 
     def _delete_tweedle_handler(self, input_dict, req, id):
-        return "Tweedle {0} Deleted.".format(
+        return "Tweedle {} Deleted.".format(
             input_dict['FOXNSOX:delete_tweedle']['name'])

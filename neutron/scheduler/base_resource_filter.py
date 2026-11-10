@@ -15,17 +15,22 @@
 
 import abc
 
+from neutron_lib.db import api as db_api
+from oslo_db import exception as db_exc
 
-class BaseResourceFilter(object):
+from neutron.common import utils as n_utils
+
+
+class BaseResourceFilter(metaclass=abc.ABCMeta):
     """Encapsulate logic that is specific to the resource type."""
     @abc.abstractmethod
     def filter_agents(self, plugin, context, resource):
         """Return the agents that can host the resource."""
 
-    def bind(self, context, agents, resource_id):
+    @n_utils.skip_exceptions(db_exc.DBError)
+    def bind(self, context, agents, resource_id, force_scheduling=False):
         """Bind the resource to the agents."""
-        with context.session.begin(subtransactions=True):
-            res = {}
+        with db_api.CONTEXT_WRITER.using(context):
             for agent in agents:
                 # Load is being incremented here to reflect latest agent load
                 # even within the agent report interval. This will be very
@@ -36,5 +41,5 @@ class BaseResourceFilter(object):
                 # problem because "+ 1" here does not meant to predict
                 # precisely what the load of the agent will be. The value will
                 # be corrected by the agent on the next report interval.
-                res['load'] = agent.load + 1
-                agent.update(res)
+                agent.load += 1
+                agent.update()

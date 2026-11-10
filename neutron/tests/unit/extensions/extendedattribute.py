@@ -12,7 +12,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from neutron.api import extensions
+from neutron_lib.api import extensions
 
 EXTENDED_ATTRIBUTE = 'extended_attribute'
 EXTENDED_ATTRIBUTES_2_0 = {
@@ -46,5 +46,4 @@ class Extendedattribute(extensions.ExtensionDescriptor):
     def get_extended_resources(self, version):
         if version == "2.0":
             return EXTENDED_ATTRIBUTES_2_0
-        else:
-            return {}
+        return {}

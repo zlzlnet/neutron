@@ -14,129 +14,146 @@
 #    under the License.
 
 import abc
+
 import netaddr
+from neutron_lib.api import converters
+from neutron_lib.api import extensions as api_extensions
+from neutron_lib.api import validators
+from neutron_lib import constants as const
+from neutron_lib.db import constants as db_const
+from neutron_lib import exceptions
+from neutron_lib.plugins import directory
+from oslo_utils import netutils
 
-from oslo_config import cfg
-from oslo_utils import uuidutils
-import six
-
+from neutron._i18n import _
 from neutron.api import extensions
-from neutron.api.v2 import attributes as attr
 from neutron.api.v2 import base
-from neutron.common import constants as const
-from neutron.common import exceptions as nexception
-from neutron import manager
-from neutron import quota
+from neutron.common import _constants
+from neutron.conf import quota
+from neutron.extensions import standardattrdescription as stdattr_ext
+from neutron.quota import resource_registry
 
 
 # Security group Exceptions
-class SecurityGroupInvalidPortRange(nexception.InvalidInput):
+class SecurityGroupInvalidPortRange(exceptions.InvalidInput):
     message = _("For TCP/UDP protocols, port_range_min must be "
                 "<= port_range_max")
 
 
-class SecurityGroupInvalidPortValue(nexception.InvalidInput):
+class SecurityGroupInvalidProtocolForPort(exceptions.InvalidInput):
+    message = _("Ports cannot be specified for protocol %(protocol)s. "
+                "Ports are only supported for %(valid_port_protocols)s.")
+
+
+class SecurityGroupInvalidPortValue(exceptions.InvalidInput):
     message = _("Invalid value for port %(port)s")
 
 
-class SecurityGroupInvalidIcmpValue(nexception.InvalidInput):
+class SecurityGroupInvalidIcmpValue(exceptions.InvalidInput):
     message = _("Invalid value for ICMP %(field)s (%(attr)s) "
                 "%(value)s. It must be 0 to 255.")
 
 
-class SecurityGroupMissingIcmpType(nexception.InvalidInput):
+class SecurityGroupEthertypeConflictWithProtocol(exceptions.InvalidInput):
+    message = _("Invalid ethertype %(ethertype)s for protocol "
+                "%(protocol)s.")
+
+
+class SecurityGroupMissingIcmpType(exceptions.InvalidInput):
     message = _("ICMP code (port-range-max) %(value)s is provided"
                 " but ICMP type (port-range-min) is missing.")
 
 
-class SecurityGroupInUse(nexception.InUse):
+class SecurityGroupInUse(exceptions.InUse):
     message = _("Security Group %(id)s %(reason)s.")
 
     def __init__(self, **kwargs):
         if 'reason' not in kwargs:
             kwargs['reason'] = _("in use")
-        super(SecurityGroupInUse, self).__init__(**kwargs)
+        super().__init__(**kwargs)
 
 
-class SecurityGroupCannotRemoveDefault(nexception.InUse):
+class SecurityGroupCannotRemoveDefault(exceptions.InUse):
     message = _("Insufficient rights for removing default security group.")
 
 
-class SecurityGroupCannotUpdateDefault(nexception.InUse):
+class SecurityGroupCannotUpdateDefault(exceptions.InUse):
     message = _("Updating default security group not allowed.")
 
 
-class SecurityGroupDefaultAlreadyExists(nexception.InUse):
+class SecurityGroupDefaultAlreadyExists(exceptions.InUse):
     message = _("Default security group already exists.")
 
 
-class SecurityGroupRuleInvalidProtocol(nexception.InvalidInput):
+class SecurityGroupRuleInvalidProtocol(exceptions.InvalidInput):
     message = _("Security group rule protocol %(protocol)s not supported. "
                 "Only protocol values %(values)s and integer representations "
                 "[0 to 255] are supported.")
 
 
-class SecurityGroupRulesNotSingleTenant(nexception.InvalidInput):
-    message = _("Multiple tenant_ids in bulk security group rule create"
+class SecurityGroupRulesNotSingleProject(exceptions.InvalidInput):
+    message = _("Multiple project_ids in bulk security group rule create"
                 " not allowed")
 
 
-class SecurityGroupRemoteGroupAndRemoteIpPrefix(nexception.InvalidInput):
-    message = _("Only remote_ip_prefix or remote_group_id may "
-                "be provided.")
+class SecurityGroupMultipleRemoteEntites(exceptions.InvalidInput):
+    message = _("Only one of remote_ip_prefix or remote_group_id or "
+                "remote_address_group_id may be provided.")
 
 
-class SecurityGroupProtocolRequiredWithPorts(nexception.InvalidInput):
-    message = _("Must also specifiy protocol if port range is given.")
+class SecurityGroupProtocolRequiredWithPorts(exceptions.InvalidInput):
+    message = _("Must also specify protocol if port range is given.")
 
 
-class SecurityGroupNotSingleGroupRules(nexception.InvalidInput):
+class SecurityGroupNotSingleGroupRules(exceptions.InvalidInput):
     message = _("Only allowed to update rules for "
                 "one security profile at a time")
 
 
-class SecurityGroupNotFound(nexception.NotFound):
+class SecurityGroupNotFound(exceptions.NotFound):
     message = _("Security group %(id)s does not exist")
 
 
-class SecurityGroupRuleNotFound(nexception.NotFound):
+class SecurityGroupRuleNotFound(exceptions.NotFound):
     message = _("Security group rule %(id)s does not exist")
 
 
-class DuplicateSecurityGroupRuleInPost(nexception.InUse):
+class DuplicateSecurityGroupRuleInPost(exceptions.InUse):
     message = _("Duplicate Security Group Rule in POST.")
 
 
-class SecurityGroupRuleExists(nexception.InUse):
-    message = _("Security group rule already exists. Rule id is %(id)s.")
+class SecurityGroupRuleExists(exceptions.InUse):
+    message = _("Security group rule already exists. Rule id is %(rule_id)s.")
 
 
-class SecurityGroupRuleInUse(nexception.InUse):
+class SecurityGroupRuleInUse(exceptions.InUse):
     message = _("Security Group Rule %(id)s %(reason)s.")
 
     def __init__(self, **kwargs):
         if 'reason' not in kwargs:
             kwargs['reason'] = _("in use")
-        super(SecurityGroupRuleInUse, self).__init__(**kwargs)
+        super().__init__(**kwargs)
 
 
-class SecurityGroupRuleParameterConflict(nexception.InvalidInput):
+class SecurityGroupRuleParameterConflict(exceptions.InvalidInput):
     message = _("Conflicting value ethertype %(ethertype)s for CIDR %(cidr)s")
 
 
-class SecurityGroupConflict(nexception.Conflict):
+class SecurityGroupConflict(exceptions.Conflict):
     message = _("Error %(reason)s while attempting the operation.")
 
 
-def convert_protocol(value):
-    if value is None:
-        return
+class SecurityGroupRuleInvalidEtherType(exceptions.InvalidInput):
+    message = _("Security group rule for ethertype '%(ethertype)s' not "
+                "supported. Allowed values are %(values)s.")
+
+
+def convert_protocol(value) -> str | None:
+    if value in _constants.SG_RULE_PROTO_ANY:
+        return None
     try:
         val = int(value)
-        if val >= 0 and val <= 255:
-            # Set value of protocol number to string due to bug 1381379,
-            # PostgreSQL fails when it tries to compare integer with string,
-            # that exists in db.
+        if 0 <= val <= 255:
             return str(value)
         raise SecurityGroupRuleInvalidProtocol(
             protocol=value, values=sg_supported_protocols)
@@ -151,34 +168,21 @@ def convert_protocol(value):
 
 
 def convert_ethertype_to_case_insensitive(value):
-    if isinstance(value, six.string_types):
+    if isinstance(value, str):
         for ethertype in sg_supported_ethertypes:
             if ethertype.lower() == value.lower():
                 return ethertype
+    raise SecurityGroupRuleInvalidEtherType(
+        ethertype=value, values=sg_supported_ethertypes)
 
 
 def convert_validate_port_value(port):
     if port is None:
         return port
-    try:
-        val = int(port)
-    except (ValueError, TypeError):
-        raise SecurityGroupInvalidPortValue(port=port)
 
-    if val >= 0 and val <= 65535:
-        return val
-    else:
-        raise SecurityGroupInvalidPortValue(port=port)
-
-
-def convert_to_uuid_list_or_none(value_list):
-    if value_list is None:
-        return
-    for sg_id in value_list:
-        if not uuidutils.is_uuid_like(sg_id):
-            msg = _("'%s' is not an integer or uuid") % sg_id
-            raise nexception.InvalidInput(error_message=msg)
-    return value_list
+    if netutils.is_valid_port(port):
+        return int(port)
+    raise SecurityGroupInvalidPortValue(port=port)
 
 
 def convert_ip_prefix_to_cidr(ip_prefix):
@@ -188,95 +192,113 @@ def convert_ip_prefix_to_cidr(ip_prefix):
         cidr = netaddr.IPNetwork(ip_prefix)
         return str(cidr)
     except (ValueError, TypeError, netaddr.AddrFormatError):
-        raise nexception.InvalidCIDR(input=ip_prefix)
+        raise exceptions.InvalidCIDR(input=ip_prefix)
 
 
-def _validate_name_not_default(data, valid_values=None):
+def _validate_name_not_default(data, max_len=db_const.NAME_FIELD_SIZE):
+    msg = validators.validate_string(data, max_len)
+    if msg:
+        return msg
     if data.lower() == "default":
         raise SecurityGroupDefaultAlreadyExists()
 
 
-attr.validators['type:name_not_default'] = _validate_name_not_default
+validators.add_validator('name_not_default', _validate_name_not_default)
 
-sg_supported_protocols = [None, const.PROTO_NAME_TCP, const.PROTO_NAME_UDP,
-                          const.PROTO_NAME_ICMP, const.PROTO_NAME_ICMP_V6]
+sg_supported_protocols = (_constants.SG_RULE_PROTO_ANY +
+                          tuple(const.IP_PROTOCOL_MAP.keys()))
 sg_supported_ethertypes = ['IPv4', 'IPv6']
+SECURITYGROUPS = 'security_groups'
+SECURITYGROUPRULES = 'security_group_rules'
 
 # Attribute Map
 RESOURCE_ATTRIBUTE_MAP = {
-    'security_groups': {
+    SECURITYGROUPS: {
         'id': {'allow_post': False, 'allow_put': False,
                'validate': {'type:uuid': None},
                'is_visible': True,
+               'is_filter': True,
+               'is_sort_key': True,
                'primary_key': True},
         'name': {'allow_post': True, 'allow_put': True,
-                 'is_visible': True, 'default': '',
-                 'validate': {'type:name_not_default': attr.NAME_MAX_LEN}},
-        'description': {'allow_post': True, 'allow_put': True,
-                        'validate': {'type:string': attr.DESCRIPTION_MAX_LEN},
-                        'is_visible': True, 'default': ''},
+                 'is_visible': True, 'default': '', 'is_filter': True,
+                 'is_sort_key': True,
+                 'validate': {
+                     'type:name_not_default': db_const.NAME_FIELD_SIZE}},
         'tenant_id': {'allow_post': True, 'allow_put': False,
                       'required_by_policy': True,
-                      'is_visible': True},
-        'security_group_rules': {'allow_post': False, 'allow_put': False,
-                                 'is_visible': True},
+                      'is_sort_key': True,
+                      'validate': {
+                          'type:string': db_const.PROJECT_ID_FIELD_SIZE},
+                      'is_visible': True, 'is_filter': True},
+        SECURITYGROUPRULES: {'allow_post': False, 'allow_put': False,
+                             'is_visible': True},
     },
-    'security_group_rules': {
+    SECURITYGROUPRULES: {
         'id': {'allow_post': False, 'allow_put': False,
                'validate': {'type:uuid': None},
                'is_visible': True,
+               'is_filter': True,
+               'is_sort_key': True,
                'primary_key': True},
         'security_group_id': {'allow_post': True, 'allow_put': False,
-                              'is_visible': True, 'required_by_policy': True},
+                              'is_visible': True, 'required_by_policy': True,
+                              'is_sort_key': True, 'is_filter': True,
+                              'validate': {
+                                  'type:string': db_const.UUID_FIELD_SIZE}},
         'remote_group_id': {'allow_post': True, 'allow_put': False,
-                            'default': None, 'is_visible': True},
-        'direction': {'allow_post': True, 'allow_put': True,
-                      'is_visible': True,
+                            'default': None, 'is_visible': True,
+                            'is_sort_key': True, 'is_filter': True},
+        'direction': {'allow_post': True, 'allow_put': False,
+                      'is_visible': True, 'is_filter': True,
+                      'is_sort_key': True,
                       'validate': {'type:values': ['ingress', 'egress']}},
         'protocol': {'allow_post': True, 'allow_put': False,
                      'is_visible': True, 'default': None,
+                     'is_sort_key': True, 'is_filter': True,
                      'convert_to': convert_protocol},
         'port_range_min': {'allow_post': True, 'allow_put': False,
                            'convert_to': convert_validate_port_value,
-                           'default': None, 'is_visible': True},
+                           'default': None, 'is_visible': True,
+                           'is_sort_key': True, 'is_filter': True},
         'port_range_max': {'allow_post': True, 'allow_put': False,
                            'convert_to': convert_validate_port_value,
-                           'default': None, 'is_visible': True},
+                           'default': None, 'is_visible': True,
+                           'is_sort_key': True, 'is_filter': True},
         'ethertype': {'allow_post': True, 'allow_put': False,
                       'is_visible': True, 'default': 'IPv4',
+                      'is_filter': True, 'is_sort_key': True,
                       'convert_to': convert_ethertype_to_case_insensitive,
                       'validate': {'type:values': sg_supported_ethertypes}},
         'remote_ip_prefix': {'allow_post': True, 'allow_put': False,
                              'default': None, 'is_visible': True,
+                             'is_sort_key': True, 'is_filter': True,
                              'convert_to': convert_ip_prefix_to_cidr},
         'tenant_id': {'allow_post': True, 'allow_put': False,
                       'required_by_policy': True,
-                      'is_visible': True},
+                      'is_sort_key': True,
+                      'validate': {
+                          'type:string': db_const.PROJECT_ID_FIELD_SIZE},
+                      'is_visible': True, 'is_filter': True},
     }
 }
 
 
-SECURITYGROUPS = 'security_groups'
 EXTENDED_ATTRIBUTES_2_0 = {
     'ports': {SECURITYGROUPS: {'allow_post': True,
                                'allow_put': True,
                                'is_visible': True,
-                               'convert_to': convert_to_uuid_list_or_none,
-                               'default': attr.ATTR_NOT_SPECIFIED}}}
-security_group_quota_opts = [
-    cfg.IntOpt('quota_security_group',
-               default=10,
-               help=_('Number of security groups allowed per tenant. '
-                      'A negative value means unlimited.')),
-    cfg.IntOpt('quota_security_group_rule',
-               default=100,
-               help=_('Number of security rules allowed per tenant. '
-                      'A negative value means unlimited.')),
-]
-cfg.CONF.register_opts(security_group_quota_opts, 'QUOTAS')
+                               'is_filter': True,
+                               'convert_to':
+                                   converters.convert_none_to_empty_list,
+                               'validate': {'type:uuid_list': None},
+                               'default': const.ATTR_NOT_SPECIFIED}}}
+
+# Register the configuration options
+quota.register_quota_opts(quota.security_group_quota_opts)
 
 
-class Securitygroup(extensions.ExtensionDescriptor):
+class Securitygroup(api_extensions.ExtensionDescriptor):
     """Security group extension."""
 
     @classmethod
@@ -298,14 +320,12 @@ class Securitygroup(extensions.ExtensionDescriptor):
     @classmethod
     def get_resources(cls):
         """Returns Ext Resources."""
-        my_plurals = [(key, key[:-1]) for key in RESOURCE_ATTRIBUTE_MAP.keys()]
-        attr.PLURALS.update(dict(my_plurals))
         exts = []
-        plugin = manager.NeutronManager.get_plugin()
+        plugin = directory.get_plugin()
         for resource_name in ['security_group', 'security_group_rule']:
             collection_name = resource_name.replace('_', '-') + "s"
-            params = RESOURCE_ATTRIBUTE_MAP.get(resource_name + "s", dict())
-            quota.QUOTAS.register_resource_by_name(resource_name)
+            params = RESOURCE_ATTRIBUTE_MAP.get(resource_name + "s", {})
+            resource_registry.register_resource_by_name(resource_name)
             controller = base.create_resource(collection_name,
                                               resource_name,
                                               plugin, params, allow_bulk=True,
@@ -319,16 +339,21 @@ class Securitygroup(extensions.ExtensionDescriptor):
 
         return exts
 
+    def update_attributes_map(self, attributes):
+        super().update_attributes_map(
+            attributes, extension_attrs_map=RESOURCE_ATTRIBUTE_MAP)
+
     def get_extended_resources(self, version):
         if version == "2.0":
             return dict(list(EXTENDED_ATTRIBUTES_2_0.items()) +
                         list(RESOURCE_ATTRIBUTE_MAP.items()))
-        else:
-            return {}
+        return {}
+
+    def get_required_extensions(self):
+        return [stdattr_ext.Standardattrdescription.get_alias()]
 
 
-@six.add_metaclass(abc.ABCMeta)
-class SecurityGroupPluginBase(object):
+class SecurityGroupPluginBase(metaclass=abc.ABCMeta):
 
     @abc.abstractmethod
     def create_security_group(self, context, security_group):
@@ -350,6 +375,10 @@ class SecurityGroupPluginBase(object):
 
     @abc.abstractmethod
     def get_security_group(self, context, id, fields=None):
+        pass
+
+    @abc.abstractmethod
+    def get_default_security_group(self, context, project_id):
         pass
 
     @abc.abstractmethod

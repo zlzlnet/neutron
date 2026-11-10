@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import mock
+from unittest import mock
 
 from neutron.api.rpc.handlers import dvr_rpc
 from neutron.tests import base
@@ -27,7 +27,7 @@ class DVRServerRpcApiTestCase(base.BaseTestCase):
         self.rpc = dvr_rpc.DVRServerRpcApi('fake_topic')
         self.mock_cctxt = self.rpc.client.prepare.return_value
         self.ctxt = mock.ANY
-        super(DVRServerRpcApiTestCase, self).setUp()
+        super().setUp()
 
     def test_get_dvr_mac_address_by_host(self):
         self.rpc.get_dvr_mac_address_by_host(self.ctxt, 'foo_host')
@@ -47,7 +47,9 @@ class DVRServerRpcApiTestCase(base.BaseTestCase):
             host='foo_host', subnet='foo_subnet')
 
     def test_get_subnet_for_dvr(self):
-        self.rpc.get_subnet_for_dvr(self.ctxt, 'foo_subnet')
+        self.rpc.get_subnet_for_dvr(
+            self.ctxt, 'foo_subnet', fixed_ips='foo_fixed_ips')
         self.mock_cctxt.call.assert_called_with(
             self.ctxt, 'get_subnet_for_dvr',
-            subnet='foo_subnet')
+            subnet='foo_subnet',
+            fixed_ips='foo_fixed_ips')

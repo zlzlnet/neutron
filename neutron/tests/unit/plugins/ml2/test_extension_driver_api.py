@@ -10,11 +10,13 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import mock
+from unittest import mock
 
-from neutron import context
-from neutron import manager
-from neutron.plugins.ml2 import config
+from neutron_lib import constants
+from neutron_lib import context
+from neutron_lib.plugins import directory
+from oslo_config import cfg
+
 from neutron.tests.unit.plugins.ml2.drivers import ext_test
 from neutron.tests.unit.plugins.ml2 import test_plugin
 
@@ -24,12 +26,61 @@ class ExtensionDriverTestCase(test_plugin.Ml2PluginV2TestCase):
     _extension_drivers = ['test']
 
     def setUp(self):
-        config.cfg.CONF.set_override('extension_drivers',
-                                     self._extension_drivers,
-                                     group='ml2')
-        super(ExtensionDriverTestCase, self).setUp()
-        self._plugin = manager.NeutronManager.get_plugin()
+        cfg.CONF.set_override('extension_drivers',
+                              self._extension_drivers,
+                              group='ml2')
+        super().setUp()
+        self._plugin = directory.get_plugin()
         self._ctxt = context.get_admin_context()
+
+    def _verify_network_create(self, code, exc_reason):
+        data = {'network': {'name': 'net1'}}
+        req = self.new_create_request('networks', data)
+        res = req.get_response(self.api)
+        self.assertEqual(code, res.status_int)
+
+        network = self.deserialize(self.fmt, res)
+        if exc_reason:
+            self.assertEqual(exc_reason,
+                             network['NeutronError']['type'])
+
+        return network
+
+    def _verify_network_update(self, network, code, exc_reason):
+        net_id = network['network']['id']
+        new_name = 'a_brand_new_name'
+        data = {'network': {'name': new_name}}
+        req = self.new_update_request('networks', data, net_id)
+        res = req.get_response(self.api)
+        self.assertEqual(code, res.status_int)
+        error = self.deserialize(self.fmt, res)
+        self.assertEqual(exc_reason,
+                         error['NeutronError']['type'])
+
+    def test_faulty_process_create(self):
+        with mock.patch.object(ext_test.TestExtensionDriver,
+                               'process_create_network',
+                               side_effect=TypeError):
+            self._verify_network_create(500, 'HTTPInternalServerError')
+            # Verify the operation is rolled back
+            query_params = "project_id=%s" % self._project_id
+            nets = self._list('networks', query_params=query_params)
+            self.assertFalse(nets['networks'])
+
+    def test_faulty_process_update(self):
+        with mock.patch.object(ext_test.TestExtensionDriver,
+                               'process_update_network',
+                               side_effect=TypeError):
+            network = self._verify_network_create(201, None)
+            self._verify_network_update(network, 500,
+                                        'HTTPInternalServerError')
+
+    def test_faulty_extend_dict(self):
+        with mock.patch.object(ext_test.TestExtensionDriver,
+                               'extend_network_dict',
+                               side_effect=[None, None, TypeError]):
+            network = self._verify_network_create(201, None)
+            self._verify_network_update(network, 400, 'ExtensionDriverError')
 
     def test_network_attr(self):
         with self.network() as network:
@@ -40,14 +91,14 @@ class ExtensionDriverTestCase(test_plugin.Ml2PluginV2TestCase):
             # Test list networks
             res = self._list('networks')
             val = res['networks'][0].get('network_extension')
-            self.assertEqual('Test_Network_Extension_extend', val)
+            self.assertEqual('default_network_extension', val)
 
             # Test network update
             data = {'network':
                     {'network_extension': 'Test_Network_Extension_Update'}}
             res = self._update('networks', network['network']['id'], data)
             val = res['network'].get('network_extension')
-            self.assertEqual('Test_Network_Extension_Update_update', val)
+            self.assertEqual('Test_Network_Extension_Update', val)
 
     def test_subnet_attr(self):
         with self.subnet() as subnet:
@@ -58,14 +109,14 @@ class ExtensionDriverTestCase(test_plugin.Ml2PluginV2TestCase):
             # Test list subnets
             res = self._list('subnets')
             val = res['subnets'][0].get('subnet_extension')
-            self.assertEqual('Test_Subnet_Extension_extend', val)
+            self.assertEqual('default_subnet_extension', val)
 
             # Test subnet update
             data = {'subnet':
                     {'subnet_extension': 'Test_Subnet_Extension_Update'}}
             res = self._update('subnets', subnet['subnet']['id'], data)
             val = res['subnet'].get('subnet_extension')
-            self.assertEqual('Test_Subnet_Extension_Update_update', val)
+            self.assertEqual('Test_Subnet_Extension_Update', val)
 
     def test_port_attr(self):
         with self.port() as port:
@@ -76,13 +127,13 @@ class ExtensionDriverTestCase(test_plugin.Ml2PluginV2TestCase):
             # Test list ports
             res = self._list('ports')
             val = res['ports'][0].get('port_extension')
-            self.assertEqual('Test_Port_Extension_extend', val)
+            self.assertEqual('default_port_extension', val)
 
             # Test port update
             data = {'port': {'port_extension': 'Test_Port_Extension_Update'}}
             res = self._update('ports', port['port']['id'], data)
             val = res['port'].get('port_extension')
-            self.assertEqual('Test_Port_Extension_Update_update', val)
+            self.assertEqual('Test_Port_Extension_Update', val)
 
     def test_extend_network_dict(self):
         with mock.patch.object(ext_test.TestExtensionDriver,
@@ -125,11 +176,11 @@ class DBExtensionDriverTestCase(test_plugin.Ml2PluginV2TestCase):
     _extension_drivers = ['testdb']
 
     def setUp(self):
-        config.cfg.CONF.set_override('extension_drivers',
-                                     self._extension_drivers,
-                                     group='ml2')
-        super(DBExtensionDriverTestCase, self).setUp()
-        self._plugin = manager.NeutronManager.get_plugin()
+        cfg.CONF.set_override('extension_drivers',
+                              self._extension_drivers,
+                              group='ml2')
+        super().setUp()
+        self._plugin = directory.get_plugin()
         self._ctxt = context.get_admin_context()
 
     def test_network_attr(self):
@@ -147,7 +198,7 @@ class DBExtensionDriverTestCase(test_plugin.Ml2PluginV2TestCase):
             val = res['networks'][0]['network_extension']
             self.assertEqual("", val)
 
-        # Test create with explict value.
+        # Test create with explicit value.
         res = self._create_network(self.fmt,
                                    'test-network', True,
                                    arg_list=('network_extension', ),
@@ -185,12 +236,12 @@ class DBExtensionDriverTestCase(test_plugin.Ml2PluginV2TestCase):
             self.assertEqual("", val)
 
         with self.network() as network:
-            # Test create with explict value.
+            # Test create with explicit value.
             data = {'subnet':
                     {'network_id': network['network']['id'],
                      'cidr': '10.1.0.0/24',
-                     'ip_version': '4',
-                     'tenant_id': self._tenant_id,
+                     'ip_version': constants.IP_VERSION_4,
+                     'project_id': self._project_id,
                      'subnet_extension': 'abc'}}
             req = self.new_create_request('subnets', data, self.fmt)
             res = req.get_response(self.api)
@@ -227,7 +278,7 @@ class DBExtensionDriverTestCase(test_plugin.Ml2PluginV2TestCase):
             self.assertEqual("", val)
 
         with self.network() as network:
-            # Test create with explict value.
+            # Test create with explicit value.
             res = self._create_port(self.fmt,
                                     network['network']['id'],
                                     arg_list=('port_extension', ),

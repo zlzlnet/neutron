@@ -13,7 +13,9 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from neutron.common import exceptions
+from neutron_lib import exceptions
+
+from neutron._i18n import _
 
 
 class InvalidSubnetRequestType(exceptions.BadRequest):
@@ -29,11 +31,6 @@ class InvalidAddressType(exceptions.NeutronException):
     message = _("Unknown address type %(address_type)s")
 
 
-class IpAddressAllocationNotFound(exceptions.NeutronException):
-    message = _("Unable to find IP address %(ip_address)s on subnet "
-                "%(subnet_id)s")
-
-
 class IpAddressAlreadyAllocated(exceptions.Conflict):
     message = _("IP address %(ip)s already allocated in subnet %(subnet_id)s")
 
@@ -42,17 +39,16 @@ class InvalidIpForSubnet(exceptions.BadRequest):
     message = _("IP address %(ip)s does not belong to subnet %(subnet_id)s")
 
 
-class InvalidAddressRequest(exceptions.BadRequest):
-    message = _("The address allocation request could not be satisfied "
-                "because: %(reason)s")
-
-
 class InvalidSubnetRequest(exceptions.BadRequest):
     message = _("The subnet request could not be satisfied because: "
                 "%(reason)s")
 
 
-class AllocationOnAutoAddressSubnet(exceptions.NeutronException):
+class IPAddressChangeNotAllowed(exceptions.BadRequest):
+    message = _("IP updates for port %(port_id)s are not allowed")
+
+
+class AllocationOnAutoAddressSubnet(exceptions.InvalidInput):
     message = _("IPv6 address %(ip)s cannot be directly "
                 "assigned to a port on subnet %(subnet_id)s as the "
                 "subnet is configured for automatic addresses")
@@ -60,3 +56,22 @@ class AllocationOnAutoAddressSubnet(exceptions.NeutronException):
 
 class IpAddressGenerationFailure(exceptions.Conflict):
     message = _("No more IP addresses available for subnet %(subnet_id)s.")
+
+
+class IpAddressGenerationFailureAllSubnets(IpAddressGenerationFailure):
+    message = _("No more IP addresses available.")
+
+
+class IpAddressGenerationFailureNoMatchingSubnet(IpAddressGenerationFailure):
+    message = _("No valid service subnet for the given device owner, "
+                "network %(network_id)s, service type %(service_type)s.")
+
+
+class IpamValueInvalid(exceptions.Conflict):
+    def __init__(self, message=None):
+        self.message = message
+        super().__init__()
+
+
+class DeferIpam(exceptions.NeutronException):
+    message = _("Exception used to signal that IP allocation is deferred")

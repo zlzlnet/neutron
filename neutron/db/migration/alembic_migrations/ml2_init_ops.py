@@ -27,18 +27,24 @@ def upgrade():
         sa.Column('vlan_id', sa.Integer(), autoincrement=False,
                   nullable=False),
         sa.Column('allocated', sa.Boolean(), nullable=False),
-        sa.PrimaryKeyConstraint('physical_network', 'vlan_id'))
+        sa.PrimaryKeyConstraint('physical_network', 'vlan_id'),
+        sa.Index(op.f('ix_ml2_vlan_allocations_physical_network_allocated'),
+                 'physical_network', 'allocated'))
 
     op.create_table(
         'ml2_vxlan_endpoints',
         sa.Column('ip_address', sa.String(length=64), nullable=False),
         sa.Column('udp_port', sa.Integer(), autoincrement=False,
                   nullable=False),
+        sa.Column('host', sa.String(length=255), nullable=True),
+        sa.UniqueConstraint('host', name='unique_ml2_vxlan_endpoints0host'),
         sa.PrimaryKeyConstraint('ip_address'))
 
     op.create_table(
         'ml2_gre_endpoints',
         sa.Column('ip_address', sa.String(length=64), nullable=False),
+        sa.Column('host', sa.String(length=255), nullable=True),
+        sa.UniqueConstraint('host', name='unique_ml2_gre_endpoints0host'),
         sa.PrimaryKeyConstraint('ip_address'))
 
     op.create_table(
@@ -46,7 +52,7 @@ def upgrade():
         sa.Column('vxlan_vni', sa.Integer(), autoincrement=False,
                   nullable=False),
         sa.Column('allocated', sa.Boolean(), nullable=False,
-                  server_default=sa.sql.false()),
+                  server_default=sa.sql.false(), index=True),
         sa.PrimaryKeyConstraint('vxlan_vni'))
 
     op.create_table(
@@ -54,7 +60,7 @@ def upgrade():
         sa.Column('gre_id', sa.Integer(), autoincrement=False,
                   nullable=False),
         sa.Column('allocated', sa.Boolean(), nullable=False,
-                  server_default=sa.sql.false()),
+                  server_default=sa.sql.false(), index=True),
         sa.PrimaryKeyConstraint('gre_id'))
 
     op.create_table(
@@ -71,6 +77,8 @@ def upgrade():
         sa.Column('segmentation_id', sa.Integer(), nullable=True),
         sa.Column('is_dynamic', sa.Boolean(), nullable=False,
                   server_default=sa.sql.false()),
+        sa.Column('segment_index', sa.Integer(), nullable=False,
+                  server_default='0'),
         sa.ForeignKeyConstraint(['network_id'], ['networks.id'],
                                 ondelete='CASCADE'),
         sa.PrimaryKeyConstraint('id'))
@@ -81,8 +89,6 @@ def upgrade():
         sa.Column('host', sa.String(length=255), nullable=False,
                   server_default=''),
         sa.Column('vif_type', sa.String(length=64), nullable=False),
-        sa.Column('driver', sa.String(length=64), nullable=True),
-        sa.Column('segment', sa.String(length=36), nullable=True),
         sa.Column('vnic_type', sa.String(length=64), nullable=False,
                   server_default='normal'),
         sa.Column('profile', sa.String(length=4095), nullable=False,
@@ -91,42 +97,17 @@ def upgrade():
                   server_default=''),
         sa.ForeignKeyConstraint(['port_id'], ['ports.id'],
                                 ondelete='CASCADE'),
-        sa.ForeignKeyConstraint(['segment'], ['ml2_network_segments.id'],
-                                ondelete='SET NULL'),
         sa.PrimaryKeyConstraint('port_id'))
 
     op.create_table(
-        'cisco_ml2_nexusport_bindings',
-        sa.Column('binding_id', sa.Integer(), nullable=False),
-        sa.Column('port_id', sa.String(length=255), nullable=True),
-        sa.Column('vlan_id', sa.Integer(), autoincrement=False,
-                  nullable=False),
-        sa.Column('switch_ip', sa.String(length=255), nullable=True),
-        sa.Column('instance_id', sa.String(length=255), nullable=True),
-        sa.PrimaryKeyConstraint('binding_id'),
+        'ml2_port_binding_levels',
+        sa.Column('port_id', sa.String(length=36), nullable=False),
+        sa.Column('host', sa.String(length=255), nullable=False),
+        sa.Column('level', sa.Integer(), autoincrement=False, nullable=False),
+        sa.Column('driver', sa.String(length=64), nullable=True),
+        sa.Column('segment_id', sa.String(length=36), nullable=True),
+        sa.ForeignKeyConstraint(['port_id'], ['ports.id'], ondelete='CASCADE'),
+        sa.ForeignKeyConstraint(['segment_id'], ['ml2_network_segments.id'],
+                                ondelete='SET NULL'),
+        sa.PrimaryKeyConstraint('port_id', 'host', 'level')
     )
-
-    op.create_table(
-        'arista_provisioned_nets',
-        sa.Column('tenant_id', sa.String(length=255), nullable=True),
-        sa.Column('id', sa.String(length=36), nullable=False),
-        sa.Column('network_id', sa.String(length=36), nullable=True),
-        sa.Column('segmentation_id', sa.Integer(),
-                  autoincrement=False, nullable=True),
-        sa.PrimaryKeyConstraint('id'))
-
-    op.create_table(
-        'arista_provisioned_vms',
-        sa.Column('tenant_id', sa.String(length=255), nullable=True),
-        sa.Column('id', sa.String(length=36), nullable=False),
-        sa.Column('vm_id', sa.String(length=255), nullable=True),
-        sa.Column('host_id', sa.String(length=255), nullable=True),
-        sa.Column('port_id', sa.String(length=36), nullable=True),
-        sa.Column('network_id', sa.String(length=36), nullable=True),
-        sa.PrimaryKeyConstraint('id'))
-
-    op.create_table(
-        'arista_provisioned_tenants',
-        sa.Column('tenant_id', sa.String(length=255), nullable=True),
-        sa.Column('id', sa.String(length=36), nullable=False),
-        sa.PrimaryKeyConstraint('id'))

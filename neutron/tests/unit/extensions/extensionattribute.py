@@ -15,10 +15,12 @@
 
 import abc
 
+from neutron_lib.api import extensions as api_extensions
+from neutron_lib.plugins import directory
+
 from neutron.api import extensions
 from neutron.api.v2 import base
-from neutron import manager
-from neutron import quota
+from neutron.quota import resource_registry
 
 
 # Attribute Map
@@ -38,7 +40,7 @@ RESOURCE_ATTRIBUTE_MAP = {
 }
 
 
-class Extensionattribute(extensions.ExtensionDescriptor):
+class Extensionattribute(api_extensions.ExtensionDescriptor):
 
     @classmethod
     def get_name(cls):
@@ -57,19 +59,19 @@ class Extensionattribute(extensions.ExtensionDescriptor):
         return "2013-02-05T10:00:00-00:00"
 
     def update_attributes_map(self, attributes):
-        super(Extensionattribute, self).update_attributes_map(
+        super().update_attributes_map(
             attributes, extension_attrs_map=RESOURCE_ATTRIBUTE_MAP)
 
     @classmethod
     def get_resources(cls):
         """Returns Ext Resources."""
         exts = []
-        plugin = manager.NeutronManager.get_plugin()
+        plugin = directory.get_plugin()
         resource_name = 'ext_test_resource'
         collection_name = resource_name + "s"
-        params = RESOURCE_ATTRIBUTE_MAP.get(collection_name, dict())
+        params = RESOURCE_ATTRIBUTE_MAP.get(collection_name, {})
 
-        quota.QUOTAS.register_resource_by_name(resource_name)
+        resource_registry.register_resource_by_name(resource_name)
 
         controller = base.create_resource(collection_name,
                                           resource_name,
@@ -86,11 +88,10 @@ class Extensionattribute(extensions.ExtensionDescriptor):
     def get_extended_resources(self, version):
         if version == "2.0":
             return RESOURCE_ATTRIBUTE_MAP
-        else:
-            return {}
+        return {}
 
 
-class ExtensionObjectTestPluginBase(object):
+class ExtensionObjectTestPluginBase:
 
     @abc.abstractmethod
     def create_ext_test_resource(self, context, router):

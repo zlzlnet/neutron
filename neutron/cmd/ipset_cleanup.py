@@ -16,10 +16,10 @@
 from oslo_config import cfg
 from oslo_log import log as logging
 
-from neutron.agent.linux import ipset_manager
 from neutron.agent.linux import utils
 from neutron.common import config
-from neutron.i18n import _LE, _LI
+from neutron.conf.agent import cmd as command
+from neutron.conf.agent import common as agent_config
 
 
 LOG = logging.getLogger(__name__)
@@ -31,43 +31,34 @@ def setup_conf():
     Use separate setup_conf for the utility because there are many options
     from the main config that do not apply during clean-up.
     """
-
-    cli_opts = [
-        cfg.BoolOpt('allsets',
-                    default=False,
-                    help=_('Destroy all IPsets.')),
-        cfg.BoolOpt('force',
-                    default=False,
-                    help=_('Destroy IPsets even if there is an iptables '
-                           'reference.')),
-        cfg.StrOpt('prefix',
-                   default=ipset_manager.NET_PREFIX,
-                   help=_('String prefix used to match IPset names.')),
-    ]
-
     conf = cfg.CONF
-    conf.register_cli_opts(cli_opts)
+    config.register_common_config_options()
+    agent_config.register_root_helper(conf=conf)
+    agent_config.setup_privsep()
+    command.register_cmd_opts(command.ip_opts, conf)
     return conf
 
 
 def remove_iptables_reference(ipset):
     # Remove any iptables reference to this IPset
     cmd = ['iptables-save'] if 'IPv4' in ipset else ['ip6tables-save']
-    iptables_save = utils.execute(cmd, run_as_root=True)
+    iptables_save = utils.execute(cmd, run_as_root=True, privsep_exec=True)
 
     if ipset in iptables_save:
         cmd = ['iptables'] if 'IPv4' in ipset else ['ip6tables']
-        LOG.info(_LI("Removing iptables rule for IPset: %s"), ipset)
+        cmd += ['-w', '10']  # wait for xlock release
+        LOG.info("Removing iptables rule for IPset: %s", ipset)
         for rule in iptables_save.splitlines():
             if '--match-set %s ' % ipset in rule and rule.startswith('-A'):
                 # change to delete
                 params = rule.split()
                 params[0] = '-D'
                 try:
-                    utils.execute(cmd + params, run_as_root=True)
+                    utils.execute(cmd + params, run_as_root=True,
+                                  privsep_exec=True)
                 except Exception:
-                    LOG.exception(_LE('Error, unable to remove iptables rule '
-                                      'for IPset: %s'), ipset)
+                    LOG.exception('Error, unable to remove iptables rule '
+                                  'for IPset: %s', ipset)
 
 
 def destroy_ipset(conf, ipset):
@@ -76,25 +67,25 @@ def destroy_ipset(conf, ipset):
     if conf.force:
         remove_iptables_reference(ipset)
 
-    LOG.info(_LI("Destroying IPset: %s"), ipset)
+    LOG.info("Destroying IPset: %s", ipset)
     cmd = ['ipset', 'destroy', ipset]
     try:
-        utils.execute(cmd, run_as_root=True)
+        utils.execute(cmd, run_as_root=True, privsep_exec=True)
     except Exception:
-        LOG.exception(_LE('Error, unable to destroy IPset: %s'), ipset)
+        LOG.exception('Error, unable to destroy IPset: %s', ipset)
 
 
 def cleanup_ipsets(conf):
     # Identify ipsets for destruction.
-    LOG.info(_LI("Destroying IPsets with prefix: %s"), conf.prefix)
+    LOG.info("Destroying IPsets with prefix: %s", conf.prefix)
 
     cmd = ['ipset', '-L', '-n']
-    ipsets = utils.execute(cmd, run_as_root=True)
+    ipsets = utils.execute(cmd, run_as_root=True, privsep_exec=True)
     for ipset in ipsets.split('\n'):
         if conf.allsets or ipset.startswith(conf.prefix):
             destroy_ipset(conf, ipset)
 
-    LOG.info(_LI("IPset cleanup completed successfully"))
+    LOG.info("IPset cleanup completed successfully")
 
 
 def main():

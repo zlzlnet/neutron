@@ -13,39 +13,46 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import httplib2
-import mock
+import abc
+import multiprocessing
 import os
+import queue
 import signal
-import socket
-import time
 import traceback
+from unittest import mock
 
+from neutron_lib import worker as neutron_worker
 from oslo_config import cfg
+from oslo_log import log
 import psutil
 
-from neutron.agent.linux import utils
+from neutron.common import utils
+from neutron import manager
 from neutron import service
-from neutron.tests import base
-from neutron import wsgi
+from neutron.tests import base as tests_base
+from neutron.tests.functional import base
 
-
+LOG = log.getLogger(__name__)
 CONF = cfg.CONF
 
-# This message will be written to temporary file each time
-# reset method is called.
-FAKE_RESET_MSG = "reset".encode("utf-8")
+# Those messages will be written to temporary file each time
+# start/reset methods are called.
+FAKE_START_MSG = 'start'
+FAKE_RESET_MSG = 'reset'
 
 TARGET_PLUGIN = 'neutron.plugins.ml2.plugin.Ml2Plugin'
 
 
-class TestNeutronServer(base.BaseTestCase):
+class TestNeutronServer(base.BaseLoggingTestCase,
+                        metaclass=abc.ABCMeta):
     def setUp(self):
-        super(TestNeutronServer, self).setUp()
+        super().setUp()
         self.service_pid = None
         self.workers = None
-        self.temp_file = self.get_temp_file_path("test_server.tmp")
-        self.health_checker = None
+        self.num_workers = None
+        self.num_start = 0
+        self._mp_queue = multiprocessing.Queue()
+        self._start_queue = multiprocessing.Queue()
         self.pipein, self.pipeout = os.pipe()
         self.addCleanup(self._destroy_workers)
 
@@ -54,7 +61,7 @@ class TestNeutronServer(base.BaseTestCase):
             # Make sure all processes are stopped
             os.kill(self.service_pid, signal.SIGKILL)
 
-    def _start_server(self, callback, workers):
+    def _start_server(self, callback, workers, processes_queue=None):
         """Run a given service.
 
         :param callback: callback that will start the required service
@@ -81,167 +88,187 @@ class TestNeutronServer(base.BaseTestCase):
 
         self.service_pid = pid
 
-        if self.workers > 0:
-            # Wait at most 10 seconds to spawn workers
-            condition = lambda: self.workers == len(self._get_workers())
+        # If number of workers is 1 it is assumed that we run
+        # a service in the current process.
+        if self.workers > 1:
+            workers_pid = self._get_workers(
+                10, processes_queue=processes_queue)
+            self.assertEqual(len(workers_pid), self.workers)
+        else:
+            workers_pid = [self.service_pid]
 
-            utils.wait_until_true(
-                condition, timeout=10, sleep=0.1,
-                exception=RuntimeError(
-                    "Failed to start %d workers." % self.workers))
-
-            workers = self._get_workers()
-            self.assertEqual(len(workers), self.workers)
-            return workers
-
-        # Wait for a service to start.
-        utils.wait_until_true(self.health_checker, timeout=10, sleep=0.1,
+        utils.wait_until_true(self._check_active, timeout=10, sleep=0.5,
                               exception=RuntimeError(
                                   "Failed to start service."))
 
-        return [self.service_pid]
+        return workers_pid
 
-    def _get_workers(self):
+    def _get_workers(self, timeout, processes_queue=None):
         """Get the list of processes in which WSGI server is running."""
+        def safe_ppid(proc):
+            try:
+                return proc.ppid()
+            except psutil.NoSuchProcess:
+                return None
 
-        if self.workers > 0:
-            return [proc.pid for proc in psutil.process_iter()
-                    if proc.ppid == self.service_pid]
-        else:
+        def get_workers_pid():
+            if self.workers > 1:
+                return [proc.pid for proc in psutil.process_iter()
+                        if safe_ppid(proc) == self.service_pid]
             return [proc.pid for proc in psutil.process_iter()
                     if proc.pid == self.service_pid]
 
+        exception = RuntimeError('Failed to start %d workers.' % self.workers)
+
+        if processes_queue:
+            try:
+                return processes_queue.get(timeout=timeout)
+            except queue.Empty:
+                raise exception
+
+        # Wait at most 10 seconds to spawn workers
+        def condition():
+            return self.workers == len(get_workers_pid())
+        utils.wait_until_true(condition, timeout=timeout, sleep=0.5,
+                              exception=exception)
+        return get_workers_pid()
+
+    def _check_active(self):
+        """Service activity check."""
+        while not self._start_queue.empty():
+            self._start_queue.get()
+            self.num_start += 1
+        return self.num_start == self.num_workers
+
+    def _fake_start(self):
+        self._mp_queue.put(FAKE_START_MSG)
+        self._start_queue.put(True)
+
     def _fake_reset(self):
-        """Writes FAKE_RESET_MSG to temporary file on each call."""
+        self._mp_queue.put(FAKE_RESET_MSG)
 
-        with open(self.temp_file, 'a') as f:
-            f.write(FAKE_RESET_MSG)
-
-    def _test_restart_service_on_sighup(self, service, workers=0):
-        """Test that a service correctly restarts on receiving SIGHUP.
+    def _test_restart_service_on_sighup(self, service, workers=1,
+                                        processes_queue=None):
+        """Test that a service correctly (re)starts on receiving SIGHUP.
 
         1. Start a service with a given number of workers.
         2. Send SIGHUP to the service.
-        3. Wait for workers (if any) to restart.
-        4. Assert that the pids of the workers didn't change after restart.
+        3. Wait for workers (if any) to (re)start.
         """
 
-        start_workers = self._start_server(callback=service, workers=workers)
-
+        self._start_server(callback=service, workers=workers,
+                           processes_queue=processes_queue)
         os.kill(self.service_pid, signal.SIGHUP)
 
-        # Wait for temp file to be created and its size become equal
-        # to size of FAKE_RESET_MSG repeated (workers + 1) times.
-        expected_size = len(FAKE_RESET_MSG) * (workers + 1)
-        condition = lambda: (os.path.isfile(self.temp_file)
-                             and os.stat(self.temp_file).st_size ==
-                             expected_size)
+        # After sending SIGHUP it is expected that there will be as many
+        # FAKE_RESET_MSG as number of workers + one additional for main
+        # process
+        expected_msg = (
+            FAKE_START_MSG * workers + FAKE_RESET_MSG * (workers + 1))
 
-        utils.wait_until_true(
-            condition, timeout=5, sleep=0.1,
-            exception=RuntimeError(
-                "Timed out waiting for file %(filename)s to be created and "
-                "its size become equal to %(size)s." %
-                {'filename': self.temp_file,
-                 'size': expected_size}))
+        # Wait for temp file to be created and its size reaching the expected
+        # value
+        expected_size = len(expected_msg)
+        ret_msg = ''
 
-        # Verify that reset has been called for parent process in which
-        # a service was started and for each worker by checking that
-        # FAKE_RESET_MSG has been written to temp file workers + 1 times.
-        with open(self.temp_file, 'r') as f:
-            res = f.readline()
-            self.assertEqual(FAKE_RESET_MSG * (workers + 1), res)
+        def is_ret_buffer_ok():
+            nonlocal ret_msg
+            LOG.debug('Checking returned buffer size')
+            while not self._mp_queue.empty():
+                ret_msg += self._mp_queue.get()
+            LOG.debug('Size of buffer is %s. Expected size: %s',
+                      len(ret_msg), expected_size)
+            return len(ret_msg) == expected_size
 
-        # Make sure worker pids don't change
-        end_workers = self._get_workers()
-        self.assertEqual(start_workers, end_workers)
-
-
-class TestWsgiServer(TestNeutronServer):
-    """Tests for neutron.wsgi.Server."""
-
-    def setUp(self):
-        super(TestWsgiServer, self).setUp()
-        self.health_checker = self._check_active
-        self.port = None
-
-    @staticmethod
-    def application(environ, start_response):
-        """A primitive test application."""
-
-        response_body = 'Response'
-        status = '200 OK'
-        response_headers = [('Content-Type', 'text/plain'),
-                            ('Content-Length', str(len(response_body)))]
-        start_response(status, response_headers)
-        return [response_body]
-
-    def _check_active(self):
-        """Check a wsgi service is active by making a GET request."""
-        port = int(os.read(self.pipein, 5))
-        conn = httplib2.HTTPConnectionWithTimeout("localhost", port)
         try:
-            conn.request("GET", "/")
-            resp = conn.getresponse()
-            return resp.status == 200
-        except socket.error:
-            return False
+            utils.wait_until_true(is_ret_buffer_ok, timeout=5, sleep=1)
+        except utils.WaitTimeout:
+            raise RuntimeError('Expected buffer size: %s, current size: %s' %
+                               (expected_size, len(ret_msg)))
 
-    def _run_wsgi(self, workers=0):
-        """Start WSGI server with a test application."""
-
-        # Mock reset method to check that it is being called
-        # on receiving SIGHUP.
-        with mock.patch("neutron.wsgi.WorkerService.reset") as reset_method:
-            reset_method.side_effect = self._fake_reset
-
-            server = wsgi.Server("Test")
-            server.start(self.application, 0, "0.0.0.0",
-                         workers=workers)
-
-            # Memorize a port that was chosen for the service
-            self.port = server.port
-            os.write(self.pipeout, str(self.port))
-
-            server.wait()
-
-    def test_restart_wsgi_on_sighup_multiple_workers(self):
-        self._test_restart_service_on_sighup(service=self._run_wsgi,
-                                             workers=2)
+        # Verify that start has been called twice for each worker (one for
+        # initial start, and the second one on SIGHUP after children were
+        # terminated).
+        self.assertEqual(expected_msg, ret_msg)
 
 
 class TestRPCServer(TestNeutronServer):
     """Tests for neutron RPC server."""
 
     def setUp(self):
-        super(TestRPCServer, self).setUp()
-        self.setup_coreplugin(TARGET_PLUGIN)
+        super().setUp()
+        self.setup_coreplugin('ml2', load_plugins=False)
         self._plugin_patcher = mock.patch(TARGET_PLUGIN, autospec=True)
         self.plugin = self._plugin_patcher.start()
         self.plugin.return_value.rpc_workers_supported = True
-        self.health_checker = self._check_active
+        self._processes_queue = multiprocessing.Queue()
 
-    def _check_active(self):
-        time.sleep(5)
-        return True
-
-    def _serve_rpc(self, workers=0):
+    def _serve_rpc(self, workers=1):
         """Start RPC server with a given number of workers."""
 
-        # Mock reset method to check that it is being called
-        # on receiving SIGHUP.
-        with mock.patch("neutron.service.RpcWorker.reset") as reset_method:
-            with mock.patch(
-                    "neutron.manager.NeutronManager.get_plugin"
-            ) as get_plugin:
-                reset_method.side_effect = self._fake_reset
-                get_plugin.return_value = self.plugin
+        # Mock start method to check that children are started again on
+        # receiving SIGHUP.
+        with mock.patch("neutron.service.RpcWorker.start") as start_method,\
+                mock.patch(
+                    "neutron.service.RpcWorker.reset") as reset_method,\
+                mock.patch(
+                    "neutron_lib.plugins.directory.get_plugin") as get_plugin:
+            start_method.side_effect = self._fake_start
+            reset_method.side_effect = self._fake_reset
+            get_plugin.return_value = self.plugin
 
-                CONF.set_override("rpc_workers", workers)
+            CONF.set_override("rpc_workers", workers)
+            # not interested in state report workers specifically
+            CONF.set_override("rpc_state_report_workers", 0)
 
-                launcher = service.serve_rpc()
-                launcher.wait()
+            rpc_workers_launcher = service.start_rpc_workers()
+            self._processes_queue.put(list(rpc_workers_launcher.children))
+            rpc_workers_launcher.wait()
 
+    @tests_base.unstable_test('LP bug 2100001')
     def test_restart_rpc_on_sighup_multiple_workers(self):
-        self._test_restart_service_on_sighup(service=self._serve_rpc,
-                                             workers=2)
+        self.num_workers = 2
+        self._test_restart_service_on_sighup(
+            service=self._serve_rpc, workers=self.num_workers,
+            processes_queue=self._processes_queue)
+
+
+class TestPluginWorker(TestNeutronServer):
+    """Ensure that a plugin returning Workers spawns workers"""
+
+    def setUp(self):
+        super().setUp()
+        self.setup_coreplugin('ml2', load_plugins=False)
+        self._plugin_patcher = mock.patch(TARGET_PLUGIN, autospec=True)
+        self.plugin = self._plugin_patcher.start()
+        manager.init()
+
+    def _start_plugin(self, workers=1):
+        with mock.patch('neutron_lib.plugins.directory.get_plugin') as gp:
+            gp.return_value = self.plugin
+            plugin_workers_launcher = service.start_plugins_workers()
+            plugin_workers_launcher.wait()
+
+    @tests_base.unstable_test('LP bug 2100001')
+    def test_start(self):
+        class FakeWorker(neutron_worker.BaseWorker):
+            def start(self):
+                pass
+
+            def wait(self):
+                pass
+
+            def stop(self):
+                pass
+
+            def reset(self):
+                pass
+
+        # Make both ABC happy and ensure 'self' is correct
+        FakeWorker.start = self._fake_start
+        FakeWorker.reset = self._fake_reset
+        workers = [FakeWorker()]
+        self.plugin.return_value.get_workers.return_value = workers
+        self.num_workers = len(workers)
+        self._test_restart_service_on_sighup(service=self._start_plugin,
+                                             workers=self.num_workers)

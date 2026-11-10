@@ -16,11 +16,41 @@
 import abc
 import contextlib
 
-import six
+from neutron_lib.api.definitions import port_security as psec
+from neutron_lib import constants as n_const
+from neutron_lib.utils import runtime
 
 
-@six.add_metaclass(abc.ABCMeta)
-class FirewallDriver(object):
+DIRECTION_IP_PREFIX = {n_const.INGRESS_DIRECTION: 'source_ip_prefix',
+                       n_const.EGRESS_DIRECTION: 'dest_ip_prefix'}
+
+# List of ICMPv6 types that should be permitted (ingress) by default. This list
+# depends on iptables conntrack behavior of recognizing ICMP errors (types 1-4)
+# as related traffic.
+ICMPV6_ALLOWED_INGRESS_TYPES = (n_const.ICMPV6_TYPE_MLD_QUERY,
+                                n_const.ICMPV6_TYPE_NS,
+                                n_const.ICMPV6_TYPE_NA)
+
+# List of ICMPv6 types that should be permitted (egress) by default.
+ICMPV6_ALLOWED_EGRESS_TYPES = (n_const.ICMPV6_TYPE_MLD_QUERY,
+                               n_const.ICMPV6_TYPE_RS,
+                               n_const.ICMPV6_TYPE_NS)
+
+# List of ICMPv6 types that should be permitted depending on payload content
+# to avoid spoofing (egress) by default.
+ICMPV6_RESTRICTED_EGRESS_TYPES = (n_const.ICMPV6_TYPE_NA, )
+
+
+def port_sec_enabled(port):
+    return port.get(psec.PORTSECURITY, True)
+
+
+def load_firewall_driver_class(driver):
+    return runtime.load_class_by_alias_or_classname(
+        'neutron.agent.firewall_drivers', driver)
+
+
+class FirewallDriver(metaclass=abc.ABCMeta):
     """Firewall Driver base class.
 
     Defines methods that any driver providing security groups
@@ -53,12 +83,16 @@ class FirewallDriver(object):
       remote_group_id will also remaining membership update management
     """
 
+    # OVS agent installs arp spoofing openflow rules. If firewall is capable
+    # of handling that, ovs agent doesn't need to install the protection.
+    provides_arp_spoofing_protection = False
+
+    @abc.abstractmethod
     def prepare_port_filter(self, port):
         """Prepare filters for the port.
 
         This method should be called before the port is created.
         """
-        raise NotImplementedError()
 
     def apply_port_filter(self, port):
         """Apply port filter.
@@ -70,14 +104,14 @@ class FirewallDriver(object):
         """
         raise NotImplementedError()
 
+    @abc.abstractmethod
     def update_port_filter(self, port):
         """Refresh security group rules from data store
 
-        Gets called when an port gets added to or removed from
+        Gets called when a port gets added to or removed from
         the security group the port is a member of or if the
         group gains or looses a rule.
         """
-        raise NotImplementedError()
 
     def remove_port_filter(self, port):
         """Stop filtering port."""
@@ -85,16 +119,13 @@ class FirewallDriver(object):
 
     def filter_defer_apply_on(self):
         """Defer application of filtering rule."""
-        pass
 
     def filter_defer_apply_off(self):
         """Turn off deferral of rules and apply the rules now."""
-        pass
 
     @property
     def ports(self):
         """Returns filtered ports."""
-        pass
 
     @contextlib.contextmanager
     def defer_apply(self):
@@ -112,6 +143,21 @@ class FirewallDriver(object):
     def update_security_group_rules(self, sg_id, rules):
         """Update rules in a security group."""
         raise NotImplementedError()
+
+    def security_group_updated(self, action_type, sec_group_ids,
+                               device_id=None):
+        """Called when a security group is updated.
+
+        Note: This method needs to be implemented by the firewall drivers
+        which use enhanced RPC for security_groups.
+        """
+        raise NotImplementedError()
+
+    def process_trusted_ports(self, port_ids):
+        """Process ports that are trusted and shouldn't be filtered."""
+
+    def remove_trusted_ports(self, port_ids):
+        pass
 
 
 class NoopFirewallDriver(FirewallDriver):
@@ -147,4 +193,8 @@ class NoopFirewallDriver(FirewallDriver):
         pass
 
     def update_security_group_rules(self, sg_id, rules):
+        pass
+
+    def security_group_updated(self, action_type, sec_group_ids,
+                               device_id=None):
         pass

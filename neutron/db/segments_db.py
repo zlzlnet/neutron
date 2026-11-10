@@ -1,0 +1,261 @@
+#    Licensed under the Apache License, Version 2.0 (the "License"); you may
+#    not use this file except in compliance with the License. You may obtain
+#    a copy of the License at
+#
+#         http://www.apache.org/licenses/LICENSE-2.0
+#
+#    Unless required by applicable law or agreed to in writing, software
+#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+#    License for the specific language governing permissions and limitations
+#    under the License.
+
+from neutron_lib.api.definitions import segment as segment_def
+from neutron_lib.callbacks import events
+from neutron_lib.callbacks import registry
+from neutron_lib.callbacks import resources
+from neutron_lib import constants as n_const
+from neutron_lib.db import api as db_api
+from neutron_lib import exceptions as n_exc
+from neutron_lib.objects import exceptions as o_exc
+from neutron_lib.plugins.ml2 import api as ml2_api
+from oslo_db import exception as db_exc
+from oslo_log import log as logging
+from oslo_utils import uuidutils
+
+from neutron.objects import base as base_obj
+from neutron.objects import network as network_obj
+from neutron.services.segments import exceptions as segments_exceptions
+
+LOG = logging.getLogger(__name__)
+
+NETWORK_TYPE = segment_def.NETWORK_TYPE
+PHYSICAL_NETWORK = segment_def.PHYSICAL_NETWORK
+SEGMENTATION_ID = segment_def.SEGMENTATION_ID
+NETWORK_ID = 'network_id'
+
+
+def _make_segment_dict(obj):
+    """Make a segment dictionary out of an object."""
+    return {'id': obj.id,
+            NETWORK_TYPE: obj.network_type,
+            PHYSICAL_NETWORK: obj.physical_network,
+            SEGMENTATION_ID: obj.segmentation_id,
+            NETWORK_ID: obj.network_id}
+
+
+def _raise_segment_in_use(network_type, physical_network, segmentation_id):
+    if network_type == n_const.TYPE_VLAN:
+        raise n_exc.VlanIdInUse(vlan_id=segmentation_id,
+                                physical_network=physical_network)
+    raise n_exc.TunnelIdInUse(tunnel_id=segmentation_id)
+
+
+def _check_flat_segment_in_use(context, network_type, physical_network):
+    """Check if a flat segment already exists for this physical network.
+
+    The global unique constraint (network_type, physical_network,
+    segmentation_id) does not catch flat network duplicates because flat
+    segments have segmentation_id=NULL and NULL != NULL in SQL.
+
+    TODO(ralonsoh): in order to implement a real constraint in the DB engine,
+                    it would be needed to migrate the ``segmentation_id`` of
+                    the FLAT networks to be 0 (for example). 0 is not a valid
+                    VLAN ID (1-4094). That will enforce the (segmentation_id,
+                    physical_network, network_type) contraint.
+    """
+    if network_type != n_const.TYPE_FLAT:
+        return
+    existing = network_obj.NetworkSegment.get_objects(
+        context, network_type=network_type,
+        physical_network=physical_network)
+    if existing:
+        # TODO(ralonsoh): move this exception to ``_raise_segment_in_use`` if
+        #                 the upper improvement is implemented.
+        raise n_exc.FlatNetworkInUse(physical_network=physical_network)
+
+
+def add_network_segment(context, network_id, segment, segment_index=None,
+                        is_dynamic=False):
+    network_type = segment.get(NETWORK_TYPE)
+    physical_network = segment.get(PHYSICAL_NETWORK)
+    segmentation_id = segment.get(SEGMENTATION_ID)
+    with db_api.CONTEXT_WRITER.using(context):
+        _check_flat_segment_in_use(context, network_type,
+                                   physical_network)
+        netseg_obj = network_obj.NetworkSegment(
+            context, id=uuidutils.generate_uuid(), network_id=network_id,
+            network_type=network_type,
+            physical_network=physical_network,
+            segmentation_id=segmentation_id,
+            segment_index=segment_index, is_dynamic=is_dynamic)
+        netseg_obj.create()
+        registry.publish(resources.SEGMENT,
+                         events.PRECOMMIT_CREATE,
+                         add_network_segment,
+                         payload=events.DBEventPayload(
+                             context, resource_id=netseg_obj.id,
+                             states=(netseg_obj,)))
+        segment['id'] = netseg_obj.id
+    LOG.info("Added segment %(id)s of type %(network_type)s for network "
+             "%(network_id)s",
+             {'id': netseg_obj.id,
+              'network_type': netseg_obj.network_type,
+              'network_id': netseg_obj.network_id})
+
+
+def update_network_segment(context, segment_id, segmentation_id):
+    try:
+        with db_api.CONTEXT_WRITER.using(context):
+            netseg_obj = network_obj.NetworkSegment.get_object(context,
+                                                               id=segment_id)
+            if not netseg_obj:
+                raise segments_exceptions.SegmentNotFound(
+                    segment_id=segment_id)
+            netseg_obj[ml2_api.SEGMENTATION_ID] = segmentation_id
+            netseg_obj.update()
+    except (o_exc.NeutronDbObjectDuplicateEntry, db_exc.DBDuplicateEntry):
+        _raise_segment_in_use(netseg_obj.network_type,
+                              netseg_obj.physical_network,
+                              segmentation_id)
+
+    LOG.info("Updated segment %(id)s, segmentation_id: %(segmentation_id)s)",
+             {'id': segment_id, 'segmentation_id': segmentation_id})
+
+
+def get_network_segments(context, network_id, filter_dynamic=False):
+    """Get network segments for a single network.
+
+    :param context: neutron context
+    :param network_id: UUID of the network
+    :param filter_dynamic: Filter segments by is_dynamic flag:
+                          - False: return only static segments (default)
+                          - True: return only dynamic segments
+                          - None: return all segments (both static and dynamic)
+    :returns: list of segment dictionaries
+    """
+    return get_networks_segments(
+        context, [network_id], filter_dynamic)[network_id]
+
+
+def get_networks_segments(context, network_ids, filter_dynamic=False):
+    """Get network segments for multiple networks.
+
+    :param context: neutron context
+    :param network_ids: list of network UUIDs
+    :param filter_dynamic: Filter segments by is_dynamic flag:
+                          - False: return only static segments (default)
+                          - True: return only dynamic segments
+                          - None: return all segments (both static and dynamic)
+    :returns: dict mapping network_id to list of segment dictionaries
+    """
+    if not network_ids:
+        return {}
+
+    with db_api.CONTEXT_READER.using(context):
+        filters = {
+            'network_id': network_ids,
+        }
+        if filter_dynamic is not None:
+            filters['is_dynamic'] = filter_dynamic
+        objs = network_obj.NetworkSegment.get_objects(context, **filters)
+        result = {net_id: [] for net_id in network_ids}
+        for record in objs:
+            result[record.network_id].append(_make_segment_dict(record))
+        return result
+
+
+def get_segment_by_id(context, segment_id):
+    with db_api.CONTEXT_READER.using(context):
+        net_obj = network_obj.NetworkSegment.get_object(context, id=segment_id)
+        if net_obj:
+            return _make_segment_dict(net_obj)
+
+
+def get_segments_physnets(context, network_id):
+    """Get the segments and their physical networks.
+
+    :param context: neutron context
+    :param network_ids: list of network UUIDs
+    :returns: dict mapping, segment ID to physical network name
+    """
+    segments = get_network_segments(context, network_id)
+    return {
+        s['id']: s[PHYSICAL_NETWORK]
+        for s in segments
+        if s[NETWORK_TYPE] in n_const.TYPE_PHYSICAL
+    }
+
+
+def get_dynamic_segment(context, network_id, physical_network=None,
+                        segmentation_id=None):
+    """Return a dynamic segment for the filters provided if one exists."""
+    with db_api.CONTEXT_READER.using(context):
+        filters = {
+            'network_id': network_id,
+            'is_dynamic': True,
+        }
+        if physical_network:
+            filters['physical_network'] = physical_network
+        if segmentation_id:
+            filters['segmentation_id'] = segmentation_id
+        pager = base_obj.Pager(limit=1)
+        objs = network_obj.NetworkSegment.get_objects(
+            context, _pager=pager, **filters)
+
+        if objs:
+            return _make_segment_dict(objs[0])
+        LOG.debug("No dynamic segment found for "
+                  "Network:%(network_id)s, "
+                  "Physical network:%(physnet)s, "
+                  "segmentation_id:%(segmentation_id)s",
+                  {'network_id': network_id,
+                   'physnet': physical_network,
+                   'segmentation_id': segmentation_id})
+
+
+def delete_network_segment(context, segment_id):
+    """Release a dynamic segment for the params provided if one exists."""
+    with db_api.CONTEXT_WRITER.using(context):
+        network_obj.NetworkSegment.delete_objects(context, id=segment_id)
+
+
+def network_segments_exist_in_range(context, network_type, physical_network,
+                                    segment_range=None):
+    """Check whether one or more network segments exist in a range."""
+    return bool(network_obj.NetworkSegment.count_segments(
+        context, network_type, physical_network, segment_range=segment_range))
+
+
+def min_max_actual_segments_in_range(context, network_type, physical_network,
+                                     segment_range=None):
+    """Return the minimum and maximum segmentation IDs used in a network
+    segment range
+    """
+    with db_api.CONTEXT_READER.using(context):
+        filters = {
+            'network_type': network_type,
+            'physical_network': physical_network,
+        }
+        pager = base_obj.Pager()
+        # (NOTE) True means ASC, False is DESC
+        pager.sorts = [('segmentation_id', True)]
+        segment_objs = network_obj.NetworkSegment.get_objects(
+            context, _pager=pager, **filters)
+
+        if segment_range:
+            minimum_id = segment_range['minimum']
+            maximum_id = segment_range['maximum']
+            segment_objs = [
+                segment for segment in segment_objs if
+                minimum_id <= segment.segmentation_id <= maximum_id]
+
+        if segment_objs:
+            return (segment_objs[0].segmentation_id,
+                    segment_objs[-1].segmentation_id)
+        LOG.debug(
+            "No existing segment found for Network type:%(network_type)s, "
+            "Physical network:%(physical_network)s",
+            {'network_type': network_type,
+             'physical_network': physical_network})
+        return None, None

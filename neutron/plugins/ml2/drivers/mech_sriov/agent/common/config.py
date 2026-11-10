@@ -14,9 +14,10 @@
 # limitations under the License.
 
 
-from oslo_config import cfg
-
-from neutron.agent.common import config
+from neutron._i18n import _
+from neutron.conf.plugins.ml2.drivers.mech_sriov import agent_common as \
+     agent_common_config
+from neutron.plugins.ml2.drivers.agent import config as cagt_config  # noqa
 
 
 def parse_exclude_devices(exclude_list):
@@ -50,38 +51,5 @@ def parse_exclude_devices(exclude_list):
         exclude_mapping[dev_name] = exclude_devices_set
     return exclude_mapping
 
-DEFAULT_DEVICE_MAPPINGS = []
-DEFAULT_EXCLUDE_DEVICES = []
 
-agent_opts = [
-    cfg.IntOpt('polling_interval', default=2,
-               help=_("The number of seconds the agent will wait between "
-                      "polling for local device changes.")),
-]
-
-sriov_nic_opts = [
-    cfg.ListOpt('physical_device_mappings',
-                default=DEFAULT_DEVICE_MAPPINGS,
-                help=_("List of <physical_network>:<network_device> mapping "
-                       "physical network names to the agent's node-specific "
-                       "physical network device of SR-IOV physical "
-                       "function to be used for VLAN networks. "
-                       "All physical networks listed in network_vlan_ranges "
-                       "on the server should have mappings to appropriate "
-                       "interfaces on each agent")),
-    cfg.ListOpt('exclude_devices',
-                default=DEFAULT_EXCLUDE_DEVICES,
-                help=_("List of <network_device>:<excluded_devices> "
-                       "mapping network_device to the agent's node-specific "
-                       "list of virtual functions that should not be used "
-                       "for virtual networking. excluded_devices is a "
-                       "semicolon separated list of virtual functions "
-                       "(BDF format).to exclude from network_device. "
-                       "The network_device in the mapping should appear in "
-                       "the physical_device_mappings list.")),
-]
-
-
-cfg.CONF.register_opts(agent_opts, 'AGENT')
-cfg.CONF.register_opts(sriov_nic_opts, 'SRIOV_NIC')
-config.register_agent_state_opts_helper(cfg.CONF)
+agent_common_config.register_agent_sriov_nic_opts()

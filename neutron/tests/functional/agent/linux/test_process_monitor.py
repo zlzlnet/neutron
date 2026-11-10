@@ -13,24 +13,24 @@
 #    under the License.
 
 import os
+import sys
 
 from oslo_config import cfg
-from six import moves
 
 from neutron.agent.linux import external_process
-from neutron.agent.linux import utils
-from neutron.tests import base
+from neutron.common import utils
 from neutron.tests.functional.agent.linux import simple_daemon
+from neutron.tests.functional import base
 
 
 UUID_FORMAT = "test-uuid-%d"
 SERVICE_NAME = "service"
 
 
-class BaseTestProcessMonitor(base.BaseTestCase):
+class BaseTestProcessMonitor(base.BaseLoggingTestCase):
 
     def setUp(self):
-        super(BaseTestProcessMonitor, self).setUp()
+        super().setUp()
         cfg.CONF.set_override('check_child_processes_interval', 1, 'AGENT')
         self._child_processes = []
         self._process_monitor = None
@@ -48,7 +48,7 @@ class BaseTestProcessMonitor(base.BaseTestCase):
 
     def _make_cmdline_callback(self, uuid):
         def _cmdline_callback(pidfile):
-            cmdline = ["python", simple_daemon.__file__,
+            cmdline = [sys.executable, simple_daemon.__file__,
                        "--uuid=%s" % uuid,
                        "--pid_file=%s" % pidfile]
             return cmdline
@@ -56,7 +56,7 @@ class BaseTestProcessMonitor(base.BaseTestCase):
 
     def spawn_n_children(self, n, service=None):
         self._child_processes = []
-        for child_number in moves.range(n):
+        for child_number in range(n):
             uuid = self._child_uuid(child_number)
             _callback = self._make_cmdline_callback(uuid)
             pm = external_process.ProcessManager(
@@ -76,7 +76,7 @@ class BaseTestProcessMonitor(base.BaseTestCase):
     def _kill_last_child(self):
         self._child_processes[-1].disable()
 
-    def wait_for_all_children_respawned(self):
+    def wait_for_all_children_spawned(self):
         def all_children_active():
             return all(pm.active for pm in self._child_processes)
 
@@ -93,9 +93,10 @@ class BaseTestProcessMonitor(base.BaseTestCase):
             all_children_active,
             timeout=max_wait_time,
             sleep=0.01,
-            exception=RuntimeError('Not all children respawned.'))
+            exception=RuntimeError('Not all children (re)spawned.'))
 
     def cleanup_spawned_children(self):
+        self._process_monitor.stop()
         for pm in self._child_processes:
             pm.disable()
 
@@ -104,5 +105,6 @@ class TestProcessMonitor(BaseTestProcessMonitor):
 
     def test_respawn_handler(self):
         self.spawn_n_children(2)
+        self.wait_for_all_children_spawned()
         self._kill_last_child()
-        self.wait_for_all_children_respawned()
+        self.wait_for_all_children_spawned()

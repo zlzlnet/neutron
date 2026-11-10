@@ -13,17 +13,12 @@
 import abc
 
 from oslo_config import cfg
-from oslo_log import log
-import six
 
-from neutron import ipam
+from neutron.ipam import requests as ipam_req
 from neutron import manager
 
-LOG = log.getLogger(__name__)
 
-
-@six.add_metaclass(abc.ABCMeta)
-class Pool(object):
+class Pool(metaclass=abc.ABCMeta):
     """Interface definition for an IPAM driver.
 
     There should be an instance of the driver for every subnet pool.
@@ -48,7 +43,6 @@ class Pool(object):
         """
         ipam_driver_name = cfg.CONF.ipam_driver
         mgr = manager.NeutronManager
-        LOG.debug("Loading ipam driver: %s", ipam_driver_name)
         driver_class = mgr.load_class_for_provider('neutron.ipam_drivers',
                                                    ipam_driver_name)
         return driver_class(subnet_pool, context)
@@ -101,23 +95,43 @@ class Pool(object):
 
         Can be overridden on driver level to return custom factory
         """
-        return ipam.SubnetRequestFactory
+        return ipam_req.SubnetRequestFactory
 
     def get_address_request_factory(self):
         """Returns default AddressRequestFactory
 
         Can be overridden on driver level to return custom factory
         """
-        return ipam.AddressRequestFactory
+        return ipam_req.AddressRequestFactory
+
+    @abc.abstractmethod
+    def get_allocator(self, subnet_ids):
+        """Gets an allocator for subnets passed in
+
+        :param subnet_ids: ids for subnets from which the IP can be allocated
+        :returns: An instance of IPAM SubnetGroup
+        :raises: TODO(Carl) What sort of errors do we need to plan for?
+        """
+
+    def needs_rollback(self):
+        """Whether driver needs an explicit rollback when operations fail.
+
+        A driver that (de)allocates resources in the same DB transaction passed
+        to it by Neutron will not want explicit rollback. A truly external IPAM
+        system would need to return True for sure. The default is True since
+        all drivers were assumed to be designed to need it from the start.
+
+        :returns: True if driver needs to be called on rollback
+        """
+        return True
 
 
-@six.add_metaclass(abc.ABCMeta)
-class Subnet(object):
+class Subnet(metaclass=abc.ABCMeta):
     """Interface definition for an IPAM subnet
 
     A subnet would typically be associated with a network but may not be.  It
     could represent a dynamically routed IP address space in which case the
-    normal network and broadcast addresses would be useable.  It should always
+    normal network and broadcast addresses would be usable.  It should always
     be a routable block of addresses and representable in CIDR notation.
     """
 
@@ -149,13 +163,23 @@ class Subnet(object):
         :returns: An instance of SpecificSubnetRequest with the subnet detail.
         """
 
+
+class SubnetGroup(metaclass=abc.ABCMeta):
+    """Interface definition for a filtered group of IPAM Subnets
+
+    Allocates from a group of semantically equivalent subnets.  The list of
+    candidate subnets *may* be ordered by preference but all of the subnets
+    must be suitable for fulfilling the request.  For example, all of them must
+    be associated with the network we're trying to allocate an address for.
+    """
+
     @abc.abstractmethod
-    def associate_neutron_subnet(self, subnet_id):
-        """Associate the IPAM subnet with a neutron subnet.
+    def allocate(self, address_request):
+        """Allocates an IP address based on the request passed in
 
-        This operation should be performed to attach a neutron subnet to the
-        current subnet instance. In some cases IPAM subnets may be created
-        independently of neutron subnets and associated at a later stage.
-
-        :param subnet_id: neutron subnet identifier.
+        :param address_request: Specifies what to allocate.
+        :type address_request: An instance of a subclass of AddressRequest
+        :returns: A netaddr.IPAddress, subnet_id tuple
+        :raises: AddressNotAvailable, AddressOutsideAllocationPool,
+            AddressOutsideSubnet, IpAddressGenerationFailureAllSubnets
         """

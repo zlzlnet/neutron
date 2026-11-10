@@ -1,30 +1,27 @@
-Welcome!
-========
+=================
+OpenStack Neutron
+=================
 
-You have come across a cloud computing network fabric controller. It has
-identified itself as "Neutron." It aims to tame your (cloud) networking!
+.. image:: https://governance.openstack.org/tc/badges/neutron.svg
 
-External Resources:
-===================
+.. Change things from this point on
 
-The homepage for Neutron is: http://launchpad.net/neutron.  Use this
-site for asking for help, and filing bugs. Code is available on
-git.openstack.org at <http://git.openstack.org/cgit/openstack/neutron>.
+Neutron is an OpenStack project to provide "network connectivity as a service"
+between interface devices (e.g., vNICs) managed by other OpenStack services
+(e.g., Nova).
 
-The latest and most in-depth documentation on how to use Neutron is
-available at: <http://docs.openstack.org>. This includes:
+To learn more about neutron:
 
-Neutron Administrator Guide
-   http://docs.openstack.org/admin-guide-cloud/content/ch_networking.html
+  * Documentation: https://docs.openstack.org/neutron/latest/
+  * Features: https://specs.openstack.org/openstack/neutron-specs
+  * Defects: https://launchpad.net/neutron
+  * Release notes: https://docs.openstack.org/releasenotes/neutron/index.html
+  * Source: https://opendev.org/openstack/neutron
 
-Neutron API Reference:
-   http://docs.openstack.org/api/openstack-network/2.0/content/
+If you would like to contribute to Neutron, please read the file
+`CONTRIBUTING.rst <./CONTRIBUTING.rst>`__ or see the Neutron contributor guide:
 
-Current Neutron developer documentation is available at:
-   http://wiki.openstack.org/NeutronDevelopment
+    https://docs.openstack.org/neutron/latest/contributor/contributing.html
 
-For help on usage and hacking of Neutron, please send mail to
-<mailto:openstack-dev@lists.openstack.org>.
-
-For information on how to contribute to Neutron, please see the
-contents of the CONTRIBUTING.rst file.
+Get in touch via `email <mailto:openstack-discuss@lists.openstack.org>`_. Use
+[Neutron] in your subject.

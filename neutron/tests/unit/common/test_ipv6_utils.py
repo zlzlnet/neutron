@@ -14,82 +14,11 @@
 #    under the License.
 
 import collections
-import mock
 
-from neutron.common import constants
+from neutron_lib import constants
+
 from neutron.common import ipv6_utils
 from neutron.tests import base
-
-
-class IPv6byEUI64TestCase(base.BaseTestCase):
-    """Unit tests for generate IPv6 by EUI-64 operations."""
-
-    def test_generate_IPv6_by_EUI64(self):
-        addr = ipv6_utils.get_ipv6_addr_by_EUI64('2001:db8::',
-                                                 '00:16:3e:33:44:55')
-        self.assertEqual('2001:db8::216:3eff:fe33:4455', addr.format())
-
-    def test_generate_IPv6_with_IPv4_prefix(self):
-        ipv4_prefix = '10.0.8'
-        mac = '00:16:3e:33:44:55'
-        self.assertRaises(TypeError, lambda:
-                          ipv6_utils.get_ipv6_addr_by_EUI64(ipv4_prefix, mac))
-
-    def test_generate_IPv6_with_bad_mac(self):
-        bad_mac = '00:16:3e:33:44:5Z'
-        prefix = '2001:db8::'
-        self.assertRaises(TypeError, lambda:
-                          ipv6_utils.get_ipv6_addr_by_EUI64(prefix, bad_mac))
-
-    def test_generate_IPv6_with_bad_prefix(self):
-        mac = '00:16:3e:33:44:55'
-        bad_prefix = 'bb'
-        self.assertRaises(TypeError, lambda:
-                          ipv6_utils.get_ipv6_addr_by_EUI64(bad_prefix, mac))
-
-    def test_generate_IPv6_with_error_prefix_type(self):
-        mac = '00:16:3e:33:44:55'
-        prefix = 123
-        self.assertRaises(TypeError, lambda:
-                          ipv6_utils.get_ipv6_addr_by_EUI64(prefix, mac))
-
-
-class TestIsEnabled(base.BaseTestCase):
-
-    def setUp(self):
-        super(TestIsEnabled, self).setUp()
-
-        def reset_detection_flag():
-            ipv6_utils._IS_IPV6_ENABLED = None
-        reset_detection_flag()
-        self.addCleanup(reset_detection_flag)
-        self.mock_exists = mock.patch("os.path.exists",
-                                      return_value=True).start()
-        mock_open = mock.patch("six.moves.builtins.open").start()
-        self.mock_read = mock_open.return_value.__enter__.return_value.read
-
-    def test_enabled(self):
-        self.mock_read.return_value = "0"
-        enabled = ipv6_utils.is_enabled()
-        self.assertTrue(enabled)
-
-    def test_disabled(self):
-        self.mock_read.return_value = "1"
-        enabled = ipv6_utils.is_enabled()
-        self.assertFalse(enabled)
-
-    def test_disabled_non_exists(self):
-        self.mock_exists.return_value = False
-        enabled = ipv6_utils.is_enabled()
-        self.assertFalse(enabled)
-        self.assertFalse(self.mock_read.called)
-
-    def test_memoize(self):
-        self.mock_read.return_value = "0"
-        ipv6_utils.is_enabled()
-        enabled = ipv6_utils.is_enabled()
-        self.assertTrue(enabled)
-        self.mock_read.assert_called_once_with()
 
 
 class TestIsAutoAddressSubnet(base.BaseTestCase):
@@ -98,11 +27,11 @@ class TestIsAutoAddressSubnet(base.BaseTestCase):
         self.subnet = {
             'cidr': '2001:200::/64',
             'gateway_ip': '2001:200::1',
-            'ip_version': 6,
+            'ip_version': constants.IP_VERSION_6,
             'ipv6_address_mode': None,
             'ipv6_ra_mode': None
         }
-        super(TestIsAutoAddressSubnet, self).setUp()
+        super().setUp()
 
     def test_combinations(self):
         Mode = collections.namedtuple('Mode', "addr_mode ra_mode "
@@ -133,12 +62,6 @@ class TestIsEui64Address(base.BaseTestCase):
             self.assertEqual(expected, ipv6_utils.is_eui64_address(ip),
                              "Error on %s" % ip)
 
-    def test_valid_eui64_addresses(self):
-        ips = ('fffe::0cad:12ff:fe44:5566',
-               ipv6_utils.get_ipv6_addr_by_EUI64('2001:db8::',
-                                                 '00:16:3e:33:44:55'))
-        self._test_eui_64(ips, True)
-
     def test_invalid_eui64_addresses(self):
         ips = ('192.168.1.1',
                '192.168.1.0',
@@ -150,3 +73,28 @@ class TestIsEui64Address(base.BaseTestCase):
                'fffe::0cad:12fe:fe44:5566',
                'ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff')
         self._test_eui_64(ips, False)
+
+
+class TestValidIpv6URL(base.BaseTestCase):
+
+    def test_valid_ipv6_url(self):
+        host = "::1"
+        port = 443
+        self.assertEqual("[::1]:443", ipv6_utils.valid_ipv6_url(host, port))
+
+    def test_invalid_ipv6_url(self):
+        host = "::1"
+        port = 443
+        self.assertNotEqual("::1:443", ipv6_utils.valid_ipv6_url(host, port))
+
+    def test_valid_ipv4_url(self):
+        host = "192.168.1.2"
+        port = 443
+        self.assertEqual("192.168.1.2:443",
+                         ipv6_utils.valid_ipv6_url(host, port))
+
+    def test_valid_hostname_url(self):
+        host = "controller"
+        port = 443
+        self.assertEqual("controller:443",
+                         ipv6_utils.valid_ipv6_url(host, port))

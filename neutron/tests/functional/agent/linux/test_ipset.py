@@ -16,6 +16,7 @@
 from neutron.agent.linux import ip_lib
 from neutron.agent.linux import ipset_manager
 from neutron.agent.linux import iptables_manager
+from neutron.common import utils
 from neutron.tests.common import machine_fixtures
 from neutron.tests.common import net_helpers
 from neutron.tests.functional.agent.linux import base
@@ -29,13 +30,13 @@ UNRELATED_IP = '1.1.1.1'
 class IpsetBase(functional_base.BaseSudoTestCase):
 
     def setUp(self):
-        super(IpsetBase, self).setUp()
+        super().setUp()
 
         bridge = self.useFixture(net_helpers.VethBridgeFixture()).bridge
         self.source, self.destination = self.useFixture(
             machine_fixtures.PeerMachines(bridge)).machines
 
-        self.ipset_name = base.get_rand_name(MAX_IPSET_NAME_LENGTH, 'set-')
+        self.ipset_name = utils.get_rand_name(MAX_IPSET_NAME_LENGTH, 'set-')
         self.icmp_accept_rule = ('-p icmp -m set --match-set %s src -j ACCEPT'
                                  % self.ipset_name)
         self.ipset = self._create_ipset_manager_and_set(
@@ -97,6 +98,5 @@ class IpsetManagerTestCase(IpsetBase):
         self.source.assert_ping(self.destination.ip)
 
     def test_destroy_ipset_set(self):
-        self.assertRaises(RuntimeError, self.ipset._destroy, self.ipset_name)
         self._remove_iptables_ipset_rules()
         self.ipset._destroy(self.ipset_name)

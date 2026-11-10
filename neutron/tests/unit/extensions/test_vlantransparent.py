@@ -12,20 +12,21 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from neutron_lib.api.definitions import vlantransparent as vlan_apidef
+from neutron_lib.db import api as db_api
 from oslo_config import cfg
-import six
 from webob import exc as web_exc
 
-from neutron.api.v2 import attributes
+from neutron.conf import quota as quota_conf
 from neutron.db import db_base_plugin_v2
 from neutron.db import vlantransparent_db as vlt_db
 from neutron.extensions import vlantransparent as vlt
 from neutron import quota
-from neutron.tests.unit.db import test_db_base_plugin_v2
+from neutron.tests.common import test_db_base_plugin_v2
 from neutron.tests.unit import testlib_api
 
 
-class VlanTransparentExtensionManager(object):
+class VlanTransparentExtensionManager:
 
     def get_resources(self):
         return []
@@ -37,14 +38,25 @@ class VlanTransparentExtensionManager(object):
         return []
 
     def get_extended_resources(self, version):
-        return vlt.get_extended_resources(version)
+        return vlt.Vlantransparent.get_extended_resources(version)
 
 
 class VlanTransparentExtensionTestPlugin(db_base_plugin_v2.NeutronDbPluginV2,
                                          vlt_db.Vlantransparent_db_mixin):
     """Test plugin to mixin the VLAN transparent extensions."""
 
-    supported_extension_aliases = ["vlan-transparent"]
+    supported_extension_aliases = [vlan_apidef.ALIAS]
+
+    def create_network(self, context, network):
+        with db_api.CONTEXT_WRITER.using(context):
+            new_net = super().create_network(context, network)
+            # Update the vlan_transparent in the database
+            n = network['network']
+            vlan_transparent = vlan_apidef.get_vlan_transparent(n)
+            network = self._get_network(context, new_net['id'])
+            n['vlan_transparent'] = vlan_transparent
+            network.update(n)
+        return new_net
 
 
 class VlanTransparentExtensionTestCase(test_db_base_plugin_v2.TestNetworksV2):
@@ -54,26 +66,14 @@ class VlanTransparentExtensionTestCase(test_db_base_plugin_v2.TestNetworksV2):
         plugin = ('neutron.tests.unit.extensions.test_vlantransparent.'
                   'VlanTransparentExtensionTestPlugin')
 
-        # Save the global RESOURCE_ATTRIBUTE_MAP
-        self.saved_attr_map = {}
-        for res, attrs in six.iteritems(attributes.RESOURCE_ATTRIBUTE_MAP):
-            self.saved_attr_map[res] = attrs.copy()
-
         # Update the plugin and extensions path
-        cfg.CONF.set_override('allow_pagination', True)
-        cfg.CONF.set_override('allow_sorting', True)
         ext_mgr = VlanTransparentExtensionManager()
-        self.addCleanup(self._restore_attribute_map)
-        super(VlanTransparentExtensionTestCase, self).setUp(plugin=plugin,
-                                                            ext_mgr=ext_mgr)
+        super().setUp(plugin=plugin,
+                      ext_mgr=ext_mgr)
 
         quota.QUOTAS._driver = None
-        cfg.CONF.set_override('quota_driver', 'neutron.quota.ConfDriver',
+        cfg.CONF.set_override('quota_driver', quota_conf.QUOTA_DB_DRIVER,
                               group='QUOTAS')
-
-    def _restore_attribute_map(self):
-        # Restore the global RESOURCE_ATTRIBUTE_MAP
-        attributes.RESOURCE_ATTRIBUTE_MAP = self.saved_attr_map
 
     def test_network_create_with_vlan_transparent_attr(self):
         vlantrans = {'vlan_transparent': True}
@@ -82,7 +82,7 @@ class VlanTransparentExtensionTestCase(test_db_base_plugin_v2.TestNetworksV2):
             res = self.deserialize(self.fmt, req.get_response(self.api))
             self.assertEqual(net['network']['name'],
                              res['network']['name'])
-            self.assertEqual(True, res['network'][vlt.VLANTRANSPARENT])
+            self.assertTrue(res['network'][vlan_apidef.VLANTRANSPARENT])
 
     def test_network_create_with_bad_vlan_transparent_attr(self):
         vlantrans = {'vlan_transparent': "abc"}
@@ -96,10 +96,10 @@ class VlanTransparentExtensionTestCase(test_db_base_plugin_v2.TestNetworksV2):
     def test_network_update_with_vlan_transparent_exception(self):
         with self.network(name='net1') as net:
             self._update('networks', net['network']['id'],
-                         {'network': {vlt.VLANTRANSPARENT: False}},
+                         {'network': {vlan_apidef.VLANTRANSPARENT: False}},
                          web_exc.HTTPBadRequest.code)
             req = self.new_show_request('networks', net['network']['id'])
             res = self.deserialize(self.fmt, req.get_response(self.api))
             self.assertEqual(net['network']['name'],
                              res['network']['name'])
-            self.assertEqual(None, res['network'][vlt.VLANTRANSPARENT])
+            self.assertFalse(res['network'][vlan_apidef.VLANTRANSPARENT])

@@ -17,299 +17,143 @@
 # when needed.
 
 """Utilities and helper functions."""
-
+from collections import abc
+from concurrent import futures
 import datetime
 import functools
 import hashlib
-import logging as std_logging
-import multiprocessing
-import netaddr
+import hmac
+import importlib
+import math
 import os
-import random
-import signal
+import os.path
+import re
+import secrets
 import socket
+import sys
+import threading
+import time
+import typing
 import uuid
+import weakref
 
-from eventlet.green import subprocess
-from oslo_concurrency import lockutils
+import netaddr
+from neutron_lib.api.definitions import availability_zone as az_def
+from neutron_lib import constants as n_const
+from neutron_lib import context as n_context
+from neutron_lib.db import api as db_api
+from neutron_lib.services.qos import constants as qos_consts
+from neutron_lib.services.trunk import constants as trunk_constants
+from neutron_lib.utils import helpers
 from oslo_config import cfg
+from oslo_db import exception as db_exc
 from oslo_log import log as logging
+from oslo_utils import encodeutils
 from oslo_utils import excutils
-import six
+from oslo_utils import timeutils
+from oslo_utils import uuidutils
+from oslo_utils import versionutils
+from osprofiler import profiler
+from sqlalchemy.dialects.mysql import dialect as mysql_dialect
+from sqlalchemy.dialects.sqlite import dialect as sqlite_dialect
+from sqlalchemy.sql.expression import func as sql_func
 
-from neutron.common import constants as q_const
+import neutron
+from neutron._i18n import _
+from neutron.api import api_common
+from neutron.common import privsep_safe_utils
+from neutron.conf import service as conf_service
+
 
 TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 LOG = logging.getLogger(__name__)
-SYNCHRONIZED_PREFIX = 'neutron-'
 
-synchronized = lockutils.synchronized_with_prefix(SYNCHRONIZED_PREFIX)
+cidr_broadcast_address = privsep_safe_utils.cidr_broadcast_address
+cidr_broadcast_address_alternative = (
+    privsep_safe_utils.cidr_broadcast_address_alternative)
+read_file = privsep_safe_utils.read_file
 
+DEFAULT_THROTTLER_VALUE = 2
 
-class cache_method_results(object):
-    """This decorator is intended for object methods only."""
-
-    def __init__(self, func):
-        self.func = func
-        functools.update_wrapper(self, func)
-        self._first_call = True
-        self._not_cached = object()
-
-    def _get_from_cache(self, target_self, *args, **kwargs):
-        func_name = "%(module)s.%(class)s.%(func_name)s" % {
-            'module': target_self.__module__,
-            'class': target_self.__class__.__name__,
-            'func_name': self.func.__name__,
-        }
-        key = (func_name,) + args
-        if kwargs:
-            key += dict2tuple(kwargs)
-        try:
-            item = target_self._cache.get(key, self._not_cached)
-        except TypeError:
-            LOG.debug("Method %(func_name)s cannot be cached due to "
-                      "unhashable parameters: args: %(args)s, kwargs: "
-                      "%(kwargs)s",
-                      {'func_name': func_name,
-                       'args': args,
-                       'kwargs': kwargs})
-            return self.func(target_self, *args, **kwargs)
-
-        if item is self._not_cached:
-            item = self.func(target_self, *args, **kwargs)
-            target_self._cache.set(key, item, None)
-
-        return item
-
-    def __call__(self, target_self, *args, **kwargs):
-        if not hasattr(target_self, '_cache'):
-            raise NotImplementedError(
-                "Instance of class %(module)s.%(class)s must contain _cache "
-                "attribute" % {
-                    'module': target_self.__module__,
-                    'class': target_self.__class__.__name__})
-        if not target_self._cache:
-            if self._first_call:
-                LOG.debug("Instance of class %(module)s.%(class)s doesn't "
-                          "contain attribute _cache therefore results "
-                          "cannot be cached for %(func_name)s.",
-                          {'module': target_self.__module__,
-                           'class': target_self.__class__.__name__,
-                           'func_name': self.func.__name__})
-                self._first_call = False
-            return self.func(target_self, *args, **kwargs)
-        return self._get_from_cache(target_self, *args, **kwargs)
-
-    def __get__(self, obj, objtype):
-        return functools.partial(self.__call__, obj)
+_SEPARATOR_REGEX = re.compile(r'[/\\]+')
 
 
-def read_cached_file(filename, cache_info, reload_func=None):
-    """Read from a file if it has been modified.
+class WaitTimeout(Exception):
+    """Default exception coming from wait_until_true() function."""
 
-    :param cache_info: dictionary to hold opaque cache.
-    :param reload_func: optional function to be called with data when
-                        file is reloaded due to a modification.
 
-    :returns: data from file
+class LockWithTimer:
+    def __init__(self, threshold):
+        self._threshold = threshold
+        self.timestamp = 0
+        self._lock = threading.Lock()
 
+    def acquire(self):
+        return self._lock.acquire(False)
+
+    def release(self):
+        return self._lock.release()
+
+    def time_to_wait(self):
+        return self.timestamp - time.time() + self._threshold
+
+
+# REVISIT(jlibosva): Some parts of throttler may be similar to what
+#                    neutron.notifiers.batch_notifier.BatchNotifier does. They
+#                    could be refactored and unified.
+def throttler(threshold=DEFAULT_THROTTLER_VALUE):
+    """Throttle number of calls to a function to only once per 'threshold'.
     """
-    mtime = os.path.getmtime(filename)
-    if not cache_info or mtime != cache_info.get('mtime'):
-        LOG.debug("Reloading cached file %s", filename)
-        with open(filename) as fap:
-            cache_info['data'] = fap.read()
-        cache_info['mtime'] = mtime
-        if reload_func:
-            reload_func(cache_info['data'])
-    return cache_info['data']
+    def decorator(f):
+        lock_with_timer = LockWithTimer(threshold)
+
+        @functools.wraps(f)
+        def wrapper(*args, **kwargs):
+            if lock_with_timer.acquire():
+                try:
+                    fname = f.__name__
+                    time_to_wait = lock_with_timer.time_to_wait()
+                    if time_to_wait > 0:
+                        LOG.debug("Call of function %s scheduled, sleeping "
+                                  "%.1f seconds", fname, time_to_wait)
+                        # Decorated function has been called recently, wait.
+                        time.sleep(time_to_wait)
+                    lock_with_timer.timestamp = time.time()
+                finally:
+                    lock_with_timer.release()
+                LOG.debug("Calling throttled function %s", fname)
+                return f(*args, **kwargs)
+        return wrapper
+    return decorator
 
 
-def find_config_file(options, config_file):
-    """Return the first config file found.
-
-    We search for the paste config file in the following order:
-    * If --config-file option is used, use that
-    * Search for the configuration files via common cfg directories
-    :retval Full path to config file, or None if no config file found
-    """
-    fix_path = lambda p: os.path.abspath(os.path.expanduser(p))
-    if options.get('config_file'):
-        if os.path.exists(options['config_file']):
-            return fix_path(options['config_file'])
-
-    dir_to_common = os.path.dirname(os.path.abspath(__file__))
-    root = os.path.join(dir_to_common, '..', '..', '..', '..')
-    # Handle standard directory search for the config file
-    config_file_dirs = [fix_path(os.path.join(os.getcwd(), 'etc')),
-                        fix_path(os.path.join('~', '.neutron-venv', 'etc',
-                                              'neutron')),
-                        fix_path('~'),
-                        os.path.join(cfg.CONF.state_path, 'etc'),
-                        os.path.join(cfg.CONF.state_path, 'etc', 'neutron'),
-                        fix_path(os.path.join('~', '.local',
-                                              'etc', 'neutron')),
-                        '/usr/etc/neutron',
-                        '/usr/local/etc/neutron',
-                        '/etc/neutron/',
-                        '/etc']
-
-    if 'plugin' in options:
-        config_file_dirs = [
-            os.path.join(x, 'neutron', 'plugins', options['plugin'])
-            for x in config_file_dirs
-        ]
-
-    if os.path.exists(os.path.join(root, 'plugins')):
-        plugins = [fix_path(os.path.join(root, 'plugins', p, 'etc'))
-                   for p in os.listdir(os.path.join(root, 'plugins'))]
-        plugins = [p for p in plugins if os.path.isdir(p)]
-        config_file_dirs.extend(plugins)
-
-    for cfg_dir in config_file_dirs:
-        cfg_file = os.path.join(cfg_dir, config_file)
-        if os.path.exists(cfg_file):
-            return cfg_file
-
-
-def _subprocess_setup():
-    # Python installs a SIGPIPE handler by default. This is usually not what
-    # non-Python subprocesses expect.
-    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
-
-
-def subprocess_popen(args, stdin=None, stdout=None, stderr=None, shell=False,
-                     env=None, preexec_fn=_subprocess_setup, close_fds=True):
-
-    return subprocess.Popen(args, shell=shell, stdin=stdin, stdout=stdout,
-                            stderr=stderr, preexec_fn=preexec_fn,
-                            close_fds=close_fds, env=env)
-
-
-def parse_mappings(mapping_list, unique_values=True):
-    """Parse a list of mapping strings into a dictionary.
-
-    :param mapping_list: a list of strings of the form '<key>:<value>'
-    :param unique_values: values must be unique if True
-    :returns: a dict mapping keys to values
-    """
-    mappings = {}
-    for mapping in mapping_list:
-        mapping = mapping.strip()
-        if not mapping:
-            continue
-        split_result = mapping.split(':')
-        if len(split_result) != 2:
-            raise ValueError(_("Invalid mapping: '%s'") % mapping)
-        key = split_result[0].strip()
-        if not key:
-            raise ValueError(_("Missing key in mapping: '%s'") % mapping)
-        value = split_result[1].strip()
-        if not value:
-            raise ValueError(_("Missing value in mapping: '%s'") % mapping)
-        if key in mappings:
-            raise ValueError(_("Key %(key)s in mapping: '%(mapping)s' not "
-                               "unique") % {'key': key, 'mapping': mapping})
-        if unique_values and value in mappings.values():
-            raise ValueError(_("Value %(value)s in mapping: '%(mapping)s' "
-                               "not unique") % {'value': value,
-                                                'mapping': mapping})
-        mappings[key] = value
-    return mappings
-
-
-def get_hostname():
-    return socket.gethostname()
-
-
-def compare_elements(a, b):
-    """Compare elements if a and b have same elements.
-
-    This method doesn't consider ordering
-    """
-    if a is None:
-        a = []
-    if b is None:
-        b = []
-    return set(a) == set(b)
-
-
-def dict2str(dic):
-    return ','.join("%s=%s" % (key, val)
-                    for key, val in sorted(six.iteritems(dic)))
-
-
-def str2dict(string):
-    res_dict = {}
-    for keyvalue in string.split(','):
-        (key, value) = keyvalue.split('=', 1)
-        res_dict[key] = value
-    return res_dict
-
-
-def dict2tuple(d):
-    items = d.items()
-    items.sort()
-    return tuple(items)
-
-
-def diff_list_of_dict(old_list, new_list):
-    new_set = set([dict2str(l) for l in new_list])
-    old_set = set([dict2str(l) for l in old_list])
-    added = new_set - old_set
-    removed = old_set - new_set
-    return [str2dict(a) for a in added], [str2dict(r) for r in removed]
-
-
-def is_extension_supported(plugin, ext_alias):
-    return ext_alias in getattr(
-        plugin, "supported_extension_aliases", [])
+def get_first_host_ip(net, ip_version):
+    return str(netaddr.IPAddress(net.first + 1, ip_version))
 
 
 def log_opt_values(log):
-    cfg.CONF.log_opt_values(log, std_logging.DEBUG)
+    cfg.CONF.log_opt_values(log, logging.DEBUG)
 
 
-def get_random_mac(base_mac):
-    mac = [int(base_mac[0], 16), int(base_mac[1], 16),
-           int(base_mac[2], 16), random.randint(0x00, 0xff),
-           random.randint(0x00, 0xff), random.randint(0x00, 0xff)]
-    if base_mac[3] != '00':
-        mac[3] = int(base_mac[3], 16)
-    return ':'.join(["%02x" % x for x in mac])
-
-
-def get_random_string(length):
-    """Get a random hex string of the specified length.
-
-    based on Cinder library
-      cinder/transfer/api.py
-    """
-    rndstr = ""
-    random.seed(datetime.datetime.now().microsecond)
-    while len(rndstr) < length:
-        rndstr += hashlib.sha224(str(random.random())).hexdigest()
-
-    return rndstr[0:length]
-
-
-def get_dhcp_agent_device_id(network_id, host):
+def get_dhcp_agent_device_id(network_id, host, segmentation_id=None):
     # Split host so as to always use only the hostname and
-    # not the domain name. This will guarantee consistentcy
+    # not the domain name. This will guarantee consistency
     # whether a local hostname or an fqdn is passed in.
     local_hostname = host.split('.')[0]
     host_uuid = uuid.uuid5(uuid.NAMESPACE_DNS, str(local_hostname))
-    return 'dhcp%s-%s' % (host_uuid, network_id)
+    if not segmentation_id:
+        return f'dhcp{host_uuid}-{network_id}'
+    return f'dhcp{host_uuid}-{network_id}-{segmentation_id}'
 
 
-def cpu_count():
-    try:
-        return multiprocessing.cpu_count()
-    except NotImplementedError:
-        return 1
+def is_dns_servers_any_address(dns_servers, ip_version):
+    """Checks if DNS server list matches the IP any address '0.0.0.0'/'::'"""
+    ip_any = netaddr.IPNetwork(n_const.IP_ANY[ip_version]).ip
+    return (len(dns_servers) == 1 and
+            netaddr.IPNetwork(dns_servers[0]).ip == ip_any)
 
 
-class exception_logger(object):
+class exception_logger:
     """Wrap a function and log raised exception
 
     :param logger: the logger to log the exception default is LOG.exception
@@ -318,6 +162,7 @@ class exception_logger(object):
               any occurred
 
     """
+
     def __init__(self, logger=None):
         self.logger = logger
 
@@ -335,6 +180,61 @@ class exception_logger(object):
         return call
 
 
+def log_worker_lifecycle(description, finished_only=False):
+    """Log worker lifecycle method calls at DEBUG level.
+
+    :param description: Callable receiving the worker instance and returning
+        the description logged in the message, or the name of an instance
+        attribute holding that value.
+    :param finished_only: If True, only log the method finished message.
+    """
+    def decorator(func):
+        method_name = func.__name__
+
+        @functools.wraps(func)
+        def wrapper(self, *args, **kwargs):
+            log = logging.getLogger(func.__module__)
+            worker_class = self.__class__.__name__
+            if callable(description):
+                desc = description(self)
+            else:
+                desc = getattr(self, description, None)
+            if not finished_only:
+                log.debug('%s %s called, description: %s',
+                          worker_class, method_name, desc)
+            result = func(self, *args, **kwargs)
+            log.debug('%s %s finished, description: %s',
+                      worker_class, method_name, desc)
+            return result
+        return wrapper
+    return decorator
+
+
+def get_other_dvr_serviced_device_owners(host_dvr_for_dhcp=True):
+    """Return device_owner names for ports that should be serviced by DVR
+
+    This doesn't return DEVICE_OWNER_COMPUTE_PREFIX since it is a
+    prefix, not a complete device_owner name, so should be handled
+    separately (see is_dvr_serviced() below)
+    """
+    device_owners = [trunk_constants.TRUNK_SUBPORT_OWNER]
+    if host_dvr_for_dhcp:
+        device_owners.append(n_const.DEVICE_OWNER_DHCP)
+    return device_owners
+
+
+def get_dvr_allowed_address_pair_device_owners():
+    """Return device_owner names for allowed_addr_pair ports serviced by DVR
+
+    This just returns the device owners that are used by the
+    allowed_address_pair ports. Right now only the device_owners shown
+    below are used by the allowed_address_pair ports.
+    Later if other device owners are used for allowed_address_pairs those
+    device_owners should be added to the list below.
+    """
+    return []
+
+
 def is_dvr_serviced(device_owner):
     """Check if the port need to be serviced by DVR
 
@@ -343,28 +243,23 @@ def is_dvr_serviced(device_owner):
     if they are required for DVR or any service directly or
     indirectly associated with DVR.
     """
-    dvr_serviced_device_owners = (q_const.DEVICE_OWNER_LOADBALANCER,
-                                  q_const.DEVICE_OWNER_DHCP)
-    return (device_owner.startswith('compute:') or
-            device_owner in dvr_serviced_device_owners)
+    return (device_owner.startswith(n_const.DEVICE_OWNER_COMPUTE_PREFIX) or
+            device_owner in get_other_dvr_serviced_device_owners())
 
 
-def get_keystone_url(conf):
-    if conf.auth_uri:
-        auth_uri = conf.auth_uri.rstrip('/')
-    else:
-        auth_uri = ('%(protocol)s://%(host)s:%(port)s' %
-            {'protocol': conf.auth_protocol,
-             'host': conf.auth_host,
-             'port': conf.auth_port})
-    # NOTE(ihrachys): all existing consumers assume version 2.0
-    return '%s/v2.0/' % auth_uri
+def is_fip_serviced(device_owner):
+    """Check if the port can be assigned a floating IP
+
+    Helper function to check the device owner of a
+    port can be assigned a floating IP.
+    """
+    return device_owner != n_const.DEVICE_OWNER_DHCP
 
 
 def ip_to_cidr(ip, prefix=None):
     """Convert an ip with no prefix to cidr notation
 
-    :param ip: An ipv4 or ipv6 address.  Convertable to netaddr.IPNetwork.
+    :param ip: An ipv4 or ipv6 address.  Convertible to netaddr.IPNetwork.
     :param prefix: Optional prefix.  If None, the default 32 will be used for
         ipv4 and 128 for ipv6.
     """
@@ -373,6 +268,23 @@ def ip_to_cidr(ip, prefix=None):
         # Can't pass ip and prefix separately.  Must concatenate strings.
         net = netaddr.IPNetwork(str(net.ip) + '/' + str(prefix))
     return str(net)
+
+
+def cidr_to_ip(ip_cidr):
+    """Strip the cidr notation from an ip cidr or ip
+
+    :param ip_cidr: An ipv4 or ipv6 address, with or without cidr notation
+    """
+    net = netaddr.IPNetwork(ip_cidr)
+    return str(net.ip)
+
+
+def cidr_mask(ip_cidr):
+    """Returns the subnet mask length from a cidr
+
+    :param ip_cidr: An ipv4 or ipv6 cidr mask length
+    """
+    return netaddr.IPNetwork(ip_cidr).netmask.netmask_bits()
 
 
 def fixed_ip_cidrs(fixed_ips):
@@ -393,22 +305,54 @@ def is_cidr_host(cidr):
         plain IP addresses specifically to avoid ambiguity.
     """
     if '/' not in str(cidr):
-        raise ValueError("cidr doesn't contain a '/'")
+        raise ValueError(_("cidr doesn't contain a '/'"))
     net = netaddr.IPNetwork(cidr)
     if net.version == 4:
-        return net.prefixlen == q_const.IPv4_BITS
-    return net.prefixlen == q_const.IPv6_BITS
+        return net.prefixlen == n_const.IPv4_BITS
+    return net.prefixlen == n_const.IPv6_BITS
+
+
+def cidr_mask_length(cidr):
+    """Returns the mask length of a cidr
+
+    :param cidr: (string) either an ipv4 or ipv6 cidr or a host IP.
+    :returns: (int) mask length of a cidr; in case of host IP, the mask length
+              will be 32 (IPv4) or 128 (IPv6)
+    """
+    return netaddr.IPNetwork(cidr).netmask.netmask_bits()
+
+
+def get_ip_version(ip_or_cidr):
+    return netaddr.IPNetwork(ip_or_cidr).version
 
 
 def ip_version_from_int(ip_version_int):
-    if ip_version_int == 4:
-        return q_const.IPv4
-    if ip_version_int == 6:
-        return q_const.IPv6
+    if ip_version_int == n_const.IP_VERSION_4:
+        return n_const.IPv4
+    if ip_version_int == n_const.IP_VERSION_6:
+        return n_const.IPv6
     raise ValueError(_('Illegal IP version number'))
 
 
-class DelayedStringRenderer(object):
+def get_network_length(ip_version):
+    """Returns the network length depending on the IP version"""
+    return (n_const.IPv4_BITS if ip_version == n_const.IP_VERSION_4
+            else n_const.IPv6_BITS)
+
+
+def get_socket_address_family(ip_version):
+    """Returns the address family depending on the IP version"""
+    return (int(socket.AF_INET if ip_version == n_const.IP_VERSION_4
+                else socket.AF_INET6))
+
+
+def is_version_greater_equal(version1, version2):
+    """Returns True if version1 is greater or equal than version2 else False"""
+    return (versionutils.convert_version_to_tuple(version1) >=
+            versionutils.convert_version_to_tuple(version2))
+
+
+class DelayedStringRenderer:
     """Takes a callable and its args and calls when __str__ is called
 
     Useful for when an argument to a logging statement is expensive to
@@ -423,3 +367,827 @@ class DelayedStringRenderer(object):
 
     def __str__(self):
         return str(self.function(*self.args, **self.kwargs))
+
+
+def _hex_format(port, mask=0):
+
+    def hex_str(num):
+        return format(num, '#06x')
+    if mask > 0:
+        return f"{hex_str(port)}/{hex_str(0xffff & ~mask)}"
+    return hex_str(port)
+
+
+def _gen_rules_port_min(port_min, top_bit):
+    """Generate rules for port_min
+
+    Encode a port range range(port_min, (port_min | (top_bit - 1)) + 1) into
+    a set of bit value/masks.
+    """
+    # Processing starts with setting up mask and top_bit variables to their
+    # maximum. Top_bit has the form (1000000) with '1' pointing to the register
+    # being processed, while mask has the form (0111111) with '1' showing
+    # possible range to be covered.
+
+    # With each rule generation cycle, mask and top_bit are bit shifted to the
+    # right. When top_bit reaches 0 it means that last register was processed.
+
+    # Let port_min be n bits long, top_bit = 1 << k, 0<=k<=n-1.
+
+    # Each cycle step checks the following conditions:
+
+    #     1). port & mask == 0
+    #     This means that remaining bits k..1 are equal to '0' and can be
+    #     covered by a single port/mask rule.
+
+    #     If condition 1 doesn't fit, then both top_bit and mask are bit
+    #     shifted to the right and condition 2 is checked:
+
+    #     2). port & top_bit == 0
+    #     This means that kth port bit is equal to '0'. By setting it to '1'
+    #     and masking other (k-1) bits all ports in range
+    #     [P, P + 2^(k-1)-1] are guaranteed to be covered.
+    #     Let p_k be equal to port first (n-k) bits with rest set to 0.
+    #     Then P = p_k | top_bit.
+
+    # Correctness proof:
+    # The remaining range to be encoded in a cycle is calculated as follows:
+    # R = [port_min, port_min | mask].
+    # If condition 1 holds, then a rule that covers R is generated and the job
+    # is done.
+    # If condition 2 holds, then the rule emitted will cover 2^(k-1) values
+    # from the range. Remaining range R will shrink by 2^(k-1).
+    # If condition 2 doesn't hold, then even after top_bit/mask shift in next
+    # iteration the value of R won't change.
+
+    # Full cycle example for range [40, 64):
+    # port=0101000, top_bit=1000000, k=6
+    # * step 1, k=6, R=[40, 63]
+    #   top_bit=1000000, mask=0111111 -> condition 1 doesn't hold, shifting
+    #                                    mask/top_bit
+    #   top_bit=0100000, mask=0011111 -> condition 2 doesn't hold
+
+    # * step 2, k=5, R=[40, 63]
+    #   top_bit=0100000, mask=0011111 -> condition 1 doesn't hold, shifting
+    #                                    mask/top_bit
+    #   top_bit=0010000, mask=0001111 -> condition 2 holds -> 011xxxx or
+    #                                                         0x0030/fff0
+    # * step 3, k=4, R=[40, 47]
+    #   top_bit=0010000, mask=0001111 -> condition 1 doesn't hold, shifting
+    #                                    mask/top_bit
+    #   top_bit=0001000, mask=0000111 -> condition 2 doesn't hold
+
+    # * step 4, k=3, R=[40, 47]
+    #   top_bit=0001000, mask=0000111 -> condition 1 holds -> 0101xxx or
+    #                                                         0x0028/fff8
+
+    #   rules=[0x0030/fff0, 0x0028/fff8]
+
+    rules = []
+    mask = top_bit - 1
+
+    while True:
+        if (port_min & mask) == 0:
+            # greedy matched a streak of '0' in port_min
+            rules.append(_hex_format(port_min, mask))
+            break
+        top_bit >>= 1
+        mask >>= 1
+        if (port_min & top_bit) == 0:
+            # matched next '0' in port_min to substitute for '1' in resulting
+            # rule
+            rules.append(_hex_format(port_min & ~mask | top_bit, mask))
+    return rules
+
+
+def _gen_rules_port_max(port_max, top_bit):
+    """Generate rules for port_max
+
+    Encode a port range range(port_max & ~(top_bit - 1), port_max + 1) into
+    a set of bit value/masks.
+    """
+    # Processing starts with setting up mask and top_bit variables to their
+    # maximum. Top_bit has the form (1000000) with '1' pointing to the register
+    # being processed, while mask has the form (0111111) with '1' showing
+    # possible range to be covered.
+
+    # With each rule generation cycle, mask and top_bit are bit shifted to the
+    # right. When top_bit reaches 0 it means that last register was processed.
+
+    # Let port_max be n bits long, top_bit = 1 << k, 0<=k<=n-1.
+
+    # Each cycle step checks the following conditions:
+
+    #     1). port & mask == mask
+    #     This means that remaining bits k..1 are equal to '1' and can be
+    #     covered by a single port/mask rule.
+
+    #     If condition 1 doesn't fit, then both top_bit and mask are bit
+    #     shifted to the right and condition 2 is checked:
+
+    #     2). port & top_bit == top_bit
+    #     This means that kth port bit is equal to '1'. By setting it to '0'
+    #     and masking other (k-1) bits all ports in range
+    #     [P, P + 2^(k-1)-1] are guaranteed to be covered.
+    #     Let p_k be equal to port first (n-k) bits with rest set to 0.
+    #     Then P = p_k | ~top_bit.
+
+    # Correctness proof:
+    # The remaining range to be encoded in a cycle is calculated as follows:
+    # R = [port_max & ~mask, port_max].
+    # If condition 1 holds, then a rule that covers R is generated and the job
+    # is done.
+    # If condition 2 holds, then the rule emitted will cover 2^(k-1) values
+    # from the range. Remaining range R will shrink by 2^(k-1).
+    # If condition 2 doesn't hold, then even after top_bit/mask shift in next
+    # iteration the value of R won't change.
+
+    # Full cycle example for range [64, 105]:
+    # port=1101001, top_bit=1000000, k=6
+    # * step 1, k=6, R=[64, 105]
+    #   top_bit=1000000, mask=0111111 -> condition 1 doesn't hold, shifting
+    #                                    mask/top_bit
+    #   top_bit=0100000, mask=0011111 -> condition 2 holds -> 10xxxxx or
+    #                                                         0x0040/ffe0
+    # * step 2, k=5, R=[96, 105]
+    #   top_bit=0100000, mask=0011111 -> condition 1 doesn't hold, shifting
+    #                                    mask/top_bit
+    #   top_bit=0010000, mask=0001111 -> condition 2 doesn't hold
+
+    # * step 3, k=4, R=[96, 105]
+    #   top_bit=0010000, mask=0001111 -> condition 1 doesn't hold, shifting
+    #                                    mask/top_bit
+    #   top_bit=0001000, mask=0000111 -> condition 2 holds -> 1100xxx or
+    #                                                         0x0060/fff8
+    # * step 4, k=3, R=[104, 105]
+    #   top_bit=0001000, mask=0000111 -> condition 1 doesn't hold, shifting
+    #                                    mask/top_bit
+    #   top_bit=0000100, mask=0000011 -> condition 2 doesn't hold
+
+    # * step 5, k=2, R=[104, 105]
+    #   top_bit=0000100, mask=0000011 -> condition 1 doesn't hold, shifting
+    #                                    mask/top_bit
+    #   top_bit=0000010, mask=0000001 -> condition 2 doesn't hold
+
+    # * step 6, k=1, R=[104, 105]
+    #   top_bit=0000010, mask=0000001 -> condition 1 holds -> 1101001 or
+    #                                                         0x0068
+
+    #   rules=[0x0040/ffe0, 0x0060/fff8, 0x0068]
+
+    rules = []
+    mask = top_bit - 1
+
+    while True:
+        if (port_max & mask) == mask:
+            # greedy matched a streak of '1' in port_max
+            rules.append(_hex_format(port_max & ~mask, mask))
+            break
+        top_bit >>= 1
+        mask >>= 1
+        if (port_max & top_bit) == top_bit:
+            # matched next '1' in port_max to substitute for '0' in resulting
+            # rule
+            rules.append(_hex_format(port_max & ~mask & ~top_bit, mask))
+    return rules
+
+
+def port_rule_masking(port_min, port_max):
+    """Translate a range [port_min, port_max] into a set of bitwise matches.
+
+    Each match has the form 'port/mask'. The port and mask are 16-bit numbers
+    written in hexadecimal prefixed by 0x. Each 1-bit in mask requires that
+    the corresponding bit in port must match. Each 0-bit in mask causes the
+    corresponding bit to be ignored.
+    """
+
+    # Let binary representation of port_min and port_max be n bits long and
+    # have first m bits in common, 0 <= m <= n.
+
+    # If remaining (n - m) bits of given ports define 2^(n-m) values, then
+    # [port_min, port_max] range is covered by a single rule.
+    # For example:
+    # n = 6
+    # port_min = 16 (binary 010000)
+    # port_max = 23 (binary 010111)
+    # Ports have m=3 bits in common with the remaining (n-m)=3 bits
+    # covering range [0, 2^3), which equals to a single 010xxx rule. The algo
+    # will return [0x0010/fff8].
+
+    # Else [port_min, port_max] range will be split into 2: range [port_min, T)
+    # and [T, port_max]. Let p_m be the common part of port_min and port_max
+    # with other (n-m) bits set to 0. Then T = p_m | 1 << (n-m-1).
+    # For example:
+    # n = 7
+    # port_min = 40  (binary 0101000)
+    # port_max = 105 (binary 1101001)
+    # Ports have m=0 bits in common, p_m=000000. Then T=1000000 and the
+    # initial range [40, 105] is divided into [40, 64) and [64, 105].
+    # Each of the ranges will be processed separately, then the generated rules
+    # will be merged.
+
+    # Check port_max >= port_min.
+    if port_max < port_min:
+        raise ValueError(_("'port_max' is smaller than 'port_min'"))
+
+    bitdiff = port_min ^ port_max
+    if bitdiff == 0:
+        # port_min == port_max
+        return [_hex_format(port_min)]
+    # for python3.x, bit_length could be used here
+    top_bit = 1
+    while top_bit <= bitdiff:
+        top_bit <<= 1
+    if (port_min & (top_bit - 1) == 0 and
+            port_max & (top_bit - 1) == top_bit - 1):
+        # special case, range of 2^k ports is covered
+        return [_hex_format(port_min, top_bit - 1)]
+
+    top_bit >>= 1
+    rules = []
+    rules.extend(_gen_rules_port_min(port_min, top_bit))
+    rules.extend(_gen_rules_port_max(port_max, top_bit))
+    return rules
+
+
+def create_object_with_dependency(creator, dep_getter, dep_creator,
+                                  dep_id_attr, dep_deleter):
+    """Creates an object that binds to a dependency while handling races.
+
+    creator is a function that expected to take the result of either
+    dep_getter or dep_creator.
+
+    The result of dep_getter and dep_creator must have an attribute of
+    dep_id_attr be used to determine if the dependency changed during object
+    creation.
+
+    dep_deleter will be called with a the result of dep_creator if the creator
+    function fails due to a non-dependency reason or the retries are exceeded.
+
+    dep_getter should return None if the dependency does not exist.
+
+    dep_creator can raise a DBDuplicateEntry to indicate that a concurrent
+    create of the dependency occurred and the process will restart to get the
+    concurrently created one.
+
+    This function will return both the created object and the dependency it
+    used/created.
+
+    This function protects against all of the cases where the dependency can
+    be concurrently removed by catching exceptions and restarting the
+    process of creating the dependency if one no longer exists. It will
+    give up after neutron_lib.db.api.MAX_RETRIES and raise the exception it
+    encounters after that.
+    """
+    result, dependency, dep_id, made_locally = None, None, None, False
+    for attempts in range(1, db_api.MAX_RETRIES + 1):
+        # we go to max + 1 here so the exception handlers can raise their
+        # errors at the end
+        try:
+            dependency = dep_getter()
+            if not dependency:
+                dependency = dep_creator()
+                made_locally = True
+            dep_id = getattr(dependency, dep_id_attr)
+        except db_exc.DBDuplicateEntry:
+            # dependency was concurrently created.
+            with excutils.save_and_reraise_exception() as ctx:
+                if attempts < db_api.MAX_RETRIES:
+                    # sleep for a random time between 0 and 1 second to
+                    # make sure a concurrent worker doesn't retry again
+                    # at exactly the same time
+                    time.sleep(secrets.SystemRandom().uniform(0, 1))
+                    ctx.reraise = False
+                    continue
+        try:
+            result = creator(dependency)
+            break
+        except Exception:
+            with excutils.save_and_reraise_exception() as ctx:
+                # check if dependency we tried to use was removed during
+                # object creation
+                if attempts < db_api.MAX_RETRIES:
+                    dependency = dep_getter()
+                    if not dependency or dep_id != getattr(dependency,
+                                                           dep_id_attr):
+                        ctx.reraise = False
+                        continue
+                # we have exceeded retries or have encountered a non-dependency
+                # related failure so we try to clean up the dependency if we
+                # created it before re-raising
+                if made_locally and dependency:
+                    try:
+                        dep_deleter(dependency)
+                    except Exception:
+                        LOG.exception("Failed cleaning up dependency %s",
+                                      dep_id)
+    return result, dependency
+
+
+def transaction_guard(f):
+    """Ensures that the context passed in is not in a transaction.
+
+    Various Neutron methods modifying resources have assumptions that they will
+    not be called inside of a transaction because they perform operations that
+    expect all data to be committed to the database (e.g. ML2 postcommit calls)
+    and/or they have side effects on external systems.
+    So calling them in a transaction can lead to consistency errors on failures
+    since the side effect will not be reverted on a DB rollback.
+
+    If you receive this error, you must alter your code to handle the fact that
+    the thing you are calling can have side effects so using transactions to
+    undo on failures is not possible.
+
+    This method can be called from a class method or a static method. "inner"
+    should consider if "self" is passed or not. The next mandatory parameter is
+    the context ``neutron_lib.context.Context``.
+    """
+    @functools.wraps(f)
+    def inner(*args, **kwargs):
+        context = (args[0] if issubclass(type(args[0]),
+                                         n_context.ContextBaseWithSession) else
+                   args[1])
+        # FIXME(kevinbenton): get rid of all uses of this flag
+        if (db_api.is_session_active(context.session) and
+                getattr(context, 'GUARD_TRANSACTION', True)):
+            raise RuntimeError(_("Method %s cannot be called within a "
+                                 "transaction.") % f)
+        return f(*args, **kwargs)
+    return inner
+
+
+def wait_until_true(predicate, timeout=60, sleep=1, exception=None):
+    """Wait until callable predicate is evaluated as True
+
+    :param predicate: Callable deciding whether waiting should continue.
+    Best practice is to instantiate predicate with functools.partial()
+    :param timeout: Timeout in seconds how long should function wait.
+    :param sleep: Polling interval for results in seconds.
+    :param exception: Exception instance to raise on timeout. If None is passed
+                      (default) then WaitTimeout exception is raised.
+    """
+    start_time = time.time()
+
+    while not predicate():
+        elapsed_time = time.time() - start_time
+        if elapsed_time > timeout:
+            raise exception if exception else WaitTimeout(
+                _("Timed out after %d seconds") % timeout
+            )
+        time.sleep(sleep)
+
+
+class classproperty:
+    def __init__(self, f):
+        self.func = f
+
+    def __get__(self, obj, owner):
+        return self.func(owner)
+
+
+_NO_ARGS_MARKER = object()
+
+
+def attach_exc_details(e, msg, args=_NO_ARGS_MARKER):
+    e._error_context_msg = msg
+    e._error_context_args = args
+
+
+def extract_exc_details(e):
+    for attr in ('_error_context_msg', '_error_context_args'):
+        if not hasattr(e, attr):
+            return 'No details.'
+    details = e._error_context_msg
+    args = e._error_context_args
+    if args is _NO_ARGS_MARKER:
+        return details
+    return details % args
+
+
+def import_modules_recursively(topdir):
+    '''Import and return all modules below the topdir directory.'''
+    topdir = _SEPARATOR_REGEX.sub('/', topdir)
+    modules = []
+    for root, dirs, files in os.walk(topdir):
+        for file_ in files:
+            if file_[-3:] != '.py':
+                continue
+
+            module = file_[:-3]
+            if module == '__init__':
+                continue
+
+            import_base = _SEPARATOR_REGEX.sub('.', root)
+
+            # NOTE(ihrachys): in Python3, or when we are not located in the
+            # directory containing neutron code, __file__ is absolute, so we
+            # should truncate it to exclude PYTHONPATH prefix
+            prefixlen = len(os.path.dirname(neutron.__file__))
+            import_base = 'neutron' + import_base[prefixlen:]
+
+            module = '.'.join([import_base, module])
+            if module not in sys.modules:
+                importlib.import_module(module)
+            modules.append(module)
+
+    return modules
+
+
+def get_rand_name(max_length=None, prefix='test'):
+    """Return a random string.
+
+    The string will start with 'prefix' and will be exactly 'max_length'.
+    If 'max_length' is None, then exactly 8 random characters, each
+    hexadecimal, will be added. In case len(prefix) <= len(max_length),
+    ValueError will be raised to indicate the problem.
+    """
+    return get_related_rand_names([prefix], max_length)[0]
+
+
+def get_rand_device_name(prefix='test'):
+    return get_rand_name(
+        max_length=n_const.DEVICE_NAME_MAX_LEN, prefix=prefix)
+
+
+def get_related_rand_names(prefixes, max_length=None):
+    """Returns a list of the prefixes with the same random characters appended
+
+    :param prefixes: A list of prefix strings
+    :param max_length: The maximum length of each returned string
+    :returns: A list with each prefix appended with the same random characters
+    """
+
+    if max_length:
+        length = max_length - max(len(p) for p in prefixes)
+        if length <= 0:
+            raise ValueError(
+                _("'max_length' must be longer than all prefixes"))
+    else:
+        length = 8
+    rndchrs = helpers.get_random_string(length)
+    return [p + rndchrs for p in prefixes]
+
+
+def get_related_rand_device_names(prefixes):
+    return get_related_rand_names(prefixes,
+                                  max_length=n_const.DEVICE_NAME_MAX_LEN)
+
+
+def bytes_to_bits(value):
+    return value * 8
+
+
+def bits_to_kilobits(
+        value: int | float,
+        base: int
+) -> int:
+    # NOTE(slaweq): round up that even 1 bit will give 1 kbit as a result, but
+    # zero will return zero too.
+    return math.ceil(value / base)
+
+
+def disable_extension_by_service_plugin(core_plugin, service_plugin):
+    if (service_plugin is None or
+            'filter-validation' not in
+            core_plugin.supported_extension_aliases):
+        return
+    if not api_common.is_filter_validation_supported(service_plugin):
+        core_plugin.supported_extension_aliases.remove('filter-validation')
+        LOG.info('Disable filter validation extension by service plugin '
+                 '%s.', service_plugin.__class__.__name__)
+
+
+def get_port_fixed_ips_set(port):
+    return {ip["ip_address"] for ip in port.get("fixed_ips", [])}
+
+
+def port_ip_changed(new_port, original_port):
+    if not new_port or not original_port:
+        return False
+
+    # Quantity is not same, so it is changed.
+    if (len(new_port.get("fixed_ips", [])) !=
+            len(original_port.get("fixed_ips", []))):
+        return True
+
+    # IPs can be placed in any order, so use python set to verify the
+    # fixed IP addresses.
+    if (get_port_fixed_ips_set(new_port) !=
+            get_port_fixed_ips_set(original_port)):
+        return True
+
+    return False
+
+
+def validate_rp_bandwidth(rp_bandwidths, device_names,
+                          tunnelled_network_rp_name=None):
+    """Validate resource provider bandwidths against device names.
+
+    :param rp_bandwidths: Dict containing resource provider bandwidths,
+                          in the form:
+                          {'phy1': {'ingress': 100, 'egress': 100}}
+    :param device_names: A set of the device names given in bridge_mappings
+                         in case of ovs-agent or in physical_device_mappings
+                         in case of sriov-agent
+    :param tunnelled_network_rp_name: the resource provider name for tunnelled
+                                      networks; if present, it will be added
+                                      to the devices list.
+    :raises ValueError: In case of the devices (keys) in the rp_bandwidths dict
+                        are not in the device_names set.
+    """
+    if tunnelled_network_rp_name:
+        device_names.add(tunnelled_network_rp_name)
+    for dev_name in rp_bandwidths:
+        if dev_name not in device_names:
+            raise ValueError(_(
+                "Invalid resource_provider_bandwidths: "
+                "Device name %(dev_name)s is missing from "
+                "device mappings") % {'dev_name': dev_name})
+
+
+def collect_profiler_info():
+    p = profiler.get()
+    if p:
+        return {
+            "hmac_key": p.hmac_key,
+            "base_id": p.get_base_id(),
+            "parent_id": p.get_id(),
+        }
+
+
+def spawn_n(func, *args, **kwargs):
+    """See spawn() above"""
+
+    profiler_info = collect_profiler_info()
+
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        if profiler_info:
+            profiler.init(**profiler_info)
+        return func(*args, **kwargs)
+
+    # NOTE(ralonsoh): the thread started and returned here is not tracked;
+    # the consumer should join() the thread in order to check that it finishes.
+    _thread = threading.Thread(target=wrapper, args=args, kwargs=kwargs)
+    _thread.start()
+    return _thread
+
+
+def timecost(f):
+    @functools.wraps(f)
+    def wrapper(*args, **kwargs):
+        # A new call id for every call, so that the start and end messages
+        # of overlapping calls to the same function can be paired.
+        call_id = uuidutils.generate_uuid()
+        message_base = ("Time-cost: call %(call_id)s function %(fname)s ") % {
+            "call_id": call_id, "fname": f.__name__}
+        end_message = message_base + "took %(seconds).3fs seconds to run"
+
+        LOG.debug('%s start', message_base)
+        timed = timeutils.time_it(LOG, message=end_message, min_duration=None)
+        return timed(f)(*args, **kwargs)
+    return wrapper
+
+
+class SingletonDecorator:
+    _singleton_instances = weakref.WeakValueDictionary()
+
+    def __init__(self, klass):
+        self._klass = klass
+
+    def __call__(self, *args, **kwargs):
+        if self._klass not in self._singleton_instances:
+            _inst = self._klass(*args, **kwargs)
+            self._singleton_instances[self._klass] = _inst
+        return self._singleton_instances[self._klass]
+
+    def drop(self):
+        """Forget the cached singleton instance.
+
+        The next instantiation will create a new instance. This is
+        mainly useful for the unit tests, where a stale singleton kept
+        alive by another object holding a reference to it could leak
+        state between the tests.
+        """
+        self._singleton_instances.pop(self._klass, None)
+
+
+def with_metaclass(meta, *bases):
+    """Function from jinja2/_compat.py. License: BSD.
+
+    Method imported from "futures".
+
+    Use it like this::
+
+        class BaseForm(object):
+            pass
+
+        class FormType(type):
+            pass
+
+        class Form(with_metaclass(FormType, BaseForm)):
+            pass
+
+    This requires a bit of explanation: the basic idea is to make a
+    dummy metaclass for one level of class instantiation that replaces
+    itself with the actual metaclass.  Because of internal type checks
+    we also need to make sure that we downgrade the custom metaclass
+    for one level to something closer to type (that's why __call__ and
+    __init__ comes back from type etc.).
+
+    This has the advantage over six.with_metaclass of not introducing
+    dummy classes into the final MRO.
+    """
+    class metaclass(meta):
+        __call__ = type.__call__
+        __init__ = type.__init__
+
+        def __new__(cls, name, this_bases, d):
+            if this_bases is None:
+                return type.__new__(cls, name, (), d)
+            return meta(name, bases, d)
+
+    return metaclass('temporary_class', None, {})
+
+
+def get_sql_random_method(sql_dialect_name):
+    """Return the SQL random method supported depending on the dialect."""
+    # NOTE(ralonsoh): this method is a good candidate to be implemented in
+    # oslo.db.
+    # https://www.sqlite.org/c3ref/randomness.html
+    if sql_dialect_name == sqlite_dialect.name:
+        return sql_func.random
+    # https://dev.mysql.com/doc/refman/8.0/en/mathematical-functions.html
+    if sql_dialect_name == mysql_dialect.name:
+        return sql_func.rand
+
+
+def get_az_hints(resource):
+    """Return the availability zone hints from a given resource."""
+    return (sorted(resource.get(az_def.AZ_HINTS, [])) or
+            cfg.CONF.default_availability_zones)
+
+
+def disable_notifications(function):
+    """Decorator to disable notifications"""
+
+    @functools.wraps(function)
+    def wrapper(*args, **kwargs):
+        rpc_workers = conf_service.get_rpc_workers()
+        if rpc_workers is None or rpc_workers >= 1:
+            return function(*args, **kwargs)
+    return wrapper
+
+
+def skip_exceptions(exceptions):
+    """Decorator to catch and hide any provided exception in the argument"""
+
+    # NOTE(ralonsoh): could be rehomed to neutron-lib.
+    if not isinstance(exceptions, list):
+        exceptions = [exceptions]
+
+    def decorator(function):
+        @functools.wraps(function)
+        def wrapper(*args, **kwargs):
+            try:
+                return function(*args, **kwargs)
+            except Exception as exc:
+                with excutils.save_and_reraise_exception() as ctx:
+                    if issubclass(type(exc), tuple(exceptions)):
+                        LOG.info('Skipped exception %s when calling method %s',
+                                 repr(ctx.value), repr(function))
+                        ctx.reraise = False
+        return wrapper
+    return decorator
+
+
+def effective_qos_policy_id(resource):
+    """Return the resource effective QoS policy
+
+    If the resource does not have any QoS policy reference, returns the
+    QoS policy inherited from the network (if exists).
+    :param resource: [dict] resource with QoS policies
+    :return: [str] resource QoS policy ID or network QoS policy ID
+    """
+    return (resource.get(qos_consts.QOS_POLICY_ID) or
+            resource.get(qos_consts.QOS_NETWORK_POLICY_ID))
+
+
+def sign_instance_id(conf, instance_id):
+    secret = conf.metadata_proxy_shared_secret
+    secret = encodeutils.to_utf8(secret)
+    instance_id = encodeutils.to_utf8(instance_id)
+    return hmac.new(secret, instance_id, hashlib.sha256).hexdigest()
+
+
+def parse_permitted_ethertypes(permitted_ethertypes):
+    ret = set()
+    for pe in permitted_ethertypes:
+        if pe[:2].lower() != '0x':
+            LOG.warning('Custom ethertype %s is not a hexadecimal number.', pe)
+            continue
+
+        try:
+            value = hex(int(pe, 16))
+            if value in ret:
+                LOG.warning('Custom ethertype %s is repeated', pe)
+            else:
+                ret.add(value)
+        except ValueError:
+            LOG.warning('Custom ethertype %s is not a hexadecimal number.', pe)
+            continue
+
+    return ret
+
+
+def ts_to_datetime(timestamp):
+    """Converts timestamp (in seconds) to datetime"""
+    return datetime.datetime.fromtimestamp(timestamp, tz=datetime.UTC)
+
+
+def datetime_to_ts(_datetime):
+    """Converts datetime to timestamp in seconds"""
+    return int(datetime.datetime.timestamp(_datetime))
+
+
+def stringmap(data: abc.Mapping[str, typing.Any],
+              default: str = '') -> dict[str, str]:
+    result = {}
+    for key, value in data.items():
+        result[key] = default if value is None else str(value)
+    return result
+
+
+class ThreadPoolExecutorWithBlock(futures.ThreadPoolExecutor):
+    """A thread pool executor with a submit blocking method
+
+    This class implements a method that allow to submit new workers but only if
+    there are available workers. If not, the method blocks indefinitely.
+    """
+
+    def __init__(self, max_workers=None, stopping_event=None, **kwargs):
+        super().__init__(max_workers=max_workers, **kwargs)
+        self._stopping_event = stopping_event or threading.Event()
+
+    def submit(self, fn, *args, **kwargs):
+        if self._stopping_event.is_set():
+            LOG.debug("ThreadPoolExecutor submit rejected due to stopping")
+            return None
+
+        while self._work_queue.qsize() > 0 and not self._shutdown:
+            if self._stopping_event.wait(timeout=0.1):
+                return None
+
+        if self._shutdown:
+            return
+
+        return super().submit(fn, *args, **kwargs)
+
+
+def is_iterable_not_string(value):
+    """Return if a value is iterable but not a string type"""
+    return (isinstance(value, abc.Iterable) and
+            not isinstance(value, bytes) and
+            not isinstance(value, bytearray) and
+            not isinstance(value, str))
+
+
+def find_unique_sequence(groups):
+    """Finds a unique sequence of choices from groups
+
+    Finds a sequence of choices from groups such that no value is
+    repeated in the selection.
+    """
+
+    def backtrack(group_index, current_path):
+        # Base Case: If we have made a choice for every group, we are done!
+        if group_index == len(groups):
+            return current_path
+
+        # Get the options for the current group
+        options = groups[group_index]
+
+        # Try every value in the current group
+        for value in options:
+
+            # --- CONSTRAINT CHECK ---
+            # "Never repeated": Check if value is already in our path.
+            # If you only wanted to check the IMMEDIATE neighbor,
+            # you would change this to: if not current_path or
+            # value != current_path[-1]
+            if value not in current_path:
+
+                # If valid, choose it and move to the next group (recurse)
+                result = backtrack(group_index + 1, current_path + [value])
+
+                # If the recursive call returned a valid result, propagate it
+                # up.
+                if result is not None:
+                    return result
+
+        # If we try all options and none work, return None (trigger
+        # backtracking).
+        return None
+
+    # Start the recursion at group index 0 with an empty path
+    return backtrack(0, [])

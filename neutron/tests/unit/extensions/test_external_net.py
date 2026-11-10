@@ -13,27 +13,39 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import mock
-from oslo_log import log as logging
+from unittest import mock
+
+from neutron_lib.api import attributes
+from neutron_lib.api.definitions import external_net as extnet_apidef
+from neutron_lib.api.definitions import subnet as subnet_apidef
+from neutron_lib.api.definitions import subnet_external_network as \
+    extsnet_apidef
+from neutron_lib import constants
+from neutron_lib import context
+from neutron_lib.plugins import constants as plugin_constants
+from neutron_lib.plugins import directory
 from oslo_utils import uuidutils
 import testtools
 from webob import exc
 
-from neutron import context
-from neutron.db import models_v2
-from neutron.extensions import external_net as external_net
-from neutron import manager
 from neutron.tests.unit.api.v2 import test_base
-from neutron.tests.unit.db import test_db_base_plugin_v2
 
 
-LOG = logging.getLogger(__name__)
+# Add subnet 'router:external' extension, without loading the extensions.
+# This change must be done before the policies are parsed in order to load the
+# 'convert_to' method before the ``FieldCheck`` instance for this field is
+# created.
+rname = subnet_apidef.COLLECTION_NAME
+attributes.RESOURCES[rname].update(
+    extsnet_apidef.RESOURCE_ATTRIBUTE_MAP[rname])
+from neutron.tests.common import test_db_base_plugin_v2  # noqa: E402
+
 
 _uuid = uuidutils.generate_uuid
 _get_path = test_base._get_path
 
 
-class ExtNetTestExtensionManager(object):
+class ExtNetTestExtensionManager:
 
     def get_resources(self):
         return []
@@ -53,35 +65,36 @@ class ExtNetDBTestCase(test_db_base_plugin_v2.NeutronDbPluginV2TestCase):
         # a double underscore
         new_args = dict(zip(map(lambda x: x.replace('__', ':'), kwargs),
                             kwargs.values()))
-        arg_list = new_args.pop('arg_list', ()) + (external_net.EXTERNAL,)
-        return super(ExtNetDBTestCase, self)._create_network(
+        arg_list = new_args.pop('arg_list', ()) + (extnet_apidef.EXTERNAL,)
+        return super()._create_network(
             fmt, name, admin_state_up, arg_list=arg_list, **new_args)
 
     def setUp(self):
         plugin = 'neutron.tests.unit.extensions.test_l3.TestNoL3NatPlugin'
         ext_mgr = ExtNetTestExtensionManager()
-        super(ExtNetDBTestCase, self).setUp(plugin=plugin, ext_mgr=ext_mgr)
+        super().setUp(plugin=plugin, ext_mgr=ext_mgr)
 
     def _set_net_external(self, net_id):
         self._update('networks', net_id,
-                     {'network': {external_net.EXTERNAL: True}})
+                     {'network': {extnet_apidef.EXTERNAL: True}},
+                     as_admin=True)
 
     def test_list_nets_external(self):
         with self.network() as n1:
             self._set_net_external(n1['network']['id'])
             with self.network():
                 body = self._list('networks')
-                self.assertEqual(len(body['networks']), 2)
+                self.assertEqual(2, len(body['networks']))
 
                 body = self._list('networks',
                                   query_params="%s=True" %
-                                               external_net.EXTERNAL)
-                self.assertEqual(len(body['networks']), 1)
+                                               extnet_apidef.EXTERNAL)
+                self.assertEqual(1, len(body['networks']))
 
                 body = self._list('networks',
                                   query_params="%s=False" %
-                                               external_net.EXTERNAL)
-                self.assertEqual(len(body['networks']), 1)
+                                               extnet_apidef.EXTERNAL)
+                self.assertEqual(1, len(body['networks']))
 
     def test_list_nets_external_pagination(self):
         if self._skip_native_pagination:
@@ -98,54 +111,55 @@ class ExtNetDBTestCase(test_db_base_plugin_v2.NeutronDbPluginV2TestCase):
                     query_params='router:external=False')
 
     def test_get_network_succeeds_without_filter(self):
-        plugin = manager.NeutronManager.get_plugin()
+        plugin = directory.get_plugin()
         ctx = context.Context(None, None, is_admin=True)
         result = plugin.get_networks(ctx, filters=None)
-        self.assertEqual(result, [])
+        self.assertEqual([], result)
 
     def test_update_network_set_external_non_admin_fails(self):
         # Assert that a non-admin user cannot update the
         # router:external attribute
-        with self.network(tenant_id='noadmin') as network:
+        with self.network(project_id='noadmin') as network:
             data = {'network': {'router:external': True}}
             req = self.new_update_request('networks',
                                           data,
-                                          network['network']['id'])
-            req.environ['neutron.context'] = context.Context('', 'noadmin')
+                                          network['network']['id'],
+                                          project_id='noadmin')
             res = req.get_response(self.api)
             self.assertEqual(exc.HTTPForbidden.code, res.status_int)
 
-    def test_network_filter_hook_admin_context(self):
-        plugin = manager.NeutronManager.get_plugin()
-        ctx = context.Context(None, None, is_admin=True)
-        model = models_v2.Network
-        conditions = plugin._network_filter_hook(ctx, model, [])
-        self.assertEqual(conditions, [])
-
-    def test_network_filter_hook_nonadmin_context(self):
-        plugin = manager.NeutronManager.get_plugin()
-        ctx = context.Context('edinson', 'cavani')
-        model = models_v2.Network
-        txt = "externalnetworks.network_id IS NOT NULL"
-        conditions = plugin._network_filter_hook(ctx, model, [])
-        self.assertEqual(conditions.__str__(), txt)
-        # Try to concatenate conditions
-        conditions = plugin._network_filter_hook(ctx, model, conditions)
-        self.assertEqual(conditions.__str__(), "%s OR %s" % (txt, txt))
+    def test_update_network_external_net_with_ports_set_not_shared(self):
+        with self.network(router__external=True, shared=True,
+                          as_admin=True) as ext_net,\
+                self.subnet(network=ext_net) as ext_subnet, \
+                self.port(subnet=ext_subnet,
+                          project_id='',
+                          device_owner=constants.DEVICE_OWNER_ROUTER_SNAT):
+            data = {'network': {'shared': False}}
+            req = self.new_update_request('networks',
+                                          data,
+                                          ext_net['network']['id'],
+                                          as_admin=True)
+            res = req.get_response(self.api)
+            self.assertEqual(exc.HTTPOk.code, res.status_int)
+            ctx = context.Context(None, None, is_admin=True)
+            plugin = directory.get_plugin()
+            result = plugin.get_networks(ctx)
+            self.assertFalse(result[0]['shared'])
 
     def test_create_port_external_network_non_admin_fails(self):
-        with self.network(router__external=True) as ext_net:
+        with self.network(as_admin=True, router__external=True) as ext_net:
             with self.subnet(network=ext_net) as ext_subnet:
                 with testtools.ExpectedException(
                         exc.HTTPClientError) as ctx_manager:
                     with self.port(subnet=ext_subnet,
-                                   set_context='True',
-                                   tenant_id='noadmin'):
+                                   is_admin=False,
+                                   project_id='noadmin'):
                         pass
-                    self.assertEqual(ctx_manager.exception.code, 403)
+                    self.assertEqual(403, ctx_manager.exception.code)
 
     def test_create_port_external_network_admin_succeeds(self):
-        with self.network(router__external=True) as ext_net:
+        with self.network(router__external=True, as_admin=True) as ext_net:
             with self.subnet(network=ext_net) as ext_subnet:
                 with self.port(subnet=ext_subnet) as port:
                     self.assertEqual(port['port']['network_id'],
@@ -154,24 +168,45 @@ class ExtNetDBTestCase(test_db_base_plugin_v2.NeutronDbPluginV2TestCase):
     def test_create_external_network_non_admin_fails(self):
         with testtools.ExpectedException(exc.HTTPClientError) as ctx_manager:
             with self.network(router__external=True,
-                              set_context='True',
-                              tenant_id='noadmin'):
+                              as_admin=False,
+                              project_id='noadmin'):
                 pass
-            self.assertEqual(ctx_manager.exception.code, 403)
+            self.assertEqual(403, ctx_manager.exception.code)
 
     def test_create_external_network_admin_succeeds(self):
-        with self.network(router__external=True) as ext_net:
-            self.assertEqual(ext_net['network'][external_net.EXTERNAL],
-                             True)
+        with self.network(router__external=True, as_admin=True) as ext_net:
+            self.assertTrue(ext_net['network'][extnet_apidef.EXTERNAL])
 
     def test_delete_network_check_disassociated_floatingips(self):
-        with mock.patch.object(manager.NeutronManager,
-                               'get_service_plugins') as srv_plugins:
-            l3_mock = mock.Mock()
-            srv_plugins.return_value = {'L3_ROUTER_NAT': l3_mock}
-            with self.network() as net:
-                req = self.new_delete_request('networks', net['network']['id'])
-                res = req.get_response(self.api)
-                self.assertEqual(res.status_int, exc.HTTPNoContent.code)
-                (l3_mock.delete_disassociated_floatingips
-                 .assert_called_once_with(mock.ANY, net['network']['id']))
+        l3_mock = mock.Mock()
+        directory.add_plugin(plugin_constants.L3, l3_mock)
+        with self.network() as net:
+            req = self.new_delete_request('networks', net['network']['id'])
+            res = req.get_response(self.api)
+            self.assertEqual(exc.HTTPNoContent.code, res.status_int)
+            (l3_mock.delete_disassociated_floatingips
+             .assert_called_once_with(mock.ANY, net['network']['id']))
+
+    def test_create_shared_networks_and_subnets(self):
+        with (self.network(as_admin=True, router__external=True) as net_ext,
+                self.network(as_admin=True, shared=True) as net_shared,
+                self.network(as_admin=True) as net_admin):
+            with (self.subnet(as_admin=True, network=net_ext)
+                  as snet_ext, self.subnet(as_admin=True, network=net_shared)
+                  as snet_shared, self.subnet(as_admin=True, network=net_admin)
+                  as snet_admin):
+                req = self.new_list_request('networks', as_admin=False,
+                                            project_id='noadmin')
+                res = self.deserialize(self.fmt, req.get_response(self.api))
+                net_ids = {net['id'] for net in res['networks']}
+                self.assertIn(net_ext['network']['id'], net_ids)
+                self.assertIn(net_shared['network']['id'], net_ids)
+                self.assertNotIn(net_admin['network']['id'], net_ids)
+
+                req = self.new_list_request('subnets', as_admin=False,
+                                            project_id='noadmin')
+                res = self.deserialize(self.fmt, req.get_response(self.api))
+                snet_ids = {snet['id'] for snet in res['subnets']}
+                self.assertIn(snet_ext['subnet']['id'], snet_ids)
+                self.assertIn(snet_shared['subnet']['id'], snet_ids)
+                self.assertNotIn(snet_admin['subnet']['id'], snet_ids)

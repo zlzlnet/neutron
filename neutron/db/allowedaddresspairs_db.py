@@ -12,84 +12,166 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 #
+import collections
 
-import sqlalchemy as sa
-from sqlalchemy import orm
+from neutron_lib.api.definitions import allowedaddresspairs as addr_apidef
+from neutron_lib.api.definitions import port as port_def
+from neutron_lib.api import validators
+from neutron_lib.callbacks import events
+from neutron_lib.callbacks import registry
+from neutron_lib.callbacks import resources
+from neutron_lib.db import api as db_api
+from neutron_lib.db import model_query
+from neutron_lib.db import resource_extend
+from neutron_lib.db import utils as db_utils
+from neutron_lib.exceptions import allowedaddresspairs as addr_exc
+from neutron_lib.objects import exceptions
+from neutron_lib.utils import net as net_utils
 
-from neutron.api.v2 import attributes as attr
-from neutron.db import db_base_plugin_v2
-from neutron.db import model_base
+from neutron.db.models import allowed_address_pair as aap
 from neutron.db import models_v2
-from neutron.extensions import allowedaddresspairs as addr_pair
+from neutron.objects import base as obj_base
+from neutron.objects.port.extensions import (allowedaddresspairs
+                                             as obj_addr_pair)
 
 
-class AllowedAddressPair(model_base.BASEV2):
-    port_id = sa.Column(sa.String(36),
-                        sa.ForeignKey('ports.id', ondelete="CASCADE"),
-                        primary_key=True)
-    mac_address = sa.Column(sa.String(32), nullable=False, primary_key=True)
-    ip_address = sa.Column(sa.String(64), nullable=False, primary_key=True)
+def _port_allowed_address_pairs_filter_hook(query, filters):
+    """Filter ports by allowed address pairs criteria."""
 
-    port = orm.relationship(
-        models_v2.Port,
-        backref=orm.backref("allowed_address_pairs",
-                            lazy="joined", cascade="delete"))
+    allowed_pairs_filter = filters and filters.get('allowed_address_pairs')
+    if not allowed_pairs_filter:
+        return query
+
+    filters = collections.defaultdict(set)
+    for field in ("ip_address", "mac_address"):
+        try:
+            # format: {"ip_address": [xxx,]} e.g. produced by get_ports()
+            filters[field] = allowed_pairs_filter.get(field)
+        except AttributeError:
+            # format: [{"ip_address": [xxx,]} e.g. produced by get_objects()
+            for f in allowed_pairs_filter:
+                val = f.get(field, [])
+                if isinstance(val, str):
+                    val = [val]
+                if val:
+                    filters[field] = filters[field].union(set(val))
+
+        if isinstance(filters[field], str):
+            filters[field] = set([filters[field]])
+
+        if filters[field]:
+            col = getattr(aap.AllowedAddressPair, field)
+            query = query.filter(
+                models_v2.Port.allowed_address_pairs.any(
+                    col.in_(filters[field])))
+
+    return query
 
 
-class AllowedAddressPairsMixin(object):
+@resource_extend.has_resource_extenders
+class AllowedAddressPairsMixin:
     """Mixin class for allowed address pairs."""
+
+    def __new__(cls, *args, **kwargs):
+        # Register the filter name for OVO validation
+        obj_base.register_filter_hook_on_model(models_v2.Port,
+                                               'allowed_address_pairs')
+
+        # Register the database query hook
+        model_query.register_hook(
+            models_v2.Port,
+            "allowed_address_pairs",
+            query_hook=None,
+            filter_hook=None,
+            result_filters=_port_allowed_address_pairs_filter_hook)
+
+        return super().__new__(cls)
 
     def _process_create_allowed_address_pairs(self, context, port,
                                               allowed_address_pairs):
-        if not attr.is_attr_set(allowed_address_pairs):
+        if not validators.is_attr_set(allowed_address_pairs):
             return []
-        with context.session.begin(subtransactions=True):
-            for address_pair in allowed_address_pairs:
-                # use port.mac_address if no mac address in address pair
-                if 'mac_address' not in address_pair:
-                    address_pair['mac_address'] = port['mac_address']
-                db_pair = AllowedAddressPair(
-                    port_id=port['id'],
-                    mac_address=address_pair['mac_address'],
-                    ip_address=address_pair['ip_address'])
-                context.session.add(db_pair)
+
+        desired_state = {
+            'context': context,
+            'network_id': port['network_id'],
+            'allowed_address_pairs': allowed_address_pairs,
+        }
+        registry.publish(
+            resources.ALLOWED_ADDRESS_PAIR, events.BEFORE_CREATE, self,
+            payload=events.DBEventPayload(
+                context,
+                resource_id=port['id'],
+                desired_state=desired_state))
+        try:
+            with db_api.CONTEXT_WRITER.using(context):
+                for address_pair in allowed_address_pairs:
+                    # use port.mac_address if no mac address in address pair
+                    if 'mac_address' not in address_pair:
+                        address_pair['mac_address'] = port['mac_address']
+                    # retain string format as passed through API
+                    mac_address = net_utils.AuthenticEUI(
+                        address_pair['mac_address'])
+                    ip_address = net_utils.AuthenticIPNetwork(
+                        address_pair['ip_address'])
+                    pair_obj = obj_addr_pair.AllowedAddressPair(
+                        context,
+                        port_id=port['id'],
+                        mac_address=mac_address,
+                        ip_address=ip_address)
+                    pair_obj.create()
+        except exceptions.NeutronDbObjectDuplicateEntry:
+            raise addr_exc.DuplicateAddressPairInRequest(
+                mac_address=address_pair['mac_address'],
+                ip_address=address_pair['ip_address'])
 
         return allowed_address_pairs
 
     def get_allowed_address_pairs(self, context, port_id):
-        pairs = (context.session.query(AllowedAddressPair).
-                 filter_by(port_id=port_id))
-        return [self._make_allowed_address_pairs_dict(pair)
+        pairs = obj_addr_pair.AllowedAddressPair.get_objects(
+            context, port_id=port_id)
+        return [self._make_allowed_address_pairs_dict(pair.db_obj)
                 for pair in pairs]
 
-    def _extend_port_dict_allowed_address_pairs(self, port_res, port_db):
+    def get_allowed_address_pairs_for_ports(self, context, port_ids):
+        pairs = (
+            obj_addr_pair.AllowedAddressPair.
+            get_allowed_address_pairs_for_ports(
+                context, port_ids=port_ids))
+        result = collections.defaultdict(list)
+        for pair in pairs:
+            result[pair.port_id].append(
+                self._make_allowed_address_pairs_dict(pair.db_obj))
+        return result
+
+    @staticmethod
+    @resource_extend.extends([port_def.COLLECTION_NAME])
+    def _extend_port_dict_allowed_address_pairs(port_res, port_db):
         # If port_db is provided, allowed address pairs will be accessed via
         # sqlalchemy models. As they're loaded together with ports this
         # will not cause an extra query.
         allowed_address_pairs = [
-            self._make_allowed_address_pairs_dict(address_pair) for
+            AllowedAddressPairsMixin._make_allowed_address_pairs_dict(
+                address_pair) for
             address_pair in port_db.allowed_address_pairs]
-        port_res[addr_pair.ADDRESS_PAIRS] = allowed_address_pairs
+        port_res[addr_apidef.ADDRESS_PAIRS] = allowed_address_pairs
         return port_res
 
-    # Register dict extend functions for ports
-    db_base_plugin_v2.NeutronDbPluginV2.register_dict_extend_funcs(
-        attr.PORTS, ['_extend_port_dict_allowed_address_pairs'])
-
     def _delete_allowed_address_pairs(self, context, id):
-        query = self._model_query(context, AllowedAddressPair)
-        with context.session.begin(subtransactions=True):
-            query.filter(AllowedAddressPair.port_id == id).delete()
+        obj_addr_pair.AllowedAddressPair.delete_objects(
+            context, port_id=id)
 
-    def _make_allowed_address_pairs_dict(self, allowed_address_pairs,
+    @staticmethod
+    def _make_allowed_address_pairs_dict(allowed_address_pairs,
                                          fields=None):
         res = {'mac_address': allowed_address_pairs['mac_address'],
                'ip_address': allowed_address_pairs['ip_address']}
-        return self._fields(res, fields)
+        return db_utils.resource_fields(res, fields)
 
     def _has_address_pairs(self, port):
-        return (attr.is_attr_set(port['port'][addr_pair.ADDRESS_PAIRS])
-                and port['port'][addr_pair.ADDRESS_PAIRS] != [])
+        return (validators.is_attr_set(
+            port['port'][addr_apidef.ADDRESS_PAIRS]) and
+                port['port'][addr_apidef.ADDRESS_PAIRS] != [])
 
     def _check_update_has_allowed_address_pairs(self, port):
         """Determine if request has an allowed address pair.
@@ -97,16 +179,16 @@ class AllowedAddressPairsMixin(object):
         Return True if the port parameter has a non-empty
         'allowed_address_pairs' attribute. Otherwise returns False.
         """
-        return (addr_pair.ADDRESS_PAIRS in port['port'] and
+        return (addr_apidef.ADDRESS_PAIRS in port['port'] and
                 self._has_address_pairs(port))
 
     def _check_update_deletes_allowed_address_pairs(self, port):
         """Determine if request deletes address pair.
 
-        Return True if port has as a allowed address pair and its value
+        Return True if port has an allowed address pair and its value
         is either [] or not is_attr_set, otherwise return False
         """
-        return (addr_pair.ADDRESS_PAIRS in port['port'] and
+        return (addr_apidef.ADDRESS_PAIRS in port['port'] and
                 not self._has_address_pairs(port))
 
     def is_address_pairs_attribute_updated(self, port, update_attrs):
@@ -117,10 +199,10 @@ class AllowedAddressPairsMixin(object):
         party controllers.
         """
 
-        new_pairs = update_attrs.get(addr_pair.ADDRESS_PAIRS)
+        new_pairs = update_attrs.get(addr_apidef.ADDRESS_PAIRS)
         if new_pairs is None:
             return False
-        old_pairs = port.get(addr_pair.ADDRESS_PAIRS)
+        old_pairs = port.get(addr_apidef.ADDRESS_PAIRS)
 
         # Missing or unchanged address pairs in attributes mean no update
         return new_pairs != old_pairs
@@ -134,11 +216,11 @@ class AllowedAddressPairsMixin(object):
         notification. This method is expected to be called within
         a transaction.
         """
-        new_pairs = port['port'].get(addr_pair.ADDRESS_PAIRS)
+        new_pairs = port['port'].get(addr_apidef.ADDRESS_PAIRS)
 
         if self.is_address_pairs_attribute_updated(original_port,
                                                    port['port']):
-            updated_port[addr_pair.ADDRESS_PAIRS] = new_pairs
+            updated_port[addr_apidef.ADDRESS_PAIRS] = new_pairs
             self._delete_allowed_address_pairs(context, port_id)
             self._process_create_allowed_address_pairs(
                 context, updated_port, new_pairs)

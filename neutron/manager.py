@@ -13,20 +13,23 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import weakref
+from collections import defaultdict
+import inspect
 
+from neutron_lib.plugins import constants as lib_const
+from neutron_lib.plugins import directory
+from neutron_lib.services import base as service_base
+from neutron_lib.utils import runtime
 from oslo_config import cfg
 from oslo_log import log as logging
 import oslo_messaging
-from oslo_utils import importutils
-import six
+from oslo_service import periodic_task
+from oslo_utils import excutils
+from osprofiler import profiler
 
+from neutron._i18n import _
 from neutron.common import utils
-from neutron.i18n import _LE, _LI
-from neutron.openstack.common import periodic_task
 from neutron.plugins.common import constants
-
-from stevedore import driver
 
 
 LOG = logging.getLogger(__name__)
@@ -34,7 +37,13 @@ LOG = logging.getLogger(__name__)
 CORE_PLUGINS_NAMESPACE = 'neutron.core_plugins'
 
 
-class Manager(periodic_task.PeriodicTasks):
+class ManagerMeta(profiler.TracedMeta,
+                  type(periodic_task.PeriodicTasks)):  # type:ignore[misc]
+    pass
+
+
+class Manager(periodic_task.PeriodicTasks, metaclass=ManagerMeta):
+    __trace_args__ = {"name": "rpc"}
 
     # Set RPC API version to 1.0 by default.
     target = oslo_messaging.Target(version='1.0')
@@ -43,7 +52,8 @@ class Manager(periodic_task.PeriodicTasks):
         if not host:
             host = cfg.CONF.host
         self.host = host
-        super(Manager, self).__init__()
+        conf = getattr(self, "conf", cfg.CONF)
+        super().__init__(conf)
 
     def periodic_tasks(self, context, raise_on_error=False):
         self.run_periodic_tasks(context, raise_on_error=raise_on_error)
@@ -54,27 +64,18 @@ class Manager(periodic_task.PeriodicTasks):
         Child classes should override this method.
 
         """
-        pass
 
     def after_start(self):
         """Handler post initialization stuff.
 
         Child classes can override this method.
         """
-        pass
 
+    def stop(self):
+        """Handle stop.
 
-def validate_post_plugin_load():
-    """Checks if the configuration variables are valid.
-
-    If the configuration is invalid then the method will return an error
-    message. If all is OK then it will return None.
-    """
-    if ('dhcp_agents_per_network' in cfg.CONF and
-        cfg.CONF.dhcp_agents_per_network <= 0):
-        msg = _("dhcp_agents_per_network must be >= 1. '%s' "
-                "is invalid.") % cfg.CONF.dhcp_agents_per_network
-        return msg
+        Child classes can override this method.
+        """
 
 
 def validate_pre_plugin_load():
@@ -88,17 +89,24 @@ def validate_pre_plugin_load():
         return msg
 
 
-class NeutronManager(object):
+class NeutronManager(metaclass=profiler.TracedMeta):
     """Neutron's Manager class.
 
     Neutron's Manager class is responsible for parsing a config file and
     instantiating the correct plugin that concretely implements
     neutron_plugin_base class.
-    The caller should make sure that NeutronManager is a singleton.
     """
+    # TODO(armax): use of the singleton pattern for this class is vestigial,
+    # and it is mainly relied on by the unit tests. It is safer to get rid
+    # of it once the entire codebase (neutron + subprojects) has switched
+    # entirely to using the plugins directory.
     _instance = None
+    __trace_args__ = {"name": "rpc"}
 
     def __init__(self, options=None, config_file=None):
+        # Store instances of already loaded plugins to avoid instantiate same
+        # plugin more than once
+        self._loaded_plugins = {}
         # If no options have been provided, create an empty dict
         if not options:
             options = {}
@@ -106,63 +114,72 @@ class NeutronManager(object):
         msg = validate_pre_plugin_load()
         if msg:
             LOG.critical(msg)
-            raise Exception(msg)
+            raise RuntimeError(msg)
 
         # NOTE(jkoelker) Testing for the subclass with the __subclasshook__
         #                breaks tach monitoring. It has been removed
         #                intentionally to allow v2 plugins to be monitored
         #                for performance metrics.
         plugin_provider = cfg.CONF.core_plugin
-        LOG.info(_LI("Loading core plugin: %s"), plugin_provider)
-        self.plugin = self._get_plugin_instance(CORE_PLUGINS_NAMESPACE,
-                                                plugin_provider)
-        msg = validate_post_plugin_load()
-        if msg:
-            LOG.critical(msg)
-            raise Exception(msg)
-
-        # core plugin as a part of plugin collection simplifies
-        # checking extensions
-        # TODO(enikanorov): make core plugin the same as
-        # the rest of service plugins
-        self.service_plugins = {constants.CORE: self.plugin}
+        LOG.info("Loading core plugin: %s", plugin_provider)
+        # NOTE(armax): keep hold of the actual plugin object
+        plugin = self._get_plugin_instance(CORE_PLUGINS_NAMESPACE,
+                                           plugin_provider)
+        directory.add_plugin(lib_const.CORE, plugin)
+        # load services from the core plugin first
+        self._load_services_from_core_plugin(plugin)
         self._load_service_plugins()
+        # Used by pecan WSGI
+        self.resource_plugin_mappings = {}
+        self.resource_controller_mappings = {}
+        self.path_prefix_resource_mappings = defaultdict(list)
 
     @staticmethod
     def load_class_for_provider(namespace, plugin_provider):
-        if not plugin_provider:
-            LOG.exception(_LE("Error, plugin is not set"))
-            raise ImportError(_("Plugin not found."))
+        """Loads plugin using alias or class name
+
+        :param namespace: namespace where alias is defined
+        :param plugin_provider: plugin alias or class name
+        :returns: plugin that is loaded
+        :raises ImportError: if fails to load plugin
+        """
+
         try:
-            # Try to resolve plugin by name
-            mgr = driver.DriverManager(namespace, plugin_provider)
-            plugin_class = mgr.driver
-        except RuntimeError as e1:
-            # fallback to class name
-            try:
-                plugin_class = importutils.import_class(plugin_provider)
-            except ImportError as e2:
-                LOG.exception(_LE("Error loading plugin by name, %s"), e1)
-                LOG.exception(_LE("Error loading plugin by class, %s"), e2)
-                raise ImportError(_("Plugin not found."))
-        return plugin_class
+            return runtime.load_class_by_alias_or_classname(namespace,
+                                                            plugin_provider)
+        except ImportError:
+            with excutils.save_and_reraise_exception():
+                LOG.error("Plugin '%s' not found.", plugin_provider)
+
+    def _get_plugin_class(self, namespace, plugin_provider):
+        return self.load_class_for_provider(namespace, plugin_provider)
 
     def _get_plugin_instance(self, namespace, plugin_provider):
-        plugin_class = self.load_class_for_provider(namespace, plugin_provider)
-        return plugin_class()
+        plugin_class = self._get_plugin_class(namespace, plugin_provider)
+        plugin_inst = self._loaded_plugins.get(plugin_class)
+        if not plugin_inst:
+            plugin_inst = plugin_class()
+            self._loaded_plugins[plugin_class] = plugin_inst
+        return plugin_inst
 
-    def _load_services_from_core_plugin(self):
+    def _load_services_from_core_plugin(self, plugin):
         """Puts core plugin in service_plugins for supported services."""
         LOG.debug("Loading services supported by the core plugin")
 
         # supported service types are derived from supported extensions
-        for ext_alias in getattr(self.plugin,
-                                 "supported_extension_aliases", []):
+        for ext_alias in getattr(plugin, "supported_extension_aliases", []):
             if ext_alias in constants.EXT_TO_SERVICE_MAPPING:
                 service_type = constants.EXT_TO_SERVICE_MAPPING[ext_alias]
-                self.service_plugins[service_type] = self.plugin
-                LOG.info(_LI("Service %s is supported by the core plugin"),
+                directory.add_plugin(service_type, plugin)
+                LOG.info("Service %s is supported by the core plugin",
                          service_type)
+
+    def _get_default_service_plugins(self):
+        """Get default service plugins to be loaded."""
+        core_plugin = directory.get_plugin()
+        if core_plugin.has_native_datastore():
+            return constants.DEFAULT_SERVICE_PLUGINS.keys()
+        return []
 
     def _load_service_plugins(self):
         """Loads service plugins.
@@ -170,42 +187,60 @@ class NeutronManager(object):
         Starts from the core plugin and checks if it supports
         advanced services then loads classes provided in configuration.
         """
-        # load services from the core plugin first
-        self._load_services_from_core_plugin()
-
         plugin_providers = cfg.CONF.service_plugins
+        plugin_providers.extend(self._get_default_service_plugins())
         LOG.debug("Loading service plugins: %s", plugin_providers)
         for provider in plugin_providers:
             if provider == '':
                 continue
 
-            LOG.info(_LI("Loading Plugin: %s"), provider)
-            plugin_inst = self._get_plugin_instance('neutron.service_plugins',
-                                                    provider)
+            LOG.info("Loading Plugin: %s", provider)
+            plugin_class = self._get_plugin_class(
+                'neutron.service_plugins', provider)
+            if (inspect.isclass(plugin_class) and
+                    not issubclass(plugin_class,
+                                   service_base.ServicePluginBase)):
+                klass = plugin_class.__class__
+                LOG.warning(
+                    'Plugin %s is not a subclass of ``ServicePluginBase``, '
+                    'please report a bug in Launchpad '
+                    'https://bugs.launchpad.net/neutron.',
+                    klass.__module__ + '.' + klass.__name__)
+            required_plugins = getattr(
+                plugin_class, "required_service_plugins", [])
+            for req_plugin in required_plugins:
+                LOG.info("Loading service plugin %s, it is required by %s",
+                         req_plugin, provider)
+                self._create_and_add_service_plugin(req_plugin)
+            # NOTE(liuyulong): adding one plugin multiple times does not have
+            # bad effect for it. Since all the plugin has its own specific
+            # unique name.
+            self._create_and_add_service_plugin(provider)
 
-            # only one implementation of svc_type allowed
-            # specifying more than one plugin
-            # for the same type is a fatal exception
-            if plugin_inst.get_plugin_type() in self.service_plugins:
-                raise ValueError(_("Multiple plugins for service "
-                                   "%s were configured") %
-                                 plugin_inst.get_plugin_type())
+    def _create_and_add_service_plugin(self, provider):
+        plugin_inst = self._get_plugin_instance('neutron.service_plugins',
+                                                provider)
+        plugin_type = plugin_inst.get_plugin_type()
+        directory.add_plugin(plugin_type, plugin_inst)
 
-            self.service_plugins[plugin_inst.get_plugin_type()] = plugin_inst
+        # search for possible agent notifiers declared in service plugin
+        # (needed by agent management extension)
+        plugin = directory.get_plugin()
+        if (hasattr(plugin, 'agent_notifiers') and
+                hasattr(plugin_inst, 'agent_notifiers')):
+            plugin.agent_notifiers = {
+                **plugin.agent_notifiers, **plugin_inst.agent_notifiers}
 
-            # search for possible agent notifiers declared in service plugin
-            # (needed by agent management extension)
-            if (hasattr(self.plugin, 'agent_notifiers') and
-                    hasattr(plugin_inst, 'agent_notifiers')):
-                self.plugin.agent_notifiers.update(plugin_inst.agent_notifiers)
+        # disable incompatible extensions in core plugin if any
+        utils.disable_extension_by_service_plugin(plugin, plugin_inst)
 
-            LOG.debug("Successfully loaded %(type)s plugin. "
-                      "Description: %(desc)s",
-                      {"type": plugin_inst.get_plugin_type(),
-                       "desc": plugin_inst.get_plugin_description()})
+        LOG.debug("Successfully loaded %(type)s plugin. "
+                  "Description: %(desc)s",
+                  {"type": plugin_type,
+                   "desc": plugin_inst.get_plugin_description()})
 
     @classmethod
-    @utils.synchronized("manager")
+    @runtime.synchronized("manager")
     def _create_instance(cls):
         if not cls.has_instance():
             cls._instance = cls()
@@ -226,13 +261,39 @@ class NeutronManager(object):
         return cls._instance
 
     @classmethod
-    def get_plugin(cls):
-        # Return a weakref to minimize gc-preventing references.
-        return weakref.proxy(cls.get_instance().plugin)
+    def set_plugin_for_resource(cls, resource, plugin):
+        cls.get_instance().resource_plugin_mappings[resource] = plugin
 
     @classmethod
-    def get_service_plugins(cls):
-        # Return weakrefs to minimize gc-preventing references.
-        service_plugins = cls.get_instance().service_plugins
-        return dict((x, weakref.proxy(y))
-                    for x, y in six.iteritems(service_plugins))
+    def get_plugin_for_resource(cls, resource):
+        return cls.get_instance().resource_plugin_mappings.get(resource)
+
+    @classmethod
+    def set_controller_for_resource(cls, resource, controller):
+        cls.get_instance().resource_controller_mappings[resource] = controller
+
+    @classmethod
+    def get_controller_for_resource(cls, resource):
+        resource = resource.replace('_', '-')
+        res_ctrl_mappings = cls.get_instance().resource_controller_mappings
+        # If no controller is found for resource, try replacing dashes with
+        # underscores
+        return res_ctrl_mappings.get(
+            resource,
+            res_ctrl_mappings.get(resource.replace('-', '_')))
+
+    @classmethod
+    def add_resource_for_path_prefix(cls, resource, path_prefix):
+        resources = cls.get_instance().path_prefix_resource_mappings[
+            path_prefix].append(resource)
+        return resources
+
+    @classmethod
+    def get_resources_for_path_prefix(cls, path_prefix):
+        return cls.get_instance().path_prefix_resource_mappings[path_prefix]
+
+
+def init():
+    """Call to load the plugins (core+services) machinery."""
+    if not directory.is_loaded():
+        NeutronManager.get_instance()

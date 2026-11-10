@@ -1,0 +1,117 @@
+hostname {{ ansible_hostname }}
+log file /var/log/frr/frr.log debugging
+service integrated-vtysh-config
+line vty
+frr version 7.0
+
+debug bfd peer
+debug bfd network
+debug bfd zebra
+
+debug bgp graceful-restart
+debug bgp neighbor-events
+debug bgp updates
+debug bgp update-groups
+
+router bgp {{ bgp_as }}
+{% if bgp_router_id %}
+  bgp router-id {{ bgp_router_id }}
+{% endif %}
+  bgp log-neighbor-changes
+  bgp graceful-shutdown
+
+  bgp graceful-restart
+  bgp graceful-restart notification
+  bgp graceful-restart restart-time 60
+  bgp graceful-restart preserve-fw-state
+  ! bgp long-lived-graceful-restart stale-time 15
+
+  neighbor downlink peer-group
+  neighbor downlink remote-as {{ downlink_remote_as }}
+  neighbor downlink bfd
+  neighbor downlink bfd profile {{ bfd_profile_name }}
+{% if bgp_password %}
+  neighbor downlink password {{ bgp_password }}
+{% endif %}
+  ! neighbor downlink capability extended-nexthop
+{% for iface in downlink_interfaces %}
+  neighbor {{ iface }} interface peer-group downlink
+{% endfor %}
+
+{% if uplink_interfaces %}
+  neighbor uplink peer-group
+  neighbor uplink remote-as {{ uplink_remote_as }}
+  neighbor uplink bfd
+  neighbor uplink bfd profile {{ bfd_profile_name }}
+  ! neighbor uplink capability extended-nexthop
+{% for iface in uplink_interfaces %}
+  neighbor {{ iface }} interface peer-group uplink
+{% endfor %}
+{% endif %}
+
+{% if 'ipv4 unicast' in bgp_address_families %}
+  address-family ipv4 unicast
+    redistribute connected
+    neighbor downlink route-reflector-client
+    neighbor downlink next-hop-self
+    neighbor downlink default-originate
+    neighbor downlink prefix-list downlink-out out
+    neighbor downlink prefix-list downlink-in in
+{% if uplink_interfaces %}
+    neighbor uplink allowas-in origin
+    neighbor uplink prefix-list uplink-in in
+{% endif %}
+  exit-address-family
+{% endif %}
+
+{% if 'ipv6 unicast' in bgp_address_families %}
+  address-family ipv6 unicast
+    redistribute connected
+    neighbor downlink activate
+    neighbor downlink route-reflector-client
+    neighbor downlink next-hop-self
+    neighbor downlink default-originate
+{% if uplink_interfaces %}
+    neighbor uplink activate
+    neighbor uplink allowas-in origin
+    neighbor uplink prefix-list only-host-prefixes in
+{% endif %}
+  exit-address-family
+{% endif %}
+
+{% if 'l2vpn evpn' in bgp_address_families %}
+  address-family l2vpn evpn
+    neighbor downlink activate
+    neighbor downlink route-reflector-client
+{% if uplink_interfaces %}
+    neighbor uplink activate
+{% endif %}
+    advertise-all-vni
+    advertise-svi-ip
+  exit-address-family
+{% endif %}
+
+{% set seq = namespace(n=5) %}
+{% for compute in groups['compute'] %}
+ip prefix-list downlink-in seq {{ seq.n }} deny {{ hostvars[compute].vxlan_local_ip | trim }}/32
+{% set seq.n = seq.n + 5 %}
+{% endfor %}
+ip prefix-list downlink-in seq 1000 permit 0.0.0.0/0 le 32
+
+ip prefix-list downlink-out seq 5 deny {{ vxlan_local_ip | trim }}/32
+ip prefix-list downlink-out seq 1000 permit 0.0.0.0/0 ge 32
+
+ip prefix-list uplink-in seq 5 deny {{ hostvars['spine'].vxlan_local_ip | trim }}/32
+ip prefix-list uplink-in seq 1000 permit 0.0.0.0/0 ge 32
+
+ip prefix-list only-host-prefixes permit 0.0.0.0/0 ge 32
+
+ipv6 prefix-list only-host-prefixes permit ::/0 ge 128
+
+ip nht resolve-via-default
+
+bfd
+  profile {{ bfd_profile_name }}
+    detect-multiplier {{ bfd_detect_multiplier }}
+    transmit-interval {{ bfd_interval }}
+    receive-interval {{ bfd_interval }}

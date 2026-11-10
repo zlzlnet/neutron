@@ -12,195 +12,71 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from six.moves import queue as Queue
-import time
-
+from neutron_lib.plugins.ml2 import ovs_constants
 from oslo_config import cfg
-from oslo_log import log as logging
-from oslo_utils import excutils
-from ovs.db import idl
+from ovsdbapp.backend.ovs_idl import command
+from ovsdbapp.backend.ovs_idl import connection
+from ovsdbapp.backend.ovs_idl import idlutils
+from ovsdbapp.backend.ovs_idl import vlog
+from ovsdbapp.schema.open_vswitch import impl_idl
 
-from neutron.agent.ovsdb import api
-from neutron.agent.ovsdb.native import commands as cmd
-from neutron.agent.ovsdb.native import connection
-from neutron.agent.ovsdb.native import helpers
-from neutron.agent.ovsdb.native import idlutils
-from neutron.i18n import _LE
-
-
-OPTS = [
-    cfg.StrOpt('ovsdb_connection',
-               default='tcp:127.0.0.1:6640',
-               help=_('The connection string for the native OVSDB backend')),
-]
-cfg.CONF.register_opts(OPTS, 'OVS')
-# TODO(twilson) DEFAULT.ovs_vsctl_timeout should be OVS.vsctl_timeout
-cfg.CONF.import_opt('ovs_vsctl_timeout', 'neutron.agent.common.ovs_lib')
-
-LOG = logging.getLogger(__name__)
+from neutron.agent.ovsdb.native import connection as n_connection
+from neutron.common import utils
+from neutron.conf.agent import ovs_conf
 
 
-class Transaction(api.Transaction):
-    def __init__(self, api, ovsdb_connection, timeout,
-                 check_error=False, log_errors=False):
-        self.api = api
-        self.check_error = check_error
-        self.log_errors = log_errors
-        self.commands = []
-        self.results = Queue.Queue(1)
-        self.ovsdb_connection = ovsdb_connection
-        self.timeout = timeout
+ovs_conf.register_ovs_agent_opts()
+_connection = None
+_idl_monitor = None
 
-    def add(self, command):
-        """Add a command to the transaction
 
-        returns The command passed as a convenience
-        """
+def api_factory():
+    global _connection
+    global _idl_monitor
+    if _connection is None:
+        _idl_monitor = n_connection.OvsIdlMonitor()
+        _connection = connection.Connection(
+            idl=_idl_monitor,
+            timeout=cfg.CONF.OVS.ovsdb_timeout)
+    return NeutronOvsdbIdl(_connection, _idl_monitor)
 
-        self.commands.append(command)
-        return command
 
-    def commit(self):
-        self.ovsdb_connection.queue_txn(self)
-        result = self.results.get()
-        if self.check_error:
-            if isinstance(result, idlutils.ExceptionResult):
-                if self.log_errors:
-                    LOG.error(result.tb)
-                raise result.ex
-        return result
+class OvsCleanup(command.BaseCommand):
+    def __init__(self, api, bridge, all_ports=False):
+        super().__init__(api)
+        self.bridge = bridge
+        self.all_ports = all_ports
 
-    def do_commit(self):
-        start_time = time.time()
-        attempts = 0
-        while True:
-            elapsed_time = time.time() - start_time
-            if attempts > 0 and elapsed_time > self.timeout:
-                raise RuntimeError("OVS transaction timed out")
-            attempts += 1
-            # TODO(twilson) Make sure we don't loop longer than vsctl_timeout
-            txn = idl.Transaction(self.api.idl)
-            for i, command in enumerate(self.commands):
-                LOG.debug("Running txn command(idx=%(idx)s): %(cmd)s",
-                          {'idx': i, 'cmd': command})
-                try:
-                    command.run_idl(txn)
-                except Exception:
-                    with excutils.save_and_reraise_exception() as ctx:
-                        txn.abort()
-                        if not self.check_error:
-                            ctx.reraise = False
-            seqno = self.api.idl.change_seqno
-            status = txn.commit_block()
-            if status == txn.TRY_AGAIN:
-                LOG.debug("OVSDB transaction returned TRY_AGAIN, retrying")
-                idlutils.wait_for_change(
-                    self.api.idl, self.timeout - elapsed_time,
-                    seqno)
+    def run_idl(self, txn):
+        br = idlutils.row_by_value(self.api.idl, 'Bridge', 'name', self.bridge)
+        for port in br.ports:
+            if not any(self.is_deletable_port(iface)
+                       for iface in port.interfaces):
                 continue
-            elif status == txn.ERROR:
-                msg = _LE("OVSDB Error: %s") % txn.get_error()
-                if self.log_errors:
-                    LOG.error(msg)
-                if self.check_error:
-                    # For now, raise similar error to vsctl/utils.execute()
-                    raise RuntimeError(msg)
-                return
-            elif status == txn.ABORTED:
-                LOG.debug("Transaction aborted")
-                return
-            elif status == txn.UNCHANGED:
-                LOG.debug("Transaction caused no change")
+            br.delvalue('ports', port)
+            for iface in port.interfaces:
+                iface.delete()
+            port.delete()
 
-            return [cmd.result for cmd in self.commands]
+    def is_deletable_port(self, port):
+        # Deletable defined as "looks like vif port and not set to skip delete"
+        if self.all_ports:
+            return True
+        if ovs_constants.SKIP_CLEANUP in port.external_ids:
+            return False
+        if not all(field in port.external_ids
+                   for field in ('iface-id', 'attached-mac')):
+            return False
+        return True
 
 
-class OvsdbIdl(api.API):
+@utils.SingletonDecorator
+class NeutronOvsdbIdl(impl_idl.OvsdbIdl):
+    def __init__(self, connection, idl_monitor):
+        max_level = None if cfg.CONF.OVS.ovsdb_debug else vlog.INFO
+        vlog.use_python_logger(max_level=max_level)
+        self.idl_monitor = idl_monitor
+        super().__init__(connection)
 
-    ovsdb_connection = connection.Connection(cfg.CONF.OVS.ovsdb_connection,
-                                             cfg.CONF.ovs_vsctl_timeout,
-                                             'Open_vSwitch')
-
-    def __init__(self, context):
-        super(OvsdbIdl, self).__init__(context)
-        # it's a chicken and egg problem: by default, the manager that
-        # corresponds to the connection URI is in most cases not enabled in
-        # local ovsdb, so we still need ovs-vsctl to set it to allow
-        # connections
-        helpers.enable_connection_uri(self.ovsdb_connection.connection)
-        OvsdbIdl.ovsdb_connection.start()
-        self.idl = OvsdbIdl.ovsdb_connection.idl
-
-    @property
-    def _tables(self):
-        return self.idl.tables
-
-    @property
-    def _ovs(self):
-        return list(self._tables['Open_vSwitch'].rows.values())[0]
-
-    def transaction(self, check_error=False, log_errors=True, **kwargs):
-        return Transaction(self, OvsdbIdl.ovsdb_connection,
-                           self.context.vsctl_timeout,
-                           check_error, log_errors)
-
-    def add_br(self, name, may_exist=True):
-        return cmd.AddBridgeCommand(self, name, may_exist)
-
-    def del_br(self, name, if_exists=True):
-        return cmd.DelBridgeCommand(self, name, if_exists)
-
-    def br_exists(self, name):
-        return cmd.BridgeExistsCommand(self, name)
-
-    def port_to_br(self, name):
-        return cmd.PortToBridgeCommand(self, name)
-
-    def iface_to_br(self, name):
-        # For our purposes, ports and interfaces always have the same name
-        return cmd.PortToBridgeCommand(self, name)
-
-    def list_br(self):
-        return cmd.ListBridgesCommand(self)
-
-    def br_get_external_id(self, name, field):
-        return cmd.BrGetExternalIdCommand(self, name, field)
-
-    def br_set_external_id(self, name, field, value):
-        return cmd.BrSetExternalIdCommand(self, name, field, value)
-
-    def db_set(self, table, record, *col_values):
-        return cmd.DbSetCommand(self, table, record, *col_values)
-
-    def db_clear(self, table, record, column):
-        return cmd.DbClearCommand(self, table, record, column)
-
-    def db_get(self, table, record, column):
-        return cmd.DbGetCommand(self, table, record, column)
-
-    def db_list(self, table, records=None, columns=None, if_exists=False):
-        return cmd.DbListCommand(self, table, records, columns, if_exists)
-
-    def db_find(self, table, *conditions, **kwargs):
-        return cmd.DbFindCommand(self, table, *conditions, **kwargs)
-
-    def set_controller(self, bridge, controllers):
-        return cmd.SetControllerCommand(self, bridge, controllers)
-
-    def del_controller(self, bridge):
-        return cmd.DelControllerCommand(self, bridge)
-
-    def get_controller(self, bridge):
-        return cmd.GetControllerCommand(self, bridge)
-
-    def set_fail_mode(self, bridge, mode):
-        return cmd.SetFailModeCommand(self, bridge, mode)
-
-    def add_port(self, bridge, port, may_exist=True):
-        return cmd.AddPortCommand(self, bridge, port, may_exist)
-
-    def del_port(self, port, bridge=None, if_exists=True):
-        return cmd.DelPortCommand(self, port, bridge, if_exists)
-
-    def list_ports(self, bridge):
-        return cmd.ListPortsCommand(self, bridge)
+    def ovs_cleanup(self, bridges, all_ports=False):
+        return OvsCleanup(self, bridges, all_ports)

@@ -14,126 +14,224 @@
 #    under the License.
 
 import abc
+import time
 
 import netaddr
-from oslo_config import cfg
+from neutron_lib.agent.linux import interface
+from neutron_lib.api import converters
+from neutron_lib import constants
+from neutron_lib import exceptions
+from neutron_lib.plugins.ml2 import ovs_constants as ovs_const
 from oslo_log import log as logging
-from oslo_utils import importutils
-import six
+from oslo_utils import excutils
+from pyroute2.netlink import exceptions as pyroute2_exc
 
+from neutron._i18n import _
 from neutron.agent.common import ovs_lib
 from neutron.agent.linux import ip_lib
-from neutron.agent.linux import utils
-from neutron.common import constants as n_const
-from neutron.common import exceptions
-from neutron.extensions import flavor
-from neutron.i18n import _LE, _LI
-
+from neutron.common import utils
+from neutron.conf.plugins.ml2.drivers import ovs_conf
+from neutron.privileged.agent.linux import ethtool
 
 LOG = logging.getLogger(__name__)
 
-OPTS = [
-    cfg.StrOpt('ovs_integration_bridge',
-               default='br-int',
-               help=_('Name of Open vSwitch bridge to use')),
-    cfg.BoolOpt('ovs_use_veth',
-                default=False,
-                help=_('Uses veth for an interface or not')),
-    cfg.IntOpt('network_device_mtu',
-               help=_('MTU setting for device.')),
-    cfg.StrOpt('meta_flavor_driver_mappings',
-               help=_('Mapping between flavor and LinuxInterfaceDriver. '
-                      'It is specific to MetaInterfaceDriver used with '
-                      'admin_user, admin_password, admin_tenant_name, '
-                      'admin_url, auth_strategy, auth_region and '
-                      'endpoint_type.')),
-    cfg.StrOpt('admin_user',
-               help=_("Admin username")),
-    cfg.StrOpt('admin_password',
-               help=_("Admin password"),
-               secret=True),
-    cfg.StrOpt('admin_tenant_name',
-               help=_("Admin tenant name")),
-    cfg.StrOpt('auth_url',
-               help=_("Authentication URL")),
-    cfg.StrOpt('auth_strategy', default='keystone',
-               help=_("The type of authentication to use")),
-    cfg.StrOpt('auth_region',
-               help=_("Authentication region")),
-    cfg.StrOpt('endpoint_type',
-               default='publicURL',
-               help=_("Network service endpoint type to pull from "
-                      "the keystone catalog")),
-]
+
+def _get_veth(name1, name2, namespace2):
+    return (ip_lib.IPDevice(name1),
+            ip_lib.IPDevice(name2, namespace=namespace2))
 
 
-@six.add_metaclass(abc.ABCMeta)
-class LinuxInterfaceDriver(object):
+class LinuxInterfaceDriver(interface.LinuxInterfaceDriver,
+                           metaclass=abc.ABCMeta):
 
-    # from linux IF_NAMESIZE
-    DEV_NAME_LEN = 14
-    DEV_NAME_PREFIX = n_const.TAP_DEVICE_PREFIX
-
-    def __init__(self, conf):
+    def __init__(self, conf, **kwargs):
         self.conf = conf
+        self._mtu_update_warn_logged = False
+
+    @property
+    def use_gateway_ips(self):
+        """Whether to use gateway IPs instead of unique IP allocations.
+
+        In each place where the DHCP agent runs, and for each subnet for
+        which DHCP is handling out IP addresses, the DHCP port needs -
+        at the Linux level - to have an IP address within that subnet.
+        Generally this needs to be a unique Neutron-allocated IP
+        address, because the subnet's underlying L2 domain is bridged
+        across multiple compute hosts and network nodes, and for HA
+        there may be multiple DHCP agents running on that same bridged
+        L2 domain.
+
+        However, if the DHCP ports - on multiple compute/network nodes
+        but for the same network - are _not_ bridged to each other,
+        they do not need each to have a unique IP address.  Instead
+        they can all share the same address from the relevant subnet.
+        This works, without creating any ambiguity, because those
+        ports are not all present on the same L2 domain, and because
+        no data within the network is ever sent to that address.
+        (DHCP requests are broadcast, and it is the network's job to
+        ensure that such a broadcast will reach at least one of the
+        available DHCP servers.  DHCP responses will be sent _from_
+        the DHCP port address.)
+
+        Specifically, for networking backends where it makes sense,
+        the DHCP agent allows all DHCP ports to use the subnet's
+        gateway IP address, and thereby to completely avoid any unique
+        IP address allocation.  This behaviour is selected by running
+        the DHCP agent with a configured interface driver whose
+        'use_gateway_ips' property is True.
+
+        When an operator deploys Neutron with an interface driver that
+        makes use_gateway_ips True, they should also ensure that a
+        gateway IP address is defined for each DHCP-enabled subnet,
+        and that the gateway IP address doesn't change during the
+        subnet's lifetime.
+        """
+        return False
 
     def init_l3(self, device_name, ip_cidrs, namespace=None,
-                preserve_ips=[], gateway_ips=None, extra_subnets=[],
-                enable_ra_on_gw=False, clean_connections=False):
+                preserve_ips=None, clean_connections=False):
         """Set the L3 settings for the interface using data from the port.
 
         ip_cidrs: list of 'X.X.X.X/YY' strings
         preserve_ips: list of ip cidrs that should not be removed from device
-        gateway_ips: For gateway ports, list of external gateway ip addresses
-        enable_ra_on_gw: Boolean to indicate configuring acceptance of IPv6 RA
         clean_connections: Boolean to indicate if we should cleanup connections
           associated to removed ips
         """
+        preserve_ips = preserve_ips or []
         device = ip_lib.IPDevice(device_name, namespace=namespace)
 
         # The LLA generated by the operating system is not known to
         # Neutron, so it would be deleted if we added it to the 'previous'
         # list here
         default_ipv6_lla = ip_lib.get_ipv6_lladdr(device.link.address)
-        previous = {addr['cidr'] for addr in device.addr.list(
-            filters=['permanent'])} - {default_ipv6_lla}
 
-        # add new addresses
+        cidrs = set()
+        remove_ips = set()
+
+        # normalize all the IP addresses first
         for ip_cidr in ip_cidrs:
-
             net = netaddr.IPNetwork(ip_cidr)
             # Convert to compact IPv6 address because the return values of
             # "ip addr list" are compact.
             if net.version == 6:
                 ip_cidr = str(net)
-            if ip_cidr in previous:
-                previous.remove(ip_cidr)
+            cidrs.add(ip_cidr)
+
+        # Determine the addresses that must be added and removed
+        for address in device.addr.list():
+            cidr = address['cidr']
+            dynamic = address['dynamic']
+
+            # skip the IPv6 link-local
+            if cidr == default_ipv6_lla:
+                # it's already configured, leave it alone
+                cidrs.discard(cidr)
                 continue
 
+            if cidr in preserve_ips:
+                continue
+
+            # Statically created addresses are OK, dynamically created
+            # addresses must be removed and replaced
+            if cidr in cidrs and not dynamic:
+                cidrs.remove(cidr)
+                continue
+
+            remove_ips.add(cidr)
+
+        # Clean up any old addresses.  This must be done first since there
+        # could be a dynamic address being replaced with a static one.
+        for ip_cidr in remove_ips:
+            if clean_connections:
+                device.delete_addr_and_conntrack_state(ip_cidr)
+            else:
+                device.addr.delete(ip_cidr)
+
+        # add any new addresses
+        for ip_cidr in cidrs:
             device.addr.add(ip_cidr)
 
-        # clean up any old addresses
-        for ip_cidr in previous:
-            if ip_cidr not in preserve_ips:
-                if clean_connections:
-                    device.delete_addr_and_conntrack_state(ip_cidr)
-                else:
-                    device.addr.delete(ip_cidr)
+    def init_router_port(self,
+                         device_name,
+                         ip_cidrs,
+                         namespace,
+                         preserve_ips=None,
+                         extra_subnets=None,
+                         clean_connections=False):
+        """Set the L3 settings for a router interface using data from the port.
 
-        for gateway_ip in gateway_ips or []:
-            device.route.add_gateway(gateway_ip)
+        ip_cidrs: list of 'X.X.X.X/YY' strings
+        preserve_ips: list of ip cidrs that should not be removed from device
+        clean_connections: Boolean to indicate if we should cleanup connections
+          associated to removed ips
+        extra_subnets: An iterable of cidrs to add as routes without address
+        """
+        LOG.debug("init_router_port: device_name(%s), namespace(%s)",
+                  device_name, namespace)
+        self.init_l3(device_name=device_name,
+                     ip_cidrs=ip_cidrs,
+                     namespace=namespace,
+                     preserve_ips=preserve_ips or [],
+                     clean_connections=clean_connections)
+        self.set_onlink_routes(device_name, namespace, extra_subnets,
+                               preserve_ips)
 
-        if enable_ra_on_gw:
-            self.configure_ipv6_ra(namespace, device_name)
+    def set_onlink_routes(self, device_name, namespace, extra_subnets,
+                          preserve_ips=None, is_ipv6=True):
+        """Manage on-link routes (routes without an associate address)
 
-        new_onlink_routes = set(s['cidr'] for s in extra_subnets)
-        existing_onlink_routes = set(
-            device.route.list_onlink_routes(n_const.IP_VERSION_4) +
-            device.route.list_onlink_routes(n_const.IP_VERSION_6))
-        for route in new_onlink_routes - existing_onlink_routes:
+        :param device_name: interface name
+        :param namespace: namespace name
+        :param extra_subnets: subnets attached to this interface without an IP
+                              address set in this interface
+        :param preserve_ips: IPs or CIDRs not to be deleted from the device
+                             on-link route list
+        """
+        device = ip_lib.IPDevice(device_name, namespace=namespace)
+        new_onlink_cidrs = {s['cidr'] for s in extra_subnets or []}
+        preserve_ips = set(preserve_ips if preserve_ips else [])
+
+        onlink = device.route.list_onlink_routes(constants.IP_VERSION_4)
+        if is_ipv6:
+            onlink += device.route.list_onlink_routes(constants.IP_VERSION_6)
+        existing_onlink_cidrs = {r['cidr'] for r in onlink}
+
+        for route in new_onlink_cidrs - existing_onlink_cidrs:
+            LOG.debug('Adding onlink route (%s)', route)
             device.route.add_onlink_route(route)
-        for route in existing_onlink_routes - new_onlink_routes:
+        for route in existing_onlink_cidrs - new_onlink_cidrs - preserve_ips:
+            LOG.debug('Deleting onlink route (%s)', route)
             device.route.delete_onlink_route(route)
+
+    def add_ipv6_addr(self, device_name, v6addr, namespace, scope='global'):
+        device = ip_lib.IPDevice(device_name,
+                                 namespace=namespace)
+        net = netaddr.IPNetwork(v6addr)
+        device.addr.add(str(net), scope)
+
+    def delete_ipv6_addr(self, device_name, v6addr, namespace):
+        device = ip_lib.IPDevice(device_name,
+                                 namespace=namespace)
+        device.delete_addr_and_conntrack_state(v6addr)
+
+    def delete_ipv6_addr_with_prefix(self, device_name, prefix, namespace):
+        """Delete the first listed IPv6 address that falls within a given
+        prefix.
+        """
+        device = ip_lib.IPDevice(device_name, namespace=namespace)
+        net = netaddr.IPNetwork(prefix)
+        for address in device.addr.list(scope='global', filters=['permanent']):
+            ip_address = netaddr.IPNetwork(address['cidr'])
+            if ip_address in net:
+                device.delete_addr_and_conntrack_state(address['cidr'])
+                break
+
+    def get_ipv6_llas(self, device_name, namespace):
+        kwargs = {'family': utils.get_socket_address_family(
+            constants.IP_VERSION_6),
+                  'scope': 'link'}
+        return ip_lib.get_devices_with_ip(namespace, name=device_name,
+                                          **kwargs)
 
     def check_bridge_exists(self, bridge):
         if not ip_lib.device_exists(bridge):
@@ -143,34 +241,67 @@ class LinuxInterfaceDriver(object):
         return (self.DEV_NAME_PREFIX + port.id)[:self.DEV_NAME_LEN]
 
     @staticmethod
-    def configure_ipv6_ra(namespace, dev_name):
-        """Configure acceptance of IPv6 route advertisements on an intf."""
-        # Learn the default router's IP address via RAs
-        ip_lib.IPWrapper(namespace=namespace).netns.execute(
-            ['sysctl', '-w', 'net.ipv6.conf.%s.accept_ra=2' % dev_name])
+    def configure_ipv6_ra(namespace, dev_name, value):
+        """Configure handling of IPv6 Router Advertisements on an
+        interface. See common/constants.py for possible values.
+        """
+        cmd = ['net.ipv6.conf.{dev}.accept_ra={value}'.format(dev=dev_name,
+                                                              value=value)]
+        ip_lib.sysctl(cmd, namespace=namespace)
+
+    @staticmethod
+    def configure_ipv6_forwarding(namespace, dev_name, enabled):
+        """Configure IPv6 forwarding on an interface."""
+        cmd = ['net.ipv6.conf.%(dev)s.forwarding=%(enabled)s' %
+               {'dev': dev_name, 'enabled': int(enabled)}]
+        ip_lib.sysctl(cmd, namespace=namespace)
 
     @abc.abstractmethod
     def plug_new(self, network_id, port_id, device_name, mac_address,
-                 bridge=None, namespace=None, prefix=None):
+                 bridge=None, namespace=None, prefix=None, mtu=None):
         """Plug in the interface only for new devices that don't exist yet."""
 
     def plug(self, network_id, port_id, device_name, mac_address,
-             bridge=None, namespace=None, prefix=None):
+             bridge=None, namespace=None, prefix=None, mtu=None):
         if not ip_lib.device_exists(device_name,
                                     namespace=namespace):
             self.plug_new(network_id, port_id, device_name, mac_address,
-                          bridge, namespace, prefix)
+                          bridge, namespace, prefix, mtu)
         else:
-            LOG.info(_LI("Device %s already exists"), device_name)
+            LOG.info("Device %s already exists", device_name)
+            if mtu:
+                self.set_mtu(
+                    device_name, mtu, namespace=namespace, prefix=prefix)
+            else:
+                LOG.warning("No MTU configured for port %s", port_id)
 
-    @abc.abstractmethod
-    def unplug(self, device_name, bridge=None, namespace=None, prefix=None):
-        """Unplug the interface."""
+    @property
+    def bridged(self):
+        """Whether the DHCP port is bridged to the VM TAP interfaces.
+
+        When the DHCP port is bridged to the TAP interfaces for the
+        VMs for which it is providing DHCP service - as is the case
+        for most Neutron network implementations - the DHCP server
+        only needs to listen on the DHCP port, and will still receive
+        DHCP requests from all the relevant VMs.
+
+        If the DHCP port is not bridged to the relevant VM TAP
+        interfaces, the DHCP server needs to listen explicitly on
+        those TAP interfaces, and to treat those as aliases of the
+        DHCP port where the IP subnet is defined.
+        """
+        return True
+
+    def set_mtu(self, device_name, mtu, namespace=None, prefix=None):
+        """Set MTU on the interface."""
+        if not self._mtu_update_warn_logged:
+            LOG.warning("Interface driver cannot update MTU for ports")
+            self._mtu_update_warn_logged = True
 
 
 class NullDriver(LinuxInterfaceDriver):
     def plug_new(self, network_id, port_id, device_name, mac_address,
-                 bridge=None, namespace=None, prefix=None):
+                 bridge=None, namespace=None, prefix=None, mtu=None):
         pass
 
     def unplug(self, device_name, bridge=None, namespace=None, prefix=None):
@@ -180,17 +311,18 @@ class NullDriver(LinuxInterfaceDriver):
 class OVSInterfaceDriver(LinuxInterfaceDriver):
     """Driver for creating an internal interface on an OVS bridge."""
 
-    DEV_NAME_PREFIX = n_const.TAP_DEVICE_PREFIX
+    DEV_NAME_PREFIX = constants.TAP_DEVICE_PREFIX
 
-    def __init__(self, conf):
-        super(OVSInterfaceDriver, self).__init__(conf)
+    def __init__(self, conf, **kwargs):
+        super().__init__(conf, **kwargs)
+        ovs_conf.register_ovs_agent_opts(self.conf)
         if self.conf.ovs_use_veth:
             self.DEV_NAME_PREFIX = 'ns-'
 
     def _get_tap_name(self, dev_name, prefix=None):
         if self.conf.ovs_use_veth:
             dev_name = dev_name.replace(prefix or self.DEV_NAME_PREFIX,
-                                        n_const.TAP_DEVICE_PREFIX)
+                                        constants.TAP_DEVICE_PREFIX)
         return dev_name
 
     def _ovs_add_port(self, bridge, device_name, port_id, mac_address,
@@ -204,11 +336,63 @@ class OVSInterfaceDriver(LinuxInterfaceDriver):
         ovs = ovs_lib.OVSBridge(bridge)
         ovs.replace_port(device_name, *attrs)
 
+    def _set_device_address(self, device, mac_address):
+        device.link.set_address(mac_address)
+        current_mac = converters.convert_to_sanitized_mac_address(
+            device.link.address)
+        if current_mac != mac_address:
+            raise RuntimeError(
+                _("Failed to set mac address to: %(mac)s; "
+                  "Current mac: %(current_mac)s") %
+                {'mac': mac_address, 'current_mac': current_mac})
+
+    def _ensure_device_address(self, device, mac_address):
+        mac_address = converters.convert_to_sanitized_mac_address(mac_address)
+        for i in range(9):
+            # workaround for the OVS shy port syndrome. ports sometimes
+            # hide for a bit right after they are first created.
+            # see bug/1618987
+            try:
+                self._set_device_address(device, mac_address)
+                return
+            except RuntimeError as e:
+                LOG.warning("Got error trying to set mac, retrying: %s",
+                            str(e))
+                time.sleep(1)
+        # didn't break, we give it one last shot without catching
+        self._set_device_address(device, mac_address)
+
+    def _add_device_to_namespace(self, ip_wrapper, device, namespace):
+        namespace_obj = ip_wrapper.ensure_namespace(namespace)
+        for i in range(9):
+            try:
+                namespace_obj.add_device_to_namespace(device)
+                break
+            except ip_lib.NetworkInterfaceNotFound:
+                # NOTE(slaweq): if the exception was NetworkInterfaceNotFound
+                # then lets try again, otherwise lets simply raise it as this
+                # is some different issue than retry tries to workaround
+                LOG.warning("Failed to set interface %s into namespace %s. "
+                            "Interface not found, attempt: %s, retrying.",
+                            device, namespace, i + 1)
+                time.sleep(1)
+            except utils.WaitTimeout:
+                # NOTE(slaweq): if the exception was WaitTimeout then it means
+                # that probably device wasn't found in the desired namespace
+                # for 5 seconds, so lets try again too
+                LOG.warning("Failed to set interface %s into namespace %s. "
+                            "Interface not found in namespace, attempt: %s, "
+                            "retrying.", device, namespace, i + 1)
+                time.sleep(1)
+        else:
+            # didn't break, we give it one last shot without catching
+            namespace_obj.add_device_to_namespace(device)
+
     def plug_new(self, network_id, port_id, device_name, mac_address,
-                 bridge=None, namespace=None, prefix=None):
+                 bridge=None, namespace=None, prefix=None, mtu=None):
         """Plug in the interface."""
         if not bridge:
-            bridge = self.conf.ovs_integration_bridge
+            bridge = self.conf.OVS.integration_bridge
 
         self.check_bridge_exists(bridge)
 
@@ -220,33 +404,70 @@ class OVSInterfaceDriver(LinuxInterfaceDriver):
             root_dev, ns_dev = ip.add_veth(tap_name,
                                            device_name,
                                            namespace2=namespace)
+            root_dev.disable_ipv6()
         else:
             ns_dev = ip.device(device_name)
+        if not ns_dev:
+            LOG.warning("Device %s is not ready in namespace %s!",
+                        device_name, namespace)
 
         internal = not self.conf.ovs_use_veth
         self._ovs_add_port(bridge, tap_name, port_id, mac_address,
                            internal=internal)
-
-        ns_dev.link.set_address(mac_address)
-
-        if self.conf.network_device_mtu:
-            ns_dev.link.set_mtu(self.conf.network_device_mtu)
-            if self.conf.ovs_use_veth:
-                root_dev.link.set_mtu(self.conf.network_device_mtu)
+        try:
+            self._ensure_device_address(ns_dev, mac_address)
+        except Exception:
+            LOG.warning("Failed to set mac for interface %s", ns_dev)
+            with excutils.save_and_reraise_exception():
+                ovs = ovs_lib.OVSBridge(bridge)
+                ovs.delete_port(tap_name)
 
         # Add an interface created by ovs to the namespace.
         if not self.conf.ovs_use_veth and namespace:
-            namespace_obj = ip.ensure_namespace(namespace)
-            namespace_obj.add_device_to_namespace(ns_dev)
+            try:
+                self._add_device_to_namespace(ip, ns_dev, namespace)
+            except (pyroute2_exc.NetlinkError, OSError, RuntimeError):
+                # To prevent the namespace failure from blasting OVS, the OVS
+                # port creation should be reverted. Possible exceptions:
+                # - NetlinkError in case of duplicated interface
+                # - OSError in case of corrupted namespace
+                # - RuntimeError in case of any issue with interface, like e.g.
+                #   Interface not found
+                LOG.warning("Failed to plug interface %s into bridge %s, "
+                            "cleaning up", device_name, bridge)
+                with excutils.save_and_reraise_exception():
+                    ovs = ovs_lib.OVSBridge(bridge)
+                    ovs.delete_port(tap_name)
+            except Exception as exc:
+                LOG.warning("Failed to plug interface %s to bridge %s in "
+                            "namespace %s due to unknown reason: %s",
+                            device_name, bridge, namespace, str(exc))
+                with excutils.save_and_reraise_exception():
+                    ovs = ovs_lib.OVSBridge(bridge)
+                    ovs.delete_port(tap_name)
+
+        # NOTE(ihrachys): the order here is significant: we must set MTU after
+        # the device is moved into a namespace, otherwise OVS bridge does not
+        # allow to set MTU that is higher than the least of all device MTUs on
+        # the bridge
+        if mtu:
+            self.set_mtu(device_name, mtu, namespace=namespace, prefix=prefix)
+        else:
+            LOG.warning("No MTU configured for port %s", port_id)
 
         ns_dev.link.set_up()
         if self.conf.ovs_use_veth:
+            # ovs-dpdk does not do checksum calculations for veth interface
+            # (bug 1832021)
+            if self.conf.OVS.datapath_type == ovs_const.OVS_DATAPATH_NETDEV:
+                ethtool.offload(ns_dev.name, rx=False, tx=False,
+                                namespace=namespace)
             root_dev.link.set_up()
 
     def unplug(self, device_name, bridge=None, namespace=None, prefix=None):
         """Unplug the interface."""
         if not bridge:
-            bridge = self.conf.ovs_integration_bridge
+            bridge = self.conf.OVS.integration_bridge
 
         tap_name = self._get_tap_name(device_name, prefix)
         self.check_bridge_exists(bridge)
@@ -259,196 +480,15 @@ class OVSInterfaceDriver(LinuxInterfaceDriver):
                 device.link.delete()
                 LOG.debug("Unplugged interface '%s'", device_name)
         except RuntimeError:
-            LOG.error(_LE("Failed unplugging interface '%s'"),
+            LOG.error("Failed unplugging interface '%s'",
                       device_name)
 
-
-class MidonetInterfaceDriver(LinuxInterfaceDriver):
-
-    def plug_new(self, network_id, port_id, device_name, mac_address,
-                 bridge=None, namespace=None, prefix=None):
-        """This method is called by the Dhcp agent or by the L3 agent
-        when a new network is created
-        """
-        ip = ip_lib.IPWrapper()
-        tap_name = device_name.replace(prefix or n_const.TAP_DEVICE_PREFIX,
-                                       n_const.TAP_DEVICE_PREFIX)
-
-        # Create ns_dev in a namespace if one is configured.
-        root_dev, ns_dev = ip.add_veth(tap_name, device_name,
-                                       namespace2=namespace)
-
-        ns_dev.link.set_address(mac_address)
-
-        # Add an interface created by ovs to the namespace.
-        namespace_obj = ip.ensure_namespace(namespace)
-        namespace_obj.add_device_to_namespace(ns_dev)
-
-        ns_dev.link.set_up()
-        root_dev.link.set_up()
-
-        cmd = ['mm-ctl', '--bind-port', port_id, device_name]
-        utils.execute(cmd, run_as_root=True)
-
-    def unplug(self, device_name, bridge=None, namespace=None, prefix=None):
-        # the port will be deleted by the dhcp agent that will call the plugin
-        device = ip_lib.IPDevice(device_name, namespace=namespace)
-        try:
-            device.link.delete()
-        except RuntimeError:
-            LOG.error(_LE("Failed unplugging interface '%s'"), device_name)
-        LOG.debug("Unplugged interface '%s'", device_name)
-
-        ip_lib.IPWrapper(namespace=namespace).garbage_collect_namespace()
-
-
-class IVSInterfaceDriver(LinuxInterfaceDriver):
-    """Driver for creating an internal interface on an IVS bridge."""
-
-    DEV_NAME_PREFIX = n_const.TAP_DEVICE_PREFIX
-
-    def __init__(self, conf):
-        super(IVSInterfaceDriver, self).__init__(conf)
-        self.DEV_NAME_PREFIX = 'ns-'
-
-    def _get_tap_name(self, dev_name, prefix=None):
-        dev_name = dev_name.replace(prefix or self.DEV_NAME_PREFIX,
-                                    n_const.TAP_DEVICE_PREFIX)
-        return dev_name
-
-    def _ivs_add_port(self, device_name, port_id, mac_address):
-        cmd = ['ivs-ctl', 'add-port', device_name]
-        utils.execute(cmd, run_as_root=True)
-
-    def plug_new(self, network_id, port_id, device_name, mac_address,
-                 bridge=None, namespace=None, prefix=None):
-        """Plug in the interface."""
-        ip = ip_lib.IPWrapper()
-        tap_name = self._get_tap_name(device_name, prefix)
-
-        root_dev, ns_dev = ip.add_veth(tap_name, device_name)
-
-        self._ivs_add_port(tap_name, port_id, mac_address)
-
-        ns_dev = ip.device(device_name)
-        ns_dev.link.set_address(mac_address)
-
-        if self.conf.network_device_mtu:
-            ns_dev.link.set_mtu(self.conf.network_device_mtu)
-            root_dev.link.set_mtu(self.conf.network_device_mtu)
-
-        if namespace:
-            namespace_obj = ip.ensure_namespace(namespace)
-            namespace_obj.add_device_to_namespace(ns_dev)
-
-        ns_dev.link.set_up()
-        root_dev.link.set_up()
-
-    def unplug(self, device_name, bridge=None, namespace=None, prefix=None):
-        """Unplug the interface."""
-        tap_name = self._get_tap_name(device_name, prefix)
-        try:
-            cmd = ['ivs-ctl', 'del-port', tap_name]
-            utils.execute(cmd, run_as_root=True)
-            device = ip_lib.IPDevice(device_name, namespace=namespace)
-            device.link.delete()
-            LOG.debug("Unplugged interface '%s'", device_name)
-        except RuntimeError:
-            LOG.error(_LE("Failed unplugging interface '%s'"),
-                      device_name)
-
-
-class BridgeInterfaceDriver(LinuxInterfaceDriver):
-    """Driver for creating bridge interfaces."""
-
-    DEV_NAME_PREFIX = 'ns-'
-
-    def plug_new(self, network_id, port_id, device_name, mac_address,
-                 bridge=None, namespace=None, prefix=None):
-        """Plugin the interface."""
-        ip = ip_lib.IPWrapper()
-
-        # Enable agent to define the prefix
-        tap_name = device_name.replace(prefix or self.DEV_NAME_PREFIX,
-                                       n_const.TAP_DEVICE_PREFIX)
-        # Create ns_veth in a namespace if one is configured.
-        root_veth, ns_veth = ip.add_veth(tap_name, device_name,
-                                         namespace2=namespace)
-        ns_veth.link.set_address(mac_address)
-
-        if self.conf.network_device_mtu:
-            root_veth.link.set_mtu(self.conf.network_device_mtu)
-            ns_veth.link.set_mtu(self.conf.network_device_mtu)
-
-        root_veth.link.set_up()
-        ns_veth.link.set_up()
-
-    def unplug(self, device_name, bridge=None, namespace=None, prefix=None):
-        """Unplug the interface."""
-        device = ip_lib.IPDevice(device_name, namespace=namespace)
-        try:
-            device.link.delete()
-            LOG.debug("Unplugged interface '%s'", device_name)
-        except RuntimeError:
-            LOG.error(_LE("Failed unplugging interface '%s'"),
-                      device_name)
-
-
-class MetaInterfaceDriver(LinuxInterfaceDriver):
-    def __init__(self, conf):
-        super(MetaInterfaceDriver, self).__init__(conf)
-        from neutronclient.v2_0 import client
-        self.neutron = client.Client(
-            username=self.conf.admin_user,
-            password=self.conf.admin_password,
-            tenant_name=self.conf.admin_tenant_name,
-            auth_url=self.conf.auth_url,
-            auth_strategy=self.conf.auth_strategy,
-            region_name=self.conf.auth_region,
-            endpoint_type=self.conf.endpoint_type
-        )
-        self.flavor_driver_map = {}
-        for net_flavor, driver_name in [
-                driver_set.split(':')
-                for driver_set in
-                self.conf.meta_flavor_driver_mappings.split(',')]:
-            self.flavor_driver_map[net_flavor] = self._load_driver(driver_name)
-
-    def _get_flavor_by_network_id(self, network_id):
-        network = self.neutron.show_network(network_id)
-        return network['network'][flavor.FLAVOR_NETWORK]
-
-    def _get_driver_by_network_id(self, network_id):
-        net_flavor = self._get_flavor_by_network_id(network_id)
-        return self.flavor_driver_map[net_flavor]
-
-    def _set_device_plugin_tag(self, network_id, device_name, namespace=None):
-        plugin_tag = self._get_flavor_by_network_id(network_id)
-        device = ip_lib.IPDevice(device_name, namespace=namespace)
-        device.link.set_alias(plugin_tag)
-
-    def _get_device_plugin_tag(self, device_name, namespace=None):
-        device = ip_lib.IPDevice(device_name, namespace=namespace)
-        return device.link.alias
-
-    def get_device_name(self, port):
-        driver = self._get_driver_by_network_id(port.network_id)
-        return driver.get_device_name(port)
-
-    def plug_new(self, network_id, port_id, device_name, mac_address,
-                 bridge=None, namespace=None, prefix=None):
-        driver = self._get_driver_by_network_id(network_id)
-        ret = driver.plug(network_id, port_id, device_name, mac_address,
-                          bridge=bridge, namespace=namespace, prefix=prefix)
-        self._set_device_plugin_tag(network_id, device_name, namespace)
-        return ret
-
-    def unplug(self, device_name, bridge=None, namespace=None, prefix=None):
-        plugin_tag = self._get_device_plugin_tag(device_name, namespace)
-        driver = self.flavor_driver_map[plugin_tag]
-        return driver.unplug(device_name, bridge, namespace, prefix)
-
-    def _load_driver(self, driver_provider):
-        LOG.debug("Driver location: %s", driver_provider)
-        plugin_klass = importutils.import_class(driver_provider)
-        return plugin_klass(self.conf)
+    def set_mtu(self, device_name, mtu, namespace=None, prefix=None):
+        if self.conf.ovs_use_veth:
+            tap_name = self._get_tap_name(device_name, prefix)
+            root_dev, ns_dev = _get_veth(
+                tap_name, device_name, namespace2=namespace)
+            root_dev.link.set_mtu(mtu)
+        else:
+            ns_dev = ip_lib.IPWrapper(namespace=namespace).device(device_name)
+        ns_dev.link.set_mtu(mtu)

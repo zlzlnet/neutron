@@ -1,0 +1,236 @@
+# Copyright 2025 Red Hat, Inc.
+# All Rights Reserved.
+#
+#    Licensed under the Apache License, Version 2.0 (the "License"); you may
+#    not use this file except in compliance with the License. You may obtain
+#    a copy of the License at
+#
+#         http://www.apache.org/licenses/LICENSE-2.0
+#
+#    Unless required by applicable law or agreed to in writing, software
+#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+#    License for the specific language governing permissions and limitations
+#    under the License.
+
+import typing
+
+import netaddr
+from neutron_lib import constants as n_const
+from oslo_log import log
+from ovsdbapp.backend.ovs_idl import event as row_event
+from ovsdbapp.backend.ovs_idl import idlutils
+from ovsdbapp import event as ovsdb_event
+
+from neutron.common.ovn import constants as ovn_const
+from neutron.common.ovn import utils as ovn_utils
+from neutron.services.bgp import constants
+
+LOG = log.getLogger(__name__)
+
+_event_to_action = {
+    row_event.RowEvent.ROW_CREATE: constants.Action.RECONCILE,
+    row_event.RowEvent.ROW_UPDATE: constants.Action.RECONCILE,
+    row_event.RowEvent.ROW_DELETE: constants.Action.DELETE,
+}
+
+
+class BGPLockEventHandler(ovsdb_event.RowEventHandler):
+    """Row event handler that full syncs when the OVSDB lock is acquired.
+
+    Only the worker holding the BGP topology lock reconciles. Checking
+    has_lock once at startup is racy.
+
+    ovsdbapp calls these hooks from the notify_loop thread on the actual lock
+    transition, so whichever worker gets the lock reconciles, whenever it
+    gets it.
+    """
+
+    def __init__(self, reconciler):
+        super().__init__()
+        self.reconciler = reconciler
+
+    def lock_acquired(self, lock_name):
+        LOG.info("Acquired OVSDB lock %s, reconciling the BGP topology",
+                 lock_name)
+        self.reconciler.full_sync()
+
+    def lock_lost(self, lock_name):
+        LOG.info("Lost OVSDB lock %s, another worker is now responsible for "
+                 "reconciling the BGP topology", lock_name)
+
+
+class BGPReconcilerResourceEvent(row_event.RowEvent):
+    RESOURCE: typing.ClassVar[
+        constants.BGPReconcilerResource | None] = None
+
+    def __init__(self, reconciler):
+        super().__init__(self.EVENTS, self.TABLE, None)
+        self.reconciler = reconciler
+
+    @property
+    def event_name(self):
+        return self.__class__.__name__
+
+    def run(self, event, row, old):
+        self.reconciler.reconcile(_event_to_action[event], self.RESOURCE, row)
+
+
+class BGPChassisBridgesUpdateEvent(BGPReconcilerResourceEvent):
+    """Event for chassis BGP bridges updates.
+
+    This event is triggered only if bgp-bridges are changed.
+    """
+    EVENTS = (BGPReconcilerResourceEvent.ROW_UPDATE,)
+    RESOURCE = constants.BGPReconcilerResource.CHASSIS_BGP_BRIDGES
+    TABLE = 'Chassis_Private'
+
+    def match_fn(self, event, row, old):
+        if not super().match_fn(event, row, old):
+            return False
+        if not hasattr(old, 'external_ids'):
+            return False
+        current_bgp_bridges = row.external_ids.get(
+            constants.CHASSIS_BGP_BRIDGES_EXT_ID_KEY)
+        old_bgp_bridges = old.external_ids.get(
+            constants.CHASSIS_BGP_BRIDGES_EXT_ID_KEY)
+
+        return current_bgp_bridges != old_bgp_bridges
+
+
+class ProviderSwitchEvent(BGPReconcilerResourceEvent):
+    EVENTS = (BGPReconcilerResourceEvent.ROW_CREATE,
+              BGPReconcilerResourceEvent.ROW_DELETE)
+    RESOURCE = constants.BGPReconcilerResource.PROVIDER_SWITCH
+    TABLE = 'Logical_Switch'
+
+    def match_fn(self, event, row, old):
+        if not super().match_fn(event, row, old):
+            return False
+        net_type = row.external_ids.get(ovn_const.OVN_NETTYPE_EXT_ID_KEY)
+        return net_type == n_const.TYPE_FLAT
+
+
+class GatewayIPEvent(BGPReconcilerResourceEvent):
+    RESOURCE = constants.BGPReconcilerResource.GATEWAY_IP
+    TABLE = 'DHCP_Options'
+
+    def match_fn(self, event, row, old):
+        if not super().match_fn(event, row, old):
+            return False
+
+        if netaddr.IPNetwork(row.cidr).version == 6:
+            return False
+
+        net_id = row.external_ids.get(ovn_const.OVN_NETWORK_ID_EXT_ID_KEY)
+        try:
+            switch = self.reconciler.nb_api.lookup(
+                'Logical_Switch', ovn_utils.ovn_name(net_id))
+        except idlutils.RowNotFound:
+            LOG.warning("Switch neutron-%s not found", net_id)
+            return False
+
+        net_type = switch.external_ids.get(ovn_const.OVN_NETTYPE_EXT_ID_KEY)
+        return net_type == n_const.TYPE_FLAT
+
+
+class GatewayIPCreatedEvent(GatewayIPEvent):
+    EVENTS = (BGPReconcilerResourceEvent.ROW_CREATE,)
+
+    def match_fn(self, event, row, old):
+        if not super().match_fn(event, row, old):
+            return False
+
+        return 'router' in row.options
+
+
+class GatewayIPUpdatedEvent(GatewayIPEvent):
+    EVENTS = (BGPReconcilerResourceEvent.ROW_UPDATE,)
+
+    def match_fn(self, event, row, old):
+        if not super().match_fn(event, row, old):
+            return False
+
+        if not hasattr(old, 'options'):
+            return False
+
+        return ('router' in row.options and
+                row.options['router'] != old.options.get('router'))
+
+
+class FIPEvent(BGPReconcilerResourceEvent):
+    RESOURCE = constants.BGPReconcilerResource.FLOATING_IP
+    TABLE = 'NAT'
+
+    def match_fn(self, event, row, old):
+        if not super().match_fn(event, row, old):
+            return False
+        if row.type != 'dnat_and_snat':
+            return False
+        try:
+            n_net_id = row.external_ids[ovn_const.OVN_FIP_NET_ID]
+        except KeyError:
+            return False
+        try:
+            switch = self.reconciler.nb_api.lookup(
+                'Logical_Switch', ovn_utils.ovn_name(n_net_id))
+        except idlutils.RowNotFound:
+            return False
+        net_type = switch.external_ids.get(ovn_const.OVN_NETTYPE_EXT_ID_KEY)
+        return net_type == n_const.TYPE_FLAT
+
+
+class FIPChangedEvent(FIPEvent):
+    EVENTS = (BGPReconcilerResourceEvent.ROW_CREATE,
+              BGPReconcilerResourceEvent.ROW_DELETE)
+
+
+class VirtualPortEvent(BGPReconcilerResourceEvent):
+    RESOURCE = constants.BGPReconcilerResource.VIRTUAL_PORT
+    TABLE = 'Logical_Switch_Port'
+
+    def _is_flat_provider_network(self, row):
+        try:
+            network_name = row.external_ids[
+                ovn_const.OVN_NETWORK_NAME_EXT_ID_KEY]
+        except KeyError:
+            return False
+        try:
+            switch = self.reconciler.nb_api.lookup(
+                'Logical_Switch', network_name)
+        except idlutils.RowNotFound:
+            return False
+        net_type = switch.external_ids.get(ovn_const.OVN_NETTYPE_EXT_ID_KEY)
+        return net_type == n_const.TYPE_FLAT
+
+    def match_fn(self, event, row, old):
+        if not super().match_fn(event, row, old):
+            return False
+        if row.type != ovn_const.LSP_TYPE_VIRTUAL:
+            return False
+        return self._is_flat_provider_network(row)
+
+
+class VirtualPortChangedEvent(VirtualPortEvent):
+    EVENTS = (BGPReconcilerResourceEvent.ROW_CREATE,
+              BGPReconcilerResourceEvent.ROW_DELETE)
+
+
+class VirtualPortTypeChangedEvent(VirtualPortEvent):
+    EVENTS = (BGPReconcilerResourceEvent.ROW_UPDATE,)
+
+    def match_fn(self, event, row, old):
+        if not hasattr(old, 'type'):
+            return False
+        if old.type == row.type:
+            return False
+        if ovn_const.LSP_TYPE_VIRTUAL in (row.type, old.type):
+            return self._is_flat_provider_network(row)
+        return False
+
+
+class BGPChassisEvent(BGPReconcilerResourceEvent):
+    EVENTS = (BGPReconcilerResourceEvent.ROW_CREATE,
+              BGPReconcilerResourceEvent.ROW_DELETE)
+    RESOURCE = constants.BGPReconcilerResource.CHASSIS
+    TABLE = 'Chassis_Private'

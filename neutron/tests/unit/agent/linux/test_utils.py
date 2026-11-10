@@ -12,12 +12,18 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import errno
-import mock
+import signal
 import socket
+from unittest import mock
+
 import testtools
 
+from neutron_lib import exceptions
+from neutron_lib import fixture as lib_fixtures
+import oslo_i18n
+
 from neutron.agent.linux import utils
+from neutron.privileged.agent.linux import utils as priv_utils
 from neutron.tests import base
 
 
@@ -26,10 +32,10 @@ _marker = object()
 
 class AgentUtilsExecuteTest(base.BaseTestCase):
     def setUp(self):
-        super(AgentUtilsExecuteTest, self).setUp()
+        super().setUp()
         self.test_file = self.get_temp_file_path('test_execute.tmp')
         open(self.test_file, 'w').close()
-        self.process = mock.patch('eventlet.green.subprocess.Popen').start()
+        self.process = mock.patch('subprocess.Popen').start()
         self.process.return_value.returncode = 0
         self.mock_popen = self.process.return_value.communicate
 
@@ -39,12 +45,31 @@ class AgentUtilsExecuteTest(base.BaseTestCase):
         result = utils.execute(["ls", self.test_file])
         self.assertEqual(result, expected)
 
-    def test_with_helper(self):
+    def test_with_root_privileges_privsep(self):
+        with mock.patch.object(priv_utils, 'execute_process') as \
+                mock_execute_process:
+            mock_execute_process.return_value = ['', '', 0]
+            utils.execute(['ls', self.test_file], run_as_root=True,
+                          privsep_exec=True)
+        mock_execute_process.assert_called_once()
+
+    def test_with_root_privileges_rootwrap(self):
         expected = "ls %s\n" % self.test_file
         self.mock_popen.return_value = [expected, ""]
         self.config(group='AGENT', root_helper='echo')
         result = utils.execute(["ls", self.test_file], run_as_root=True)
         self.assertEqual(result, expected)
+
+    @mock.patch.object(utils.RootwrapDaemonHelper, 'get_client')
+    def test_with_root_privileges_rootwrap_exception(self, get_client):
+        client_inst = mock.Mock()
+        client_inst.execute.side_effect = RuntimeError
+        get_client.return_value = client_inst
+        self.config(group='AGENT', root_helper_daemon='echo')
+        with mock.patch.object(utils, 'LOG') as log:
+            self.assertRaises(RuntimeError, utils.execute,
+                              ['ls'], run_as_root=True)
+            self.assertTrue(log.error.called)
 
     def test_stderr_true(self):
         expected = "%s\n" % self.test_file
@@ -57,7 +82,7 @@ class AgentUtilsExecuteTest(base.BaseTestCase):
         self.mock_popen.return_value = ["", ""]
         stdout = utils.execute(["ls", self.test_file[:-1]],
                                check_exit_code=False)
-        self.assertEqual(stdout, "")
+        self.assertEqual("", stdout)
 
     def test_execute_raises(self):
         self.mock_popen.side_effect = RuntimeError
@@ -99,69 +124,196 @@ class AgentUtilsExecuteTest(base.BaseTestCase):
             utils.execute(['ls'])
             self.assertTrue(log.debug.called)
 
+    def test_return_code_log_error_change_locale(self):
+        ja_output = 'std_out in Japanese'
+        ja_error = 'std_err in Japanese'
+        ja_message_out = oslo_i18n._message.Message(ja_output)
+        ja_message_err = oslo_i18n._message.Message(ja_error)
+        ja_translate_out = oslo_i18n._translate.translate(ja_message_out, 'ja')
+        ja_translate_err = oslo_i18n._translate.translate(ja_message_err, 'ja')
+        self.mock_popen.return_value = (ja_translate_out, ja_translate_err)
+        self.process.return_value.returncode = 1
+
+        with mock.patch.object(utils, 'LOG') as log:
+            utils.execute(['ls'], check_exit_code=False)
+            self.assertIn(ja_translate_out, str(log.error.call_args_list))
+            self.assertIn(ja_translate_err, str(log.error.call_args_list))
+
     def test_return_code_raise_runtime_do_not_log_fail_as_error(self):
         self.mock_popen.return_value = ('', '')
         self.process.return_value.returncode = 1
         with mock.patch.object(utils, 'LOG') as log:
-            self.assertRaises(RuntimeError, utils.execute,
+            self.assertRaises(exceptions.ProcessExecutionError, utils.execute,
                               ['ls'], log_fail_as_error=False)
             self.assertFalse(log.error.called)
 
+    def test_encode_process_input(self):
+        str_idata = "%s\n" % self.test_file[:-1]
+        str_odata = "%s\n" % self.test_file
+        bytes_idata = str_idata.encode(encoding='utf-8')
+        bytes_odata = str_odata.encode(encoding='utf-8')
+        self.mock_popen.return_value = [bytes_odata, b'']
+        result = utils.execute(['cat'], process_input=str_idata)
+        self.mock_popen.assert_called_once_with(bytes_idata)
+        self.assertEqual(str_odata, result)
 
-class AgentUtilsGetInterfaceMAC(base.BaseTestCase):
-    def test_get_interface_mac(self):
-        expect_val = '01:02:03:04:05:06'
-        with mock.patch('fcntl.ioctl') as ioctl:
-            ioctl.return_value = ''.join(['\x00' * 18,
-                                          '\x01\x02\x03\x04\x05\x06',
-                                          '\x00' * 232])
-            actual_val = utils.get_interface_mac('eth0')
-        self.assertEqual(actual_val, expect_val)
+    def test_return_str_data(self):
+        str_data = "%s\n" % self.test_file
+        self.mock_popen.return_value = [str_data, '']
+        result = utils.execute(['ls', self.test_file], return_stderr=True)
+        self.assertEqual((str_data, ''), result)
 
-
-class AgentUtilsReplaceFile(base.BaseTestCase):
-    def test_replace_file(self):
-        # make file to replace
-        with mock.patch('tempfile.NamedTemporaryFile') as ntf:
-            ntf.return_value.name = '/baz'
-            with mock.patch('os.chmod') as chmod:
-                with mock.patch('os.rename') as rename:
-                    utils.replace_file('/foo', 'bar')
-
-                    expected = [mock.call('w+', dir='/', delete=False),
-                                mock.call().write('bar'),
-                                mock.call().close()]
-
-                    ntf.assert_has_calls(expected)
-                    chmod.assert_called_once_with('/baz', 0o644)
-                    rename.assert_called_once_with('/baz', '/foo')
+    def test_surrogateescape_in_decoding_out_data(self):
+        bytes_err_data = b'\xed\xa0\xbd'
+        err_data = bytes_err_data.decode('utf-8', 'surrogateescape')
+        out_data = "%s\n" % self.test_file
+        bytes_out_data = out_data.encode(encoding='utf-8')
+        self.mock_popen.return_value = [bytes_out_data, bytes_err_data]
+        result = utils.execute(['ls', self.test_file], return_stderr=True)
+        self.assertEqual((out_data, err_data), result)
 
 
-class TestFindChildPids(base.BaseTestCase):
+class AgentUtilsExecuteEncodeTest(base.BaseTestCase):
+    def setUp(self):
+        super().setUp()
+        self.test_file = self.get_temp_file_path('test_execute.tmp')
+        open(self.test_file, 'w').close()
 
-    def test_returns_empty_list_for_exit_code_1(self):
+    def test_decode_return_data(self):
+        str_data = "%s\n" % self.test_file
+        result = utils.execute(['ls', self.test_file], return_stderr=True)
+        self.assertEqual((str_data, ''), result)
+
+
+class TestFindForkTopParent(base.BaseTestCase):
+    def _test_find_fork_top_parent(self, expected=_marker,
+                                   find_parent_pid_retvals=None,
+                                   pid_invoked_with_cmdline_retvals=None):
+        def _find_parent_pid(x):
+            if find_parent_pid_retvals:
+                return find_parent_pid_retvals.pop(0)
+
+        pid_invoked_with_cmdline = {}
+        if pid_invoked_with_cmdline_retvals:
+            pid_invoked_with_cmdline['side_effect'] = (
+                pid_invoked_with_cmdline_retvals)
+        else:
+            pid_invoked_with_cmdline['return_value'] = False
+        with mock.patch.object(utils, 'find_parent_pid',
+                               side_effect=_find_parent_pid), \
+                mock.patch.object(utils, 'pid_invoked_with_cmdline',
+                                  **pid_invoked_with_cmdline):
+            actual = utils.find_fork_top_parent(_marker)
+        self.assertEqual(expected, actual)
+
+    def test_returns_own_pid_no_parent(self):
+        self._test_find_fork_top_parent()
+
+    def test_returns_own_pid_nofork(self):
+        self._test_find_fork_top_parent(find_parent_pid_retvals=['2', '3'])
+
+    def test_returns_first_parent_pid_fork(self):
+        self._test_find_fork_top_parent(
+            expected='2',
+            find_parent_pid_retvals=['2', '3', '4'],
+            pid_invoked_with_cmdline_retvals=[True, False, False])
+
+    def test_returns_top_parent_pid_fork(self):
+        self._test_find_fork_top_parent(
+            expected='4',
+            find_parent_pid_retvals=['2', '3', '4'],
+            pid_invoked_with_cmdline_retvals=[True, True, True])
+
+
+class TestKillProcess(base.BaseTestCase):
+    def _test_kill_process(self, pid, raise_exception=False,
+                           kill_signal=signal.SIGKILL, pid_killed=True):
+        if raise_exception:
+            exc = exceptions.ProcessExecutionError('', returncode=0)
+        else:
+            exc = None
         with mock.patch.object(utils, 'execute',
-                               side_effect=RuntimeError('Exit code: 1')):
-            self.assertEqual(utils.find_child_pids(-1), [])
+                               side_effect=exc) as mock_execute:
+            with mock.patch.object(utils, 'process_is_running',
+                                   return_value=not pid_killed):
+                utils.kill_process(pid, kill_signal, run_as_root=True)
 
-    def test_returns_empty_list_for_no_output(self):
-        with mock.patch.object(utils, 'execute', return_value=''):
-            self.assertEqual(utils.find_child_pids(-1), [])
+        mock_execute.assert_called_with(['kill', '-%d' % kill_signal, pid],
+                                        run_as_root=True, privsep_exec=True)
 
-    def test_returns_list_of_child_process_ids_for_good_ouput(self):
-        with mock.patch.object(utils, 'execute', return_value=' 123 \n 185\n'):
-            self.assertEqual(utils.find_child_pids(-1), ['123', '185'])
+    def test_kill_process_returns_none_for_valid_pid(self):
+        self._test_kill_process('1')
 
-    def test_raises_unknown_exception(self):
-        with testtools.ExpectedException(RuntimeError):
-            with mock.patch.object(utils, 'execute',
-                                   side_effect=RuntimeError()):
-                utils.find_child_pids(-1)
+    def test_kill_process_returns_none_for_stale_pid(self):
+        self._test_kill_process('1', raise_exception=True)
+
+    def test_kill_process_raises_exception_for_execute_exception(self):
+        with testtools.ExpectedException(exceptions.ProcessExecutionError):
+            # Simulate that the process is running after trying to kill due to
+            # any reason such as, for example, Permission denied
+            self._test_kill_process('1', raise_exception=True,
+                                    pid_killed=False)
+
+    def test_kill_process_with_different_signal(self):
+        self._test_kill_process('1', kill_signal=signal.SIGTERM)
+
+
+class TestGetCmdlineFromPid(base.BaseTestCase):
+
+    def setUp(self):
+        super().setUp()
+        self.pid = 34
+        self.process_is_running_mock = mock.patch.object(
+            utils, "process_is_running").start()
+
+    def _test_cmdline(self, process, expected_cmd):
+        self.process_is_running_mock.return_value = True
+        mock_open = self.useFixture(
+            lib_fixtures.OpenFixture('/proc/%s/cmdline' % self.pid, process)
+        ).mock_open
+        cmdline = utils.get_cmdline_from_pid(self.pid)
+        mock_open.assert_called_once_with('/proc/%s/cmdline' % self.pid)
+        self.assertEqual(expected_cmd, cmdline)
+
+    def test_cmdline_separated_with_null_char(self):
+        process_cmd = "python3\0test-binary\0test option\0"
+        expected_cmdline = ["python3", "test-binary", "test option"]
+        self._test_cmdline(process_cmd, expected_cmdline)
+
+    def test_cmdline_separated_with_space_char(self):
+        process_cmd = "python3 test-binary test option\0"
+        expected_cmdline = ["python3", "test-binary", "test", "option"]
+        self._test_cmdline(process_cmd, expected_cmdline)
+
+    def test_cmdline_with_single_argument(self):
+        process_cmd = "test-binary\0"
+        expected_cmdline = ["test-binary"]
+        self._test_cmdline(process_cmd, expected_cmdline)
+
+    def test_no_process_running(self):
+        self.process_is_running_mock.return_value = False
+        mock_open = self.useFixture(
+            lib_fixtures.OpenFixture('/proc/%s/cmdline' % self.pid)
+        ).mock_open
+        cmdline = utils.get_cmdline_from_pid(self.pid)
+        mock_open.assert_not_called()
+        self.assertEqual([], cmdline)
+
+    def test_cmdline_process_disappearing(self):
+        self.process_is_running_mock.return_value = True
+        mock_open = self.useFixture(
+            lib_fixtures.OpenFixture('/proc/%s/cmdline' % self.pid, 'process')
+        ).mock_open
+        mock_open.side_effect = OSError()
+        cmdline = utils.get_cmdline_from_pid(self.pid)
+        mock_open.assert_called_once_with('/proc/%s/cmdline' % self.pid)
+        self.assertEqual([], cmdline)
 
 
 class TestGetRoothelperChildPid(base.BaseTestCase):
     def _test_get_root_helper_child_pid(self, expected=_marker,
-                                        run_as_root=False, pids=None):
+                                        run_as_root=False, pids=None,
+                                        cmds=None):
         def _find_child_pids(x):
             if not pids:
                 return []
@@ -169,9 +321,17 @@ class TestGetRoothelperChildPid(base.BaseTestCase):
             return pids
 
         mock_pid = object()
+        pid_invoked_with_cmdline = {}
+        if cmds:
+            pid_invoked_with_cmdline['side_effect'] = cmds
+        else:
+            pid_invoked_with_cmdline['return_value'] = False
         with mock.patch.object(utils, 'find_child_pids',
-                               side_effect=_find_child_pids):
-            actual = utils.get_root_helper_child_pid(mock_pid, run_as_root)
+                               side_effect=_find_child_pids), \
+                mock.patch.object(utils, 'pid_invoked_with_cmdline',
+                                  **pid_invoked_with_cmdline):
+            actual = utils.get_root_helper_child_pid(
+                mock_pid, mock.ANY, run_as_root)
         if expected is _marker:
             expected = str(mock_pid)
         self.assertEqual(expected, actual)
@@ -181,12 +341,21 @@ class TestGetRoothelperChildPid(base.BaseTestCase):
 
     def test_returns_child_pid_as_root(self):
         self._test_get_root_helper_child_pid(expected='2', pids=['1', '2'],
-                                             run_as_root=True)
+                                             run_as_root=True,
+                                             cmds=[True])
 
     def test_returns_last_child_pid_as_root(self):
         self._test_get_root_helper_child_pid(expected='3',
                                              pids=['1', '2', '3'],
-                                             run_as_root=True)
+                                             run_as_root=True,
+                                             cmds=[False, True])
+
+    def test_returns_first_non_root_helper_child(self):
+        self._test_get_root_helper_child_pid(
+                expected='2',
+                pids=['1', '2', '3'],
+                run_as_root=True,
+                cmds=[True, False])
 
     def test_returns_none_as_root(self):
         self._test_get_root_helper_child_pid(expected=None, run_as_root=True)
@@ -199,22 +368,37 @@ class TestPathUtilities(base.BaseTestCase):
 
     def test_cmd_matches_expected_matches_abs_path(self):
         cmd = ['/bar/../foo']
-        self.assertTrue(utils.cmd_matches_expected(cmd, cmd))
+        self.assertTrue(utils.cmd_matches_expected(cmd, cmd, None))
 
     def test_cmd_matches_expected_matches_script(self):
         self.assertTrue(utils.cmd_matches_expected(['python', 'script'],
-                                                   ['script']))
+                                                   ['script'], None))
 
     def test_cmd_matches_expected_doesnt_match(self):
-        self.assertFalse(utils.cmd_matches_expected('foo', 'bar'))
+        self.assertFalse(utils.cmd_matches_expected('foo', 'bar', None))
+
+    def test_cmd_matches_expected_matches_script_with_procname(self):
+        self.assertTrue(utils.cmd_matches_expected(
+            ['proc_name', '(python', 'script)'], ['script'], 'proc_name'))
+
+    def test_cmd_matches_expected_matches_abs_path_script_with_procname(self):
+        self.assertTrue(utils.cmd_matches_expected(
+            ['proc_name', '(python', '/bar/../foo)'], ['/bar/../foo'],
+            'proc_name'))
+        self.assertTrue(utils.cmd_matches_expected(
+            ['proc_name', '(python', '/bar/../foo', 'input_param)'],
+            ['/bar/../foo', 'input_param'], 'proc_name'))
+        self.assertTrue(utils.cmd_matches_expected(
+            ['proc_name', '(/bar/../foo', 'input_param)'],
+            ['/bar/../foo', 'input_param'], 'proc_name'))
 
 
-class FakeUser(object):
+class FakeUser:
     def __init__(self, name):
         self.pw_name = name
 
 
-class FakeGroup(object):
+class FakeGroup:
     def __init__(self, name):
         self.gr_name = name
 
@@ -282,18 +466,6 @@ class TestBaseOSUtils(base.BaseTestCase):
         getegid.assert_called_once_with()
         getgrgid.assert_called_once_with(self.EGID)
 
-    @mock.patch('os.makedirs')
-    def test_ensure_dir_no_fail_if_exists(self, makedirs):
-        error = OSError()
-        error.errno = errno.EEXIST
-        makedirs.side_effect = error
-        utils.ensure_dir("/etc/create/concurrently")
-
-    @mock.patch('os.makedirs')
-    def test_ensure_dir_calls_makedirs(self, makedirs):
-        utils.ensure_dir("/etc/create/directory")
-        makedirs.assert_called_once_with("/etc/create/directory", 0o755)
-
 
 class TestUnixDomainHttpConnection(base.BaseTestCase):
     def test_connect(self):
@@ -310,45 +482,3 @@ class TestUnixDomainHttpConnection(base.BaseTestCase):
                     mock.call().connect('/the/path')]
                 )
                 self.assertEqual(conn.timeout, 3)
-
-
-class TestUnixDomainHttpProtocol(base.BaseTestCase):
-    def test_init_empty_client(self):
-        u = utils.UnixDomainHttpProtocol(mock.Mock(), '', mock.Mock())
-        self.assertEqual(u.client_address, ('<local>', 0))
-
-    def test_init_with_client(self):
-        u = utils.UnixDomainHttpProtocol(mock.Mock(), 'foo', mock.Mock())
-        self.assertEqual(u.client_address, 'foo')
-
-
-class TestUnixDomainWSGIServer(base.BaseTestCase):
-    def setUp(self):
-        super(TestUnixDomainWSGIServer, self).setUp()
-        self.eventlet_p = mock.patch.object(utils, 'eventlet')
-        self.eventlet = self.eventlet_p.start()
-        self.server = utils.UnixDomainWSGIServer('test')
-
-    def test_start(self):
-        mock_app = mock.Mock()
-        with mock.patch.object(self.server, '_launch') as launcher:
-            self.server.start(mock_app, '/the/path', workers=5, backlog=128)
-            self.eventlet.assert_has_calls([
-                mock.call.listen(
-                    '/the/path',
-                    family=socket.AF_UNIX,
-                    backlog=128
-                )]
-            )
-            launcher.assert_called_once_with(mock_app, workers=5)
-
-    def test_run(self):
-        self.server._run('app', 'sock')
-
-        self.eventlet.wsgi.server.assert_called_once_with(
-            'sock',
-            'app',
-            protocol=utils.UnixDomainHttpProtocol,
-            log=mock.ANY,
-            max_size=self.server.num_threads
-        )

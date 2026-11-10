@@ -39,27 +39,8 @@ def upgrade():
                   nullable=False, server_default='normal'),
         sa.Column('profile', sa.String(length=4095),
                   nullable=False, server_default=''),
-        sa.Column('cap_port_filter', sa.Boolean(), nullable=False),
-        sa.Column('driver', sa.String(length=64), nullable=True),
-        sa.Column('segment', sa.String(length=36), nullable=True),
-        sa.Column(u'status', sa.String(16), nullable=False),
+        sa.Column('status', sa.String(16), nullable=False),
         sa.ForeignKeyConstraint(['port_id'], ['ports.id'],
                                 ondelete='CASCADE'),
-        sa.ForeignKeyConstraint(['segment'], ['ml2_network_segments.id'],
-                                ondelete='SET NULL'),
         sa.PrimaryKeyConstraint('port_id', 'host')
-    )
-    op.create_table(
-        'csnat_l3_agent_bindings',
-        sa.Column('router_id', sa.String(length=36), nullable=False),
-        sa.Column('l3_agent_id', sa.String(length=36), nullable=False),
-        sa.Column('host_id', sa.String(length=255), nullable=True),
-        sa.Column('csnat_gw_port_id', sa.String(length=36), nullable=True),
-        sa.ForeignKeyConstraint(['l3_agent_id'], ['agents.id'],
-                                ondelete='CASCADE'),
-        sa.ForeignKeyConstraint(['router_id'], ['routers.id'],
-                                ondelete='CASCADE'),
-        sa.ForeignKeyConstraint(['csnat_gw_port_id'], ['ports.id'],
-                                ondelete='CASCADE'),
-        sa.PrimaryKeyConstraint('router_id')
     )

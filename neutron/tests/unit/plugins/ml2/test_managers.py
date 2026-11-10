@@ -1,0 +1,536 @@
+# Copyright (c) 2016 IBM Corp.
+#
+# All Rights Reserved.
+#
+#    Licensed under the Apache License, Version 2.0 (the "License"); you may
+#    not use this file except in compliance with the License. You may obtain
+#    a copy of the License at
+#
+#         http://www.apache.org/licenses/LICENSE-2.0
+#
+#    Unless required by applicable law or agreed to in writing, software
+#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+#    License for the specific language governing permissions and limitations
+#    under the License.
+
+from unittest import mock
+
+from neutron_lib.api.definitions import portbindings
+from neutron_lib.api.definitions import provider_net as provider
+from neutron_lib import exceptions as exc
+from neutron_lib.exceptions import placement as place_exc
+from neutron_lib.exceptions import vlanqinq as qinq_exc
+from neutron_lib.exceptions import vlantransparent as vlan_exc
+from neutron_lib.plugins.ml2 import api
+from oslo_config import cfg
+from oslo_db import exception as db_exc
+from oslo_utils import uuidutils
+
+from neutron.db import segments_db
+from neutron.plugins.ml2.common import exceptions as ml2_exc
+from neutron.plugins.ml2 import managers
+from neutron.tests import base
+from neutron.tests.unit.plugins.ml2._test_mech_agent import FakePortContext
+from neutron.tests.unit.plugins.ml2.drivers import mech_fake_agent
+from neutron.tests.unit.plugins.ml2.drivers import mechanism_test
+
+
+class TestManagers(base.BaseTestCase):
+    def setUp(self):
+        super().setUp()
+        self.segment_id = "11111111-2222-3333-4444-555555555555"
+        self.segments_to_bind = [{api.ID: self.segment_id,
+                                  'network_type': 'vlan',
+                                  'physical_network': 'public',
+                                  api.SEGMENTATION_ID: 49}]
+        original_port = {'fixed_ips': [{'subnet_id': mock.ANY,
+                                        'ip_address': mock.ANY}]}
+        self.context = FakePortContext(None, None, self.segments_to_bind,
+                                       original=original_port)
+        self.context._binding = mock.Mock()
+        self.context._binding_levels = []
+        self.context._new_bound_segment = self.segment_id
+        self.context._next_segments_to_bind = None
+
+    def test__check_driver_to_bind(self):
+        cfg.CONF.set_override('mechanism_drivers', ['fake_agent'],
+                              group='ml2')
+        manager = managers.MechanismManager()
+
+        with mock.patch.object(mech_fake_agent.FakeAgentMechanismDriver,
+                               'bind_port') as bind_port:
+            manager._bind_port_level(self.context, 0, self.segments_to_bind)
+        self.assertEqual(1, bind_port.call_count)
+
+    def test__check_driver_to_bind2(self):
+        cfg.CONF.set_override('mechanism_drivers', ['fake_agent'],
+                              group='ml2')
+        manager = managers.MechanismManager()
+        self.context._binding_levels = [mock.Mock(port_id="port_id",
+                                                  level=0,
+                                                  driver='fake_agent',
+                                                  segment_id=self.segment_id)]
+
+        with mock.patch.object(mech_fake_agent.FakeAgentMechanismDriver,
+                               'bind_port') as bind_port:
+            manager._bind_port_level(self.context, 0, self.segments_to_bind)
+        self.assertEqual(0, bind_port.call_count)
+
+    def test__bind_port_level_port_binding_error_is_raised(self):
+        cfg.CONF.set_override('mechanism_drivers', ['fake_agent'],
+                              group='ml2')
+        manager = managers.MechanismManager()
+
+        with mock.patch.object(
+                mech_fake_agent.FakeAgentMechanismDriver,
+                'bind_port',
+                side_effect=exc.PortBindingError(
+                    port_id=self.context.current['id'],
+                    host=self.context.host)):
+            self.assertRaises(
+                exc.PortBindingError,
+                manager._bind_port_level,
+                self.context, 0, self.segments_to_bind)
+
+    def test_bind_port_port_binding_error_stops_drivers(self):
+        cfg.CONF.set_override(
+            'mechanism_drivers',
+            ['fake_agent', 'another_fake_agent'],
+            group='ml2')
+        manager = managers.MechanismManager()
+        self.context._clear_binding_levels = mock.Mock(
+            side_effect=self.context._binding_levels.clear)
+        self.context._unset_binding = mock.Mock()
+        self.context._binding.vnic_type = portbindings.VNIC_NORMAL
+
+        with mock.patch.object(
+                mech_fake_agent.FakeAgentMechanismDriver,
+                'bind_port',
+                side_effect=exc.PortBindingError(
+                    port_id=self.context.current['id'],
+                    host=self.context.host)) as first_bind, \
+                mock.patch.object(
+                    mech_fake_agent
+                    .AnotherFakeAgentMechanismDriver,
+                    'bind_port') as second_bind:
+            manager.bind_port(self.context)
+        first_bind.assert_called_once_with(self.context)
+        second_bind.assert_not_called()
+        self.assertEqual(2, self.context._clear_binding_levels.call_count)
+        self.context._unset_binding.assert_called_once_with()
+        self.assertEqual(portbindings.VIF_TYPE_BINDING_FAILED,
+                         self.context._binding.vif_type)
+
+    def test_bind_port_port_binding_error_aborts_hierarchical_binding(self):
+        cfg.CONF.set_override(
+            'mechanism_drivers',
+            ['fake_agent', 'another_fake_agent'],
+            group='ml2')
+        manager = managers.MechanismManager()
+        self.context._clear_binding_levels = mock.Mock(
+            side_effect=self.context._binding_levels.clear)
+        self.context._unset_binding = mock.Mock()
+        self.context._binding.vnic_type = portbindings.VNIC_NORMAL
+        next_segment = dict(self.segments_to_bind[0])
+        next_segment[api.ID] = uuidutils.generate_uuid()
+
+        def continue_binding(context):
+            context._new_bound_segment = self.segment_id
+            context._next_segments_to_bind = [next_segment]
+
+        def make_binding_level(**kwargs):
+            return mock.Mock(**kwargs)
+
+        with mock.patch.object(
+                mech_fake_agent.FakeAgentMechanismDriver,
+                'bind_port', side_effect=continue_binding) as outer_bind, \
+                mock.patch.object(
+                    mech_fake_agent.AnotherFakeAgentMechanismDriver,
+                    'bind_port',
+                    side_effect=exc.PortBindingError(
+                        port_id=self.context.current['id'],
+                        host=self.context.host)) as inner_bind, \
+                mock.patch.object(
+                    managers.ports,
+                    'PortBindingLevel',
+                    side_effect=make_binding_level):
+            manager.bind_port(self.context)
+
+        outer_bind.assert_called_once_with(self.context)
+        inner_bind.assert_called_once_with(self.context)
+        self.assertEqual([], self.context._binding_levels)
+        self.context._unset_binding.assert_called_once_with()
+        self.assertEqual(portbindings.VIF_TYPE_BINDING_FAILED,
+                         self.context._binding.vif_type)
+
+    def test__bind_port_level_generic_exception_continues(self):
+        cfg.CONF.set_override(
+            'mechanism_drivers',
+            ['fake_agent', 'another_fake_agent'],
+            group='ml2')
+        manager = managers.MechanismManager()
+
+        with mock.patch.object(
+                mech_fake_agent.FakeAgentMechanismDriver,
+                'bind_port',
+                side_effect=RuntimeError('generic')) as first_bind, \
+                mock.patch.object(
+                    mech_fake_agent
+                    .AnotherFakeAgentMechanismDriver,
+                    'bind_port') as second_bind:
+            manager._bind_port_level(
+                self.context, 0, self.segments_to_bind)
+        self.assertEqual(1, first_bind.call_count)
+        self.assertEqual(1, second_bind.call_count)
+
+    def _check_drivers_connectivity(self, agents):
+        cfg.CONF.set_override('mechanism_drivers', agents, group='ml2')
+        manager = managers.MechanismManager()
+        return (manager.ordered_mech_drivers,
+                manager._check_drivers_connectivity(
+                    manager.ordered_mech_drivers, self.context))
+
+    def test__check_drivers_connectivity(self):
+        self.assertEqual(*self._check_drivers_connectivity(['fake_agent']))
+
+    def test__check_drivers_connectivity_ip_less_port(self):
+        self.context._original['fixed_ips'] = []
+        self.assertEqual(*self._check_drivers_connectivity(['fake_agent']))
+
+    def test__check_drivers_connectivity_ip_less_port_l3_only_driver(self):
+        self.context._original['fixed_ips'] = []
+        self.assertEqual(
+            [],
+            self._check_drivers_connectivity(['fake_agent_l3'])[1])
+
+    def test__infer_driver_from_allocation_positive(self):
+        cfg.CONF.set_override(
+            'mechanism_drivers', ['fake_agent'], group='ml2')
+        manager = managers.MechanismManager()
+        with mock.patch.object(mech_fake_agent.FakeAgentMechanismDriver,
+                               'responsible_for_ports_allocation',
+                               return_value=True):
+            responsible_driver = manager._infer_driver_from_allocation(
+                FakePortContext(
+                    None,
+                    None,
+                    self.segments_to_bind,
+                    profile={'allocation': 'fake_resource_provider'}))
+            self.assertEqual(responsible_driver.name, 'fake_agent')
+
+    def test__infer_driver_from_allocation_negative(self):
+        cfg.CONF.set_override(
+            'mechanism_drivers', ['fake_agent'], group='ml2')
+        manager = managers.MechanismManager()
+        with mock.patch.object(mech_fake_agent.FakeAgentMechanismDriver,
+                               'responsible_for_ports_allocation',
+                               return_value=False):
+            self.assertRaises(
+                place_exc.UnknownResourceProvider,
+                manager._infer_driver_from_allocation,
+                FakePortContext(
+                    None,
+                    None,
+                    self.segments_to_bind,
+                    profile={'allocation':
+                             {'fake_uuid': 'fake_resource_provider'}})
+            )
+
+    def test__infer_driver_from_allocation_ambiguous(self):
+        cfg.CONF.set_override(
+            'mechanism_drivers',
+            ['fake_agent', 'another_fake_agent'],
+            group='ml2')
+        manager = managers.MechanismManager()
+        with mock.patch.object(mech_fake_agent.FakeAgentMechanismDriver,
+                               'responsible_for_ports_allocation',
+                               return_value=True), \
+            mock.patch.object(mech_fake_agent.AnotherFakeAgentMechanismDriver,
+                              'responsible_for_ports_allocation',
+                              return_value=True):
+            self.assertRaises(
+                place_exc.AmbiguousResponsibilityForResourceProvider,
+                manager._infer_driver_from_allocation,
+                FakePortContext(
+                    None,
+                    None,
+                    self.segments_to_bind,
+                    profile={'allocation':
+                             {'fake_uuid': 'fake_resource_provider'}})
+            )
+
+    @mock.patch.object(managers.LOG, 'critical')
+    @mock.patch.object(managers.MechanismManager, '_driver_not_loaded')
+    def test__driver_not_found(self, mock_not_loaded, mock_log):
+        cfg.CONF.set_override('mechanism_drivers', ['invalidmech'],
+                              group='ml2')
+        self.assertRaises(SystemExit, managers.MechanismManager)
+        mock_not_loaded.assert_not_called()
+        mock_log.assert_called_once_with("The following mechanism drivers "
+                                         "were not found: %s"
+                                         % {'invalidmech'})
+
+    @mock.patch.object(managers.LOG, 'critical')
+    @mock.patch.object(managers.MechanismManager, '_driver_not_found')
+    def test__driver_not_loaded(self, mock_not_found, mock_log):
+        cfg.CONF.set_override('mechanism_drivers', ['faulty_agent'],
+                              group='ml2')
+        self.assertRaises(SystemExit, managers.MechanismManager)
+        mock_log.assert_called_once_with("The '%(entrypoint)s' entrypoint "
+                                         "could not be loaded for the "
+                                         "following reason: '%(reason)s'.",
+                                         {'entrypoint': mock.ANY,
+                                          'reason': mock.ANY})
+
+
+class TestMechManager(base.BaseTestCase):
+    def setUp(self):
+        cfg.CONF.set_override('mechanism_drivers', ['test'], group='ml2')
+        super().setUp()
+        self._manager = managers.MechanismManager()
+
+    def _check_precommit(self, resource, operation):
+        meth_name = f"{operation}_{resource}_precommit"
+        method = getattr(self._manager, meth_name)
+        fake_ctxt = mock.Mock()
+        fake_ctxt.current = {}
+
+        with mock.patch.object(mechanism_test.TestMechanismDriver, meth_name,
+                               side_effect=db_exc.DBDeadlock()):
+            self.assertRaises(db_exc.DBDeadlock, method, fake_ctxt)
+
+        with mock.patch.object(mechanism_test.TestMechanismDriver, meth_name,
+                               side_effect=RuntimeError()):
+            self.assertRaises(ml2_exc.MechanismDriverError, method, fake_ctxt)
+
+    def _check_resource(self, resource):
+        self._check_precommit(resource, 'create')
+        self._check_precommit(resource, 'update')
+        self._check_precommit(resource, 'delete')
+
+    def test_network_precommit(self):
+        self._check_resource('network')
+
+    def test_subnet_precommit(self):
+        self._check_resource('subnet')
+
+    def test_port_precommit(self):
+        self._check_resource('port')
+
+    def _make_driver_mock(self, name):
+        driver = mock.Mock()
+        driver.name = name
+        return driver
+
+    def _set_two_drivers(self):
+        self.driver_a = self._make_driver_mock('driver_a')
+        self.driver_b = self._make_driver_mock('driver_b')
+        self._manager.ordered_mech_drivers = [self.driver_a, self.driver_b]
+
+    def test_delete_port_precommit_reverse_order(self):
+        """delete_port_precommit must notify drivers in reverse order."""
+        self._set_two_drivers()
+        call_order = []
+        self.driver_a.obj.delete_port_precommit.side_effect = (
+            lambda ctx: call_order.append('a'))
+        self.driver_b.obj.delete_port_precommit.side_effect = (
+            lambda ctx: call_order.append('b'))
+
+        self._manager.delete_port_precommit(mock.Mock())
+
+        self.assertEqual(['b', 'a'], call_order)
+
+    def test_delete_port_postcommit_reverse_order(self):
+        """delete_port_postcommit must notify in reverse order."""
+        self._set_two_drivers()
+        call_order = []
+        self.driver_a.obj.delete_port_postcommit.side_effect = (
+            lambda ctx: call_order.append('a'))
+        self.driver_b.obj.delete_port_postcommit.side_effect = (
+            lambda ctx: call_order.append('b'))
+
+        self._manager.delete_port_postcommit(mock.Mock())
+
+        self.assertEqual(['b', 'a'], call_order)
+
+    def test_create_port_postcommit_forward_order(self):
+        """create_port_postcommit must notify drivers in forward order."""
+        self._set_two_drivers()
+        call_order = []
+        self.driver_a.obj.create_port_postcommit.side_effect = (
+            lambda ctx: call_order.append('a'))
+        self.driver_b.obj.create_port_postcommit.side_effect = (
+            lambda ctx: call_order.append('b'))
+
+        self._manager.create_port_postcommit(mock.Mock())
+
+        self.assertEqual(['a', 'b'], call_order)
+
+
+class TestMechDriverTriStateChecks(base.BaseTestCase):
+    """Unit tests for vlan_transparent / qinq mechanism-driver aggregation."""
+
+    def setUp(self):
+        super().setUp()
+        cfg.CONF.set_override('mechanism_drivers', ['test'], group='ml2')
+        self.manager = managers.MechanismManager()
+
+    def _ordered_exts(self, method_name, return_values):
+        exts = []
+        for ret in return_values:
+            obj = mock.Mock()
+            getattr(obj, method_name).return_value = ret
+            exts.append(mock.Mock(obj=obj))
+        return exts
+
+    def test_vlan_transparency_disabled_noop(self):
+        self.manager.ordered_mech_drivers = self._ordered_exts(
+            'check_vlan_transparency', [False])
+        ctx = mock.Mock(current={'vlan_transparent': False})
+        self.manager._check_vlan_transparency(ctx)
+
+    def test_vlan_transparency_no_mech_drivers_legacy_noop(self):
+        self.manager.ordered_mech_drivers = []
+        ctx = mock.Mock(current={'vlan_transparent': True})
+        self.manager._check_vlan_transparency(ctx)
+
+    def test_vlan_transparency_all_abstain_raises(self):
+        self.manager.ordered_mech_drivers = self._ordered_exts(
+            'check_vlan_transparency', [None, None])
+        ctx = mock.Mock(current={'vlan_transparent': True})
+        self.assertRaises(
+            vlan_exc.VlanTransparencyDriverError,
+            self.manager._check_vlan_transparency, ctx)
+
+    def test_vlan_transparency_explicit_false_raises(self):
+        self.manager.ordered_mech_drivers = self._ordered_exts(
+            'check_vlan_transparency', [True, False])
+        ctx = mock.Mock(current={'vlan_transparent': True})
+        self.assertRaises(
+            vlan_exc.VlanTransparencyDriverError,
+            self.manager._check_vlan_transparency, ctx)
+
+    def test_vlan_transparency_one_true_ok(self):
+        self.manager.ordered_mech_drivers = self._ordered_exts(
+            'check_vlan_transparency', [True])
+        ctx = mock.Mock(current={'vlan_transparent': True})
+        self.manager._check_vlan_transparency(ctx)
+
+    def test_vlan_transparency_mixed_abstain_and_true_ok(self):
+        self.manager.ordered_mech_drivers = self._ordered_exts(
+            'check_vlan_transparency', [None, True])
+        ctx = mock.Mock(current={'vlan_transparent': True})
+        self.manager._check_vlan_transparency(ctx)
+
+    def test_qinq_disabled_noop(self):
+        self.manager.ordered_mech_drivers = self._ordered_exts(
+            'check_vlan_qinq', [False])
+        ctx = mock.Mock(current={'qinq': False})
+        self.manager._check_vlan_qinq(ctx)
+
+    def test_qinq_no_mech_drivers_legacy_noop(self):
+        self.manager.ordered_mech_drivers = []
+        ctx = mock.Mock(current={'qinq': True})
+        self.manager._check_vlan_qinq(ctx)
+
+    def test_qinq_all_abstain_raises(self):
+        self.manager.ordered_mech_drivers = self._ordered_exts(
+            'check_vlan_qinq', [None])
+        ctx = mock.Mock(current={'qinq': True})
+        self.assertRaises(
+            qinq_exc.VlanQinqDriverError,
+            self.manager._check_vlan_qinq, ctx)
+
+    def test_qinq_explicit_false_raises(self):
+        self.manager.ordered_mech_drivers = self._ordered_exts(
+            'check_vlan_qinq', [True, False])
+        ctx = mock.Mock(current={'qinq': True})
+        self.assertRaises(
+            qinq_exc.VlanQinqDriverError,
+            self.manager._check_vlan_qinq, ctx)
+
+    def test_qinq_one_true_ok(self):
+        self.manager.ordered_mech_drivers = self._ordered_exts(
+            'check_vlan_qinq', [True])
+        ctx = mock.Mock(current={'qinq': True})
+        self.manager._check_vlan_qinq(ctx)
+
+    def test_qinq_mixed_abstain_and_true_ok(self):
+        self.manager.ordered_mech_drivers = self._ordered_exts(
+            'check_vlan_qinq', [None, True])
+        ctx = mock.Mock(current={'qinq': True})
+        self.manager._check_vlan_qinq(ctx)
+
+
+class TypeManagerTestCase(base.BaseTestCase):
+
+    def setUp(self):
+        super().setUp()
+        self.type_manager = managers.TypeManager()
+        self.ctx = mock.Mock()
+        self.network = {'id': uuidutils.generate_uuid(),
+                        'project_id': uuidutils.generate_uuid()}
+
+    def test_update_network_segment_no_vlan_no_segmentation_id(self):
+        net_data = {}
+        segment = {api.NETWORK_TYPE: 'vlan'}
+        self.assertRaises(
+            exc.InvalidInput, self.type_manager.update_network_segment,
+            self.ctx, self.network, net_data, segment)
+
+        net_data = {provider.SEGMENTATION_ID: 1000}
+        segment = {api.NETWORK_TYPE: 'no_vlan'}
+        self.assertRaises(
+            exc.InvalidInput, self.type_manager.update_network_segment,
+            self.ctx, self.network, net_data, segment)
+
+    def test_update_network_segment(self):
+        segmentation_id = 1000
+        net_data = {provider.SEGMENTATION_ID: segmentation_id}
+        segment = {'id': uuidutils.generate_uuid(),
+                   api.NETWORK_TYPE: 'vlan',
+                   api.PHYSICAL_NETWORK: 'default_network'}
+        new_segment = {api.NETWORK_TYPE: 'vlan',
+                       api.PHYSICAL_NETWORK: 'default_network',
+                       api.SEGMENTATION_ID: segmentation_id}
+        with mock.patch.object(self.type_manager,
+                               'validate_provider_segment') as mock_validate, \
+                mock.patch.object(self.type_manager,
+                                  'reserve_provider_segment') as mock_reserve,\
+                mock.patch.object(self.type_manager,
+                                  'release_network_segment') as mock_release, \
+                mock.patch.object(segments_db, 'update_network_segment') as \
+                mock_update_network_segment:
+            self.type_manager.update_network_segment(self.ctx, self.network,
+                                                     net_data, segment)
+            mock_validate.assert_called_once_with(new_segment)
+            mock_reserve.assert_called_once_with(
+                self.ctx, new_segment,
+                filters={'project_id': self.network['project_id']})
+            mock_update_network_segment.assert_called_once_with(
+                self.ctx, segment['id'], segmentation_id)
+            mock_release.assert_called_once_with(self.ctx, segment)
+
+    def test_register_types_rejects_old_type_driver(self):
+        old_driver = mock.Mock(spec=api.TypeDriver)
+        old_driver.get_type.return_value = 'fake'
+        ext = mock.Mock()
+        ext.obj = old_driver
+        ext.name = 'fake_old_driver'
+        with mock.patch.object(managers.TypeManager, '__iter__',
+                               return_value=iter([ext])):
+            self.assertRaises(exc.Invalid,
+                              self.type_manager._register_types)
+
+    def test_register_types_accepts_ml2_type_driver(self):
+        ml2_driver = mock.Mock(spec=api.ML2TypeDriver)
+        ml2_driver.get_type.return_value = 'fake'
+        ext = mock.Mock()
+        ext.obj = ml2_driver
+        ext.name = 'fake_ml2_driver'
+        self.type_manager.drivers = {}
+        with mock.patch.object(managers.TypeManager, '__iter__',
+                               return_value=iter([ext])):
+            self.type_manager._register_types()
+        self.assertIn('fake', self.type_manager.drivers)

@@ -13,27 +13,39 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from neutron.common import constants as const
-from neutron.extensions import portbindings
-from neutron.plugins.ml2 import driver_api as api
+import uuid
+
+from neutron_lib.api.definitions import portbindings
+from neutron_lib.api.definitions import provider_net as pnet
+from neutron_lib import constants as const
+from neutron_lib.plugins.ml2 import api
+
+from neutron.plugins.ml2.drivers import mech_agent
+
+
+VIF_TYPE_TEST = 'vif_type_test'
 
 
 class TestMechanismDriver(api.MechanismDriver):
     """Test mechanism driver for testing mechanism driver api."""
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._supported_vnic_types = ('test_mechanism_driver_vnic_type', )
+        self._supported_extensions = set()
+
     def initialize(self):
         self.bound_ports = set()
 
     def _check_network_context(self, context, original_expected):
-        assert(isinstance(context, api.NetworkContext))
-        assert(isinstance(context.current, dict))
-        assert(context.current['id'] is not None)
+        assert isinstance(context, api.NetworkContext)
+        assert isinstance(context.current, dict)
+        assert context.current['id'] is not None
         if original_expected:
-            assert(isinstance(context.original, dict))
-            assert(context.current['id'] == context.original['id'])
+            assert isinstance(context.original, dict)
+            assert context.current['id'] == context.original['id']
         else:
-            assert(not context.original)
-        assert(context.network_segments)
+            assert not context.original
 
     def create_network_precommit(self, context):
         self._check_network_context(context, False)
@@ -54,14 +66,17 @@ class TestMechanismDriver(api.MechanismDriver):
         self._check_network_context(context, False)
 
     def _check_subnet_context(self, context, original_expected):
-        assert(isinstance(context, api.SubnetContext))
-        assert(isinstance(context.current, dict))
-        assert(context.current['id'] is not None)
+        assert isinstance(context, api.SubnetContext)
+        assert isinstance(context.current, dict)
+        assert context.current['id'] is not None
         if original_expected:
-            assert(isinstance(context.original, dict))
-            assert(context.current['id'] == context.original['id'])
+            assert isinstance(context.original, dict)
+            assert context.current['id'] == context.original['id']
         else:
-            assert(not context.original)
+            assert not context.original
+        network_context = context.network
+        assert isinstance(network_context, api.NetworkContext)
+        self._check_network_context(network_context, False)
 
     def create_subnet_precommit(self, context):
         self._check_subnet_context(context, False)
@@ -82,15 +97,16 @@ class TestMechanismDriver(api.MechanismDriver):
         self._check_subnet_context(context, False)
 
     def _check_port_context(self, context, original_expected):
-        assert(isinstance(context, api.PortContext))
+        assert isinstance(context, api.PortContext)
 
         self._check_port_info(context.current, context.host,
-                              context.vif_type, context.vif_details)
+                              context.vif_type, context.vif_details,
+                              context.binding_levels)
 
         if context.vif_type in (portbindings.VIF_TYPE_UNBOUND,
                                 portbindings.VIF_TYPE_BINDING_FAILED):
             if (context.segments_to_bind and
-                context.segments_to_bind[0][api.NETWORK_TYPE] == 'vlan'):
+                    context.segments_to_bind[0][api.NETWORK_TYPE] == 'vlan'):
                 # Partially bound.
                 self._check_bound(context.binding_levels,
                                   context.top_bound_segment,
@@ -99,20 +115,21 @@ class TestMechanismDriver(api.MechanismDriver):
                 self._check_unbound(context.binding_levels,
                                     context.top_bound_segment,
                                     context.bottom_bound_segment)
-            assert((context.current['id'], context.host)
-                   not in self.bound_ports)
+            assert ((context.current['id'], context.host) not in
+                    self.bound_ports)
         else:
             self._check_bound(context.binding_levels,
                               context.top_bound_segment,
                               context.bottom_bound_segment)
-            assert((context.current['id'], context.host) in self.bound_ports)
+            assert (context.current['id'], context.host) in self.bound_ports
 
         if original_expected:
             self._check_port_info(context.original, context.original_host,
                                   context.original_vif_type,
-                                  context.original_vif_details)
+                                  context.original_vif_details,
+                                  context.binding_levels)
 
-            assert(context.current['id'] == context.original['id'])
+            assert context.current['id'] == context.original['id']
 
             if (context.original_vif_type in
                 (portbindings.VIF_TYPE_UNBOUND,
@@ -125,57 +142,65 @@ class TestMechanismDriver(api.MechanismDriver):
                                   context.original_top_bound_segment,
                                   context.original_bottom_bound_segment)
         else:
-            assert(context.original is None)
-            assert(context.original_host is None)
-            assert(context.original_vif_type is None)
-            assert(context.original_vif_details is None)
-            assert(context.original_status is None)
+            assert context.original is None
+            assert context.original_host is None
+            assert context.original_vif_type is None
+            assert context.original_vif_details is None
+            assert context.original_status is None
             self._check_unbound(context.original_binding_levels,
                                 context.original_top_bound_segment,
                                 context.original_bottom_bound_segment)
 
         network_context = context.network
-        assert(isinstance(network_context, api.NetworkContext))
+        assert isinstance(network_context, api.NetworkContext)
         self._check_network_context(network_context, False)
 
-    def _check_port_info(self, port, host, vif_type, vif_details):
-        assert(isinstance(port, dict))
-        assert(port['id'] is not None)
-        assert(vif_type in (portbindings.VIF_TYPE_UNBOUND,
+    def _check_port_info(self, port, host, vif_type, vif_details,
+                         binding_levels):
+        assert isinstance(port, dict)
+        assert port['id'] is not None
+        assert vif_type in (portbindings.VIF_TYPE_UNBOUND,
                             portbindings.VIF_TYPE_BINDING_FAILED,
                             portbindings.VIF_TYPE_DISTRIBUTED,
                             portbindings.VIF_TYPE_OVS,
-                            portbindings.VIF_TYPE_BRIDGE))
+                            portbindings.VIF_TYPE_BRIDGE)
+        bound_drivers = port[portbindings.VIF_DETAILS].pop(
+            portbindings.VIF_DETAILS_BOUND_DRIVERS, None)
         if port['device_owner'] == const.DEVICE_OWNER_DVR_INTERFACE:
-            assert(port[portbindings.HOST_ID] == '')
-            assert(port[portbindings.VIF_TYPE] ==
-                   portbindings.VIF_TYPE_DISTRIBUTED)
-            assert(port[portbindings.VIF_DETAILS] == {})
+            assert port[portbindings.HOST_ID] == ''
+            assert (port[portbindings.VIF_TYPE] ==
+                    portbindings.VIF_TYPE_DISTRIBUTED)
+            assert port[portbindings.VIF_DETAILS] == {}
         else:
-            assert(port[portbindings.HOST_ID] == host)
-            assert(port[portbindings.VIF_TYPE] !=
-                   portbindings.VIF_TYPE_DISTRIBUTED)
-            assert(port[portbindings.VIF_TYPE] == vif_type)
-            assert(isinstance(vif_details, dict))
-            assert(port[portbindings.VIF_DETAILS] == vif_details)
+            assert port[portbindings.HOST_ID] == host
+            assert (port[portbindings.VIF_TYPE] !=
+                    portbindings.VIF_TYPE_DISTRIBUTED)
+            assert port[portbindings.VIF_TYPE] == vif_type
+            assert isinstance(vif_details, dict)
+
+            assert port[portbindings.VIF_DETAILS] == vif_details
+        if bound_drivers and binding_levels:
+            bd_reference = {str(idx): bl['bound_driver'] for
+                            idx, bl in enumerate(binding_levels)}
+            assert bd_reference == bound_drivers
 
     def _check_unbound(self, levels, top_segment, bottom_segment):
-        assert(levels is None)
-        assert(top_segment is None)
-        assert(bottom_segment is None)
+        assert levels is None
+        assert top_segment is None
+        assert bottom_segment is None
 
     def _check_bound(self, levels, top_segment, bottom_segment):
-        assert(isinstance(levels, list))
+        assert isinstance(levels, list)
         top_level = levels[0]
-        assert(isinstance(top_level, dict))
-        assert(isinstance(top_segment, dict))
-        assert(top_segment == top_level[api.BOUND_SEGMENT])
-        assert('test' == top_level[api.BOUND_DRIVER])
+        assert isinstance(top_level, dict)
+        assert isinstance(top_segment, dict)
+        assert top_segment == top_level[api.BOUND_SEGMENT]
+        assert 'test' == top_level[api.BOUND_DRIVER]
         bottom_level = levels[-1]
-        assert(isinstance(bottom_level, dict))
-        assert(isinstance(bottom_segment, dict))
-        assert(bottom_segment == bottom_level[api.BOUND_SEGMENT])
-        assert('test' == bottom_level[api.BOUND_DRIVER])
+        assert isinstance(bottom_level, dict)
+        assert isinstance(bottom_segment, dict)
+        assert bottom_segment == bottom_level[api.BOUND_SEGMENT]
+        assert 'test' == bottom_level[api.BOUND_DRIVER]
 
     def create_port_precommit(self, context):
         self._check_port_context(context, False)
@@ -184,8 +209,9 @@ class TestMechanismDriver(api.MechanismDriver):
         self._check_port_context(context, False)
 
     def update_port_precommit(self, context):
-        if (context.original_top_bound_segment and
-            not context.top_bound_segment):
+        if ((context.original_top_bound_segment and
+             not context.top_bound_segment) or
+                (context.host == "host-fail")):
             self.bound_ports.remove((context.original['id'],
                                      context.original_host))
         self._check_port_context(context, True)
@@ -231,3 +257,125 @@ class TestMechanismDriver(api.MechanismDriver):
                                     portbindings.VIF_TYPE_OVS,
                                     {portbindings.CAP_PORT_FILTER: False})
                 self.bound_ports.add((context.current['id'], host))
+        elif host == "host-fail":
+            context.set_binding(None,
+                                portbindings.VIF_TYPE_BINDING_FAILED,
+                                {portbindings.CAP_PORT_FILTER: False})
+            self.bound_ports.add((context.current['id'], host))
+
+    def filter_hosts_with_segment_access(
+            self, context, segments, candidate_hosts, agent_getter):
+        return set()
+
+    @property
+    def resource_provider_uuid5_namespace(self):
+        return uuid.UUID('7f0ce65c-1f13-11e9-8921-3c6aa7b21d17')
+
+    @property
+    def supported_vnic_types(self):
+        return self._supported_vnic_types
+
+    def get_standard_device_mappings(self, agent):
+        return {}
+
+    def supported_extensions(self, extensions):
+        if self._supported_extensions:
+            return extensions & self._supported_extensions
+        return extensions
+
+
+class TestMechanismDriverWithAgent(mech_agent.AgentMechanismDriverBase,
+                                   TestMechanismDriver):
+    """Test mechanism driver with agent for testing mechanism driver api."""
+
+    def __init__(self):
+        super().__init__(
+            'test_agent_type', [portbindings.VNIC_NORMAL])
+        self.bound_ports = set()
+        self._agent_type = 'test_mechanism_driver_agent'
+
+    def get_supported_vif_type(self, agent):
+        return VIF_TYPE_TEST
+
+    def get_vif_type(self, context, agent, segment):
+        return VIF_TYPE_TEST
+
+    @staticmethod
+    def provider_network_attribute_updates_supported():
+        return [pnet.SEGMENTATION_ID]
+
+    def try_to_bind_segment_for_agent(self, context, segment, agent):
+        pass
+
+    @property
+    def agent_type(self):
+        return self._agent_type
+
+    @agent_type.setter
+    def agent_type(self, agent_type):
+        self._agent_type = agent_type
+
+    @TestMechanismDriver.supported_vnic_types.setter
+    def supported_vnic_types(self, vnic_types):
+        self._supported_vnic_types = vnic_types
+
+
+# Host used to trigger a hierarchical bind spanning two distinct
+# mechanism drivers (as opposed to "host-hierarchical" above, where a
+# single driver binds both levels itself).
+HIER_TWO_DRIVER_HOST = "host-two-driver-hierarchical"
+
+
+class _HierarchicalRecordingDriver(api.MechanismDriver):
+    """Base for the two-driver hierarchical binding test drivers.
+
+    Each subclass owns exactly one binding level for HIER_TWO_DRIVER_HOST,
+    reproducing the real-world case where a physical fabric driver binds
+    the outer level and a host vswitch driver binds the inner level.
+    delete_port_precommit/postcommit record into `recorder`, a list the
+    test supplies, so cross-driver call order can be asserted.
+    """
+
+    driver_name = None
+
+    def initialize(self):
+        self.recorder = None
+
+    def delete_port_precommit(self, context):
+        if self.recorder is not None:
+            self.recorder.append((self.driver_name, 'precommit'))
+
+    def delete_port_postcommit(self, context):
+        if self.recorder is not None:
+            self.recorder.append((self.driver_name, 'postcommit'))
+
+
+class HierarchicalOuterMechanismDriver(_HierarchicalRecordingDriver):
+    """Binds the outer (level 0) segment, then hands off to level 1."""
+
+    driver_name = 'test_hier_outer'
+
+    def bind_port(self, context):
+        if context.host != HIER_TWO_DRIVER_HOST:
+            return
+        segment = context.segments_to_bind[0]
+        if segment[api.NETWORK_TYPE] != 'local':
+            return
+        next_segment = context.allocate_dynamic_segment(
+            {api.NETWORK_TYPE: 'vlan', api.PHYSICAL_NETWORK: 'physnet1'})
+        context.continue_binding(segment[api.ID], [next_segment])
+
+
+class HierarchicalInnerMechanismDriver(_HierarchicalRecordingDriver):
+    """Binds the inner (level 1) segment handed off by the outer driver."""
+
+    driver_name = 'test_hier_inner'
+
+    def bind_port(self, context):
+        if context.host != HIER_TWO_DRIVER_HOST:
+            return
+        segment = context.segments_to_bind[0]
+        if segment[api.NETWORK_TYPE] != 'vlan':
+            return
+        context.set_binding(segment[api.ID], portbindings.VIF_TYPE_OVS,
+                            {portbindings.CAP_PORT_FILTER: False})

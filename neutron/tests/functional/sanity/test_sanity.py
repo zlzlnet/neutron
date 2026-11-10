@@ -13,12 +13,14 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from oslo_config import cfg
+
 from neutron.cmd.sanity import checks
-from neutron.tests import base
-from neutron.tests.functional import base as functional_base
+from neutron.conf.agent import dhcp as dhcp_conf
+from neutron.tests.functional import base
 
 
-class SanityTestCase(base.BaseTestCase):
+class SanityTestCase(base.BaseLoggingTestCase):
     """Sanity checks that do not require root access.
 
     Tests that just call checks.some_function() are to ensure that
@@ -27,16 +29,21 @@ class SanityTestCase(base.BaseTestCase):
     """
 
     def setUp(self):
-        super(SanityTestCase, self).setUp()
-
-    def test_nova_notify_runs(self):
-        checks.nova_notify_supported()
+        super().setUp()
+        # needed for test_dnsmasq_version()
+        cfg.CONF.register_opts(dhcp_conf.DNSMASQ_OPTS)
 
     def test_dnsmasq_version(self):
         checks.dnsmasq_version_supported()
 
+    def test_ipset_support(self):
+        checks.ipset_supported()
 
-class SanityTestCaseRoot(functional_base.BaseSudoTestCase):
+    def test_ip6tables_support(self):
+        checks.ip6tables_supported()
+
+
+class SanityTestCaseRoot(base.BaseSudoTestCase):
     """Sanity checks that require root access.
 
     Tests that just call checks.some_function() are to ensure that
@@ -46,6 +53,9 @@ class SanityTestCaseRoot(functional_base.BaseSudoTestCase):
 
     def test_ovs_vxlan_support_runs(self):
         checks.ovs_vxlan_supported()
+
+    def test_ovs_geneve_support_runs(self):
+        checks.ovs_geneve_supported()
 
     def test_iproute2_vxlan_support_runs(self):
         checks.iproute2_vxlan_supported()
@@ -59,11 +69,20 @@ class SanityTestCaseRoot(functional_base.BaseSudoTestCase):
     def test_arp_header_match_runs(self):
         checks.arp_header_match_supported()
 
-    def test_vf_management_runs(self):
-        checks.vf_management_supported()
+    def test_icmpv6_header_match_runs(self):
+        checks.icmpv6_header_match_supported()
 
     def test_namespace_root_read_detection_runs(self):
         checks.netns_read_requires_helper()
 
     def test_ovsdb_native_supported_runs(self):
         checks.ovsdb_native_supported()
+
+    def test_keepalived_ipv6_support(self):
+        checks.keepalived_ipv6_supported()
+
+    def test_bridge_firewalling_enabled(self):
+        checks.bridge_firewalling_enabled()
+
+    def test_ip_nonlocal_bind(self):
+        checks.ip_nonlocal_bind()

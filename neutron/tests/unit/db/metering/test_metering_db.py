@@ -14,17 +14,18 @@
 
 import contextlib
 
+from neutron_lib.api.definitions import metering as metering_apidef
+from neutron_lib import constants as n_consts
+from neutron_lib.db import constants as db_const
+from neutron_lib.plugins import constants
+from oslo_utils import uuidutils
 import webob.exc
 
 from neutron.api import extensions
 from neutron.common import config
-from neutron.common import constants as n_consts
-from neutron import context
 import neutron.extensions
-from neutron.extensions import metering
-from neutron.plugins.common import constants
 from neutron.services.metering import metering_plugin
-from neutron.tests.unit.db import test_db_base_plugin_v2
+from neutron.tests.common import test_db_base_plugin_v2
 
 DB_METERING_PLUGIN_KLASS = (
     "neutron.services.metering."
@@ -32,23 +33,22 @@ DB_METERING_PLUGIN_KLASS = (
 )
 
 extensions_path = ':'.join(neutron.extensions.__path__)
+_long_description_ok = 'x' * (db_const.LONG_DESCRIPTION_FIELD_SIZE)
+_long_description_ng = 'x' * (db_const.LONG_DESCRIPTION_FIELD_SIZE + 1)
+_fake_uuid = uuidutils.generate_uuid
 
 
-class MeteringPluginDbTestCaseMixin(object):
-    def _create_metering_label(self, fmt, name, description, **kwargs):
+class MeteringPluginDbTestCaseMixin:
+    def _create_metering_label(self, fmt, name, description, project_id=None,
+                               **kwargs):
+        project_id = project_id or self._project_id
         data = {'metering_label': {'name': name,
-                                   'tenant_id': kwargs.get('tenant_id',
-                                                           'test-tenant'),
                                    'shared': kwargs.get('shared', False),
                                    'description': description}}
-        req = self.new_create_request('metering-labels', data,
-                                      fmt)
-
-        if kwargs.get('set_context') and 'tenant_id' in kwargs:
-            # create a specific auth context for this request
-            req.environ['neutron.context'] = (
-                context.Context('', kwargs['tenant_id'],
-                                is_admin=kwargs.get('is_admin', True)))
+        req = self.new_create_request(
+            'metering-labels', data, fmt,
+            project_id=project_id,
+            as_admin=kwargs.get('is_admin', True))
 
         return req.get_response(self.ext_api)
 
@@ -59,28 +59,41 @@ class MeteringPluginDbTestCaseMixin(object):
         return self.deserialize(fmt, res)
 
     def _create_metering_label_rule(self, fmt, metering_label_id, direction,
-                                    remote_ip_prefix, excluded, **kwargs):
-        data = {'metering_label_rule':
-                {'metering_label_id': metering_label_id,
-                 'tenant_id': kwargs.get('tenant_id', 'test-tenant'),
-                 'direction': direction,
-                 'excluded': excluded,
-                 'remote_ip_prefix': remote_ip_prefix}}
-        req = self.new_create_request('metering-label-rules',
-                                      data, fmt)
+                                    excluded, remote_ip_prefix=None,
+                                    source_ip_prefix=None,
+                                    destination_ip_prefix=None,
+                                    project_id=None,
+                                    **kwargs):
+        project_id = project_id or self._project_id
+        data = {
+            'metering_label_rule': {
+                        'metering_label_id': metering_label_id,
+                        'direction': direction,
+                        'excluded': excluded,
+                     }
+                }
 
-        if kwargs.get('set_context') and 'tenant_id' in kwargs:
-            # create a specific auth context for this request
-            req.environ['neutron.context'] = (
-                context.Context('', kwargs['tenant_id']))
+        if remote_ip_prefix:
+            data['metering_label_rule']['remote_ip_prefix'] = remote_ip_prefix
+
+        if source_ip_prefix:
+            data['metering_label_rule']['source_ip_prefix'] = source_ip_prefix
+
+        if destination_ip_prefix:
+            data['metering_label_rule']['destination_ip_prefix'] =\
+                destination_ip_prefix
+
+        req = self.new_create_request(
+            'metering-label-rules', data, fmt,
+            project_id=project_id,
+            as_admin=kwargs.get('is_admin', True))
 
         return req.get_response(self.ext_api)
 
     def _make_metering_label_rule(self, fmt, metering_label_id, direction,
-                                  remote_ip_prefix, excluded, **kwargs):
+                                  excluded, **kwargs):
         res = self._create_metering_label_rule(fmt, metering_label_id,
-                                               direction, remote_ip_prefix,
-                                               excluded, **kwargs)
+                                               direction, excluded, **kwargs)
         if res.status_int >= 400:
             raise webob.exc.HTTPClientError(code=res.status_int)
         return self.deserialize(fmt, res)
@@ -96,15 +109,14 @@ class MeteringPluginDbTestCaseMixin(object):
 
     @contextlib.contextmanager
     def metering_label_rule(self, metering_label_id=None, direction='ingress',
-                            remote_ip_prefix='10.0.0.0/24',
-                            excluded='false', fmt=None):
+                            excluded=False, fmt=None, **kwargs):
         if not fmt:
             fmt = self.fmt
         metering_label_rule = self._make_metering_label_rule(fmt,
                                                              metering_label_id,
                                                              direction,
-                                                             remote_ip_prefix,
-                                                             excluded)
+                                                             excluded,
+                                                             **kwargs)
         yield metering_label_rule
 
 
@@ -113,15 +125,15 @@ class MeteringPluginDbTestCase(
         MeteringPluginDbTestCaseMixin):
     fmt = 'json'
 
-    resource_prefix_map = dict(
-        (k.replace('_', '-'), constants.COMMON_PREFIXES[constants.METERING])
-        for k in metering.RESOURCE_ATTRIBUTE_MAP.keys()
-    )
+    resource_prefix_map = {
+        k.replace('_', '-'): "/metering"
+        for k in metering_apidef.RESOURCE_ATTRIBUTE_MAP
+    }
 
     def setUp(self, plugin=None):
         service_plugins = {'metering_plugin_name': DB_METERING_PLUGIN_KLASS}
 
-        super(MeteringPluginDbTestCase, self).setUp(
+        super().setUp(
             plugin=plugin,
             service_plugins=service_plugins
         )
@@ -155,13 +167,33 @@ class TestMetering(MeteringPluginDbTestCase):
             for k, v, in keys:
                 self.assertEqual(metering_label['metering_label'][k], v)
 
+    def test_create_metering_label_with_max_description_length(self):
+        res = self._create_metering_label(self.fmt, 'my label',
+                                          _long_description_ok)
+        self.assertEqual(webob.exc.HTTPCreated.code, res.status_int)
+
+    def test_create_metering_label_with_too_long_description(self):
+        res = self._create_metering_label(self.fmt, 'my label',
+                                          _long_description_ng)
+        self.assertEqual(webob.exc.HTTPBadRequest.code, res.status_int)
+
+    def test_update_metering_label(self):
+        name = 'my label'
+        description = 'my metering label'
+        data = {'metering_label': {}}
+        with self.metering_label(name, description) as metering_label:
+            metering_label_id = metering_label['metering_label']['id']
+            self._update('metering-labels', metering_label_id, data,
+                         webob.exc.HTTPNotImplemented.code)
+
     def test_delete_metering_label(self):
         name = 'my label'
         description = 'my metering label'
 
         with self.metering_label(name, description) as metering_label:
             metering_label_id = metering_label['metering_label']['id']
-            self._delete('metering-labels', metering_label_id, 204)
+            self._delete('metering-labels', metering_label_id, 204,
+                         as_admin=True)
 
     def test_list_metering_label(self):
         name = 'my label'
@@ -188,12 +220,35 @@ class TestMetering(MeteringPluginDbTestCase):
                     ('direction', direction),
                     ('excluded', excluded),
                     ('remote_ip_prefix', remote_ip_prefix)]
-            with self.metering_label_rule(metering_label_id,
-                                          direction,
-                                          remote_ip_prefix,
-                                          excluded) as label_rule:
+            with self.metering_label_rule(
+                    metering_label_id, direction, excluded,
+                    remote_ip_prefix=remote_ip_prefix) as label_rule:
                 for k, v, in keys:
                     self.assertEqual(label_rule['metering_label_rule'][k], v)
+
+    def test_create_metering_label_rule_with_non_existent_label(self):
+        direction = 'egress'
+        remote_ip_prefix = '192.168.0.0/24'
+        excluded = True
+
+        res = self._create_metering_label_rule(
+            self.fmt, _fake_uuid(), direction, excluded,
+            remote_ip_prefix=remote_ip_prefix)
+        self.assertEqual(webob.exc.HTTPNotFound.code, res.status_int)
+
+    def test_update_metering_label_rule(self):
+        name = 'my label'
+        description = 'my metering label'
+        direction = 'egress'
+        remote_ip_prefix = '192.168.0.0/24'
+        data = {'metering_label_rule': {}}
+        with self.metering_label(name, description) as metering_label, \
+                self.metering_label_rule(
+                    metering_label['metering_label']['id'], direction,
+                    remote_ip_prefix=remote_ip_prefix) as label_rule:
+            rule_id = label_rule['metering_label_rule']['id']
+            self._update('metering-label-rules', rule_id, data,
+                         webob.exc.HTTPNotImplemented.code, as_admin=True)
 
     def test_delete_metering_label_rule(self):
         name = 'my label'
@@ -206,12 +261,12 @@ class TestMetering(MeteringPluginDbTestCase):
             remote_ip_prefix = '192.168.0.0/24'
             excluded = True
 
-            with self.metering_label_rule(metering_label_id,
-                                          direction,
-                                          remote_ip_prefix,
-                                          excluded) as label_rule:
+            with self.metering_label_rule(
+                    metering_label_id, direction, excluded,
+                    remote_ip_prefix=remote_ip_prefix) as label_rule:
                 rule_id = label_rule['metering_label_rule']['id']
-                self._delete('metering-label-rules', rule_id, 204)
+                self._delete('metering-label-rules', rule_id, 204,
+                             as_admin=True)
 
     def test_list_metering_label_rule(self):
         name = 'my label'
@@ -224,18 +279,16 @@ class TestMetering(MeteringPluginDbTestCase):
             remote_ip_prefix = '192.168.0.0/24'
             excluded = True
 
-            with self.metering_label_rule(metering_label_id,
-                                          direction,
-                                          remote_ip_prefix,
-                                          excluded) as v1,\
-                    self.metering_label_rule(metering_label_id,
-                                             'ingress',
-                                             remote_ip_prefix,
-                                             excluded) as v2:
+            with self.metering_label_rule(
+                    metering_label_id, direction, excluded,
+                    remote_ip_prefix=remote_ip_prefix) as v1,\
+                    self.metering_label_rule(
+                        metering_label_id, 'ingress', excluded,
+                        remote_ip_prefix=remote_ip_prefix) as v2:
                 metering_label_rule = (v1, v2)
 
                 self._test_list_resources('metering-label-rule',
-                                          metering_label_rule)
+                                          metering_label_rule, as_admin=True)
 
     def test_create_metering_label_rules(self):
         name = 'my label'
@@ -248,18 +301,16 @@ class TestMetering(MeteringPluginDbTestCase):
             remote_ip_prefix = '192.168.0.0/24'
             excluded = True
 
-            with self.metering_label_rule(metering_label_id,
-                                          direction,
-                                          remote_ip_prefix,
-                                          excluded) as v1,\
-                    self.metering_label_rule(metering_label_id,
-                                             direction,
-                                             n_consts.IPv4_ANY,
-                                             False) as v2:
+            with self.metering_label_rule(
+                    metering_label_id, direction, excluded,
+                    remote_ip_prefix=remote_ip_prefix) as v1,\
+                    self.metering_label_rule(
+                        metering_label_id, direction, False,
+                        remote_ip_prefix=n_consts.IPv4_ANY) as v2:
                 metering_label_rule = (v1, v2)
 
                 self._test_list_resources('metering-label-rule',
-                                          metering_label_rule)
+                                          metering_label_rule, as_admin=True)
 
     def test_create_overlap_metering_label_rules(self):
         name = 'my label'
@@ -273,15 +324,12 @@ class TestMetering(MeteringPluginDbTestCase):
             remote_ip_prefix2 = '192.168.0.0/16'
             excluded = True
 
-            with self.metering_label_rule(metering_label_id,
-                                          direction,
-                                          remote_ip_prefix1,
-                                          excluded):
-                res = self._create_metering_label_rule(self.fmt,
-                                                       metering_label_id,
-                                                       direction,
-                                                       remote_ip_prefix2,
-                                                       excluded)
+            with self.metering_label_rule(
+                    metering_label_id, direction, excluded,
+                    remote_ip_prefix=remote_ip_prefix1):
+                res = self._create_metering_label_rule(
+                    self.fmt, metering_label_id, direction, excluded,
+                    remote_ip_prefix=remote_ip_prefix2)
                 self.assertEqual(webob.exc.HTTPConflict.code, res.status_int)
 
     def test_create_metering_label_rule_two_labels(self):
@@ -299,15 +347,14 @@ class TestMetering(MeteringPluginDbTestCase):
                 remote_ip_prefix = '192.168.0.0/24'
                 excluded = True
 
-                with self.metering_label_rule(metering_label_id1,
-                                              direction,
-                                              remote_ip_prefix,
-                                              excluded) as v1,\
-                        self.metering_label_rule(metering_label_id2,
-                                                 direction,
-                                                 remote_ip_prefix,
-                                                 excluded) as v2:
+                with self.metering_label_rule(
+                        metering_label_id1, direction, excluded,
+                        remote_ip_prefix=remote_ip_prefix) as v1,\
+                        self.metering_label_rule(
+                            metering_label_id2, direction, excluded,
+                            remote_ip_prefix=remote_ip_prefix) as v2:
                     metering_label_rule = (v1, v2)
 
                     self._test_list_resources('metering-label-rule',
-                                              metering_label_rule)
+                                              metering_label_rule,
+                                              as_admin=True)

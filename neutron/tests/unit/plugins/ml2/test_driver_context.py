@@ -13,12 +13,44 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import mock
+from unittest import mock
 
-from neutron.common import constants
-from neutron.extensions import portbindings
+from neutron_lib.api.definitions import portbindings
+from neutron_lib import constants
+
 from neutron.plugins.ml2 import driver_context
+from neutron.plugins.ml2 import models
 from neutron.tests import base
+
+
+class TestNetworkContext(base.BaseTestCase):
+
+    def test_network_segments_includes_dynamic_segments(self):
+        plugin = mock.Mock()
+        plugin_context = mock.Mock()
+        network = {'id': 'test-network-id'}
+
+        with mock.patch.object(driver_context.segments_db,
+                               'get_network_segments') as mock_get_segments:
+            driver_context.NetworkContext(plugin, plugin_context, network)
+            mock_get_segments.assert_called_once_with(
+                plugin_context, 'test-network-id', filter_dynamic=None)
+
+    def test_network_segments_uses_provided_segments(self):
+        plugin = mock.Mock()
+        plugin_context = mock.Mock()
+        network = {'id': 'test-network-id'}
+        provided_segments = [
+            {'id': 'seg1', 'network_type': 'vlan'},
+            {'id': 'seg2', 'network_type': 'vlan', 'is_dynamic': True}
+        ]
+
+        with mock.patch.object(driver_context.segments_db,
+                               'get_network_segments') as mock_get_segments:
+            ctx = driver_context.NetworkContext(
+                plugin, plugin_context, network, segments=provided_segments)
+            mock_get_segments.assert_not_called()
+            self.assertEqual(provided_segments, ctx.network_segments)
 
 
 class TestPortContext(base.BaseTestCase):
@@ -32,12 +64,13 @@ class TestPortContext(base.BaseTestCase):
         plugin = mock.Mock()
         plugin_context = mock.Mock()
         network = mock.MagicMock()
-        binding = mock.Mock()
+        binding = models.PortBinding()
 
         port = {'device_owner': constants.DEVICE_OWNER_DVR_INTERFACE}
         binding.host = 'foohost'
 
-        with mock.patch.object(driver_context.db, 'get_network_segments'):
+        with mock.patch.object(driver_context.segments_db,
+                               'get_network_segments'):
             ctx = driver_context.PortContext(plugin,
                                              plugin_context,
                                              port,
@@ -50,13 +83,14 @@ class TestPortContext(base.BaseTestCase):
         plugin = mock.Mock()
         plugin_context = mock.Mock()
         network = mock.MagicMock()
-        binding = mock.Mock()
+        binding = models.PortBinding()
 
-        port = {'device_owner': 'compute',
+        port = {'device_owner': constants.DEVICE_OWNER_COMPUTE_PREFIX,
                 portbindings.HOST_ID: 'host'}
         binding.host = 'foohost'
 
-        with mock.patch.object(driver_context.db, 'get_network_segments'):
+        with mock.patch.object(driver_context.segments_db,
+                               'get_network_segments'):
             ctx = driver_context.PortContext(plugin,
                                              plugin_context,
                                              port,
@@ -69,12 +103,13 @@ class TestPortContext(base.BaseTestCase):
         plugin = mock.Mock()
         plugin_context = mock.Mock()
         network = mock.MagicMock()
-        binding = mock.Mock()
+        binding = models.PortBinding()
 
         port = {'device_owner': constants.DEVICE_OWNER_DVR_INTERFACE}
         binding.status = 'foostatus'
 
-        with mock.patch.object(driver_context.db, 'get_network_segments'):
+        with mock.patch.object(driver_context.segments_db,
+                               'get_network_segments'):
             ctx = driver_context.PortContext(plugin,
                                              plugin_context,
                                              port,
@@ -87,13 +122,14 @@ class TestPortContext(base.BaseTestCase):
         plugin = mock.Mock()
         plugin_context = mock.Mock()
         network = mock.MagicMock()
-        binding = mock.Mock()
+        binding = models.PortBinding()
 
-        port = {'device_owner': 'compute',
+        port = {'device_owner': constants.DEVICE_OWNER_COMPUTE_PREFIX,
                 'status': 'status'}
         binding.status = 'foostatus'
 
-        with mock.patch.object(driver_context.db, 'get_network_segments'):
+        with mock.patch.object(driver_context.segments_db,
+                               'get_network_segments'):
             ctx = driver_context.PortContext(plugin,
                                              plugin_context,
                                              port,

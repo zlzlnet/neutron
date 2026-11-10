@@ -1,12 +1,43 @@
 # The format of this file isn't really documented; just use --generate-rcfile
-[MASTER]
-# Add <file or directory> to the black list. It should be a base name, not a
-# path. You may set this option multiple times.
-#
-# Note the 'openstack' below is intended to match only
-# neutron.openstack.common.  If we ever have another 'openstack'
-# dirname, then we'll need to expand the ignore features in pylint :/
-ignore=.git,tests,openstack
+[MAIN]
+# Files or directories to be skipped. They should be base names, not paths.
+ignore=.git
+
+# Add files or directories matching the regex patterns to the ignore-list. The
+# regex matches against paths and can be in Posix or Windows format.
+ignore-paths=
+ neutron/tests/base.py,
+ neutron/tests/common/helpers.py,
+ neutron/tests/fullstack/.*,
+ neutron/tests/functional/agent/linux/test_iptables.py,
+ neutron/tests/functional/agent/linux/test_utils.py,
+ neutron/tests/functional/agent/l3/test_keepalived_state_change.py,
+ neutron/tests/functional/agent/l3/test_legacy_router.py,
+ neutron/tests/functional/common/ovn/test_utils.py,
+ neutron/tests/functional/resources/process.py,
+ neutron/tests/functional/plugins/ml2/drivers/ovn/mech_driver/ovsdb/test_ovsdb_monitor.py,
+ neutron/tests/unit/agent/common/test_resource_processing_queue.py,
+ neutron/tests/unit/agent/linux/test_external_process.py,
+ neutron/tests/unit/agent/linux/test_dhcp.py,
+ neutron/tests/unit/agent/linux/test_utils.py,
+ neutron/tests/unit/extensions/test_external_net.py,
+ neutron/tests/unit/extensions/test_l3.py,
+ neutron/tests/unit/ipam/fake_driver.py,
+ neutron/tests/unit/objects/.*.py,
+ neutron/tests/unit/plugins/ml2/test_security_group.py,
+ neutron/tests/unit/plugins/ml2/drivers/test_type_vlan.py,
+ neutron/tests/unit/plugins/ml2/drivers/openvswitch/agent/test_ovs_tunnel.py,
+ neutron/tests/unit/privileged/agent/linux/test_ip_lib.py,
+ neutron/tests/unit/services/qos/drivers/test_manager.py,
+ neutron/tests/unit/services/logapi/drivers/test_manager.py
+
+# List of plugins (as comma separated values of python module names) to load,
+# usually to register additional checkers.
+load-plugins=pylint.extensions.no_self_use
+
+# When enabled, pylint would attempt to guess common misconfiguration and emit
+# user-friendly hints instead of false-positive error messages.
+suggestion-mode=yes
 
 [MESSAGES CONTROL]
 # NOTE(gus): This is a long list.  A number of these are important and
@@ -14,51 +45,44 @@ ignore=.git,tests,openstack
 # with a local disable)
 disable=
 # "F" Fatal errors that prevent further processing
- import-error,
 # "I" Informational noise
- locally-disabled,
 # "E" Error for important programming issues (likely bugs)
  access-member-before-definition,
  no-member,
  no-method-argument,
  no-self-argument,
+ not-an-iterable,
+ possibly-used-before-assignment,
 # "W" Warnings for stylistic problems or minor programming issues
  abstract-method,
  arguments-differ,
  attribute-defined-outside-init,
- bad-builtin,
- bad-indentation,
  broad-except,
- dangerous-default-value,
- deprecated-lambda,
- expression-not-assigned,
  fixme,
  global-statement,
- no-init,
- non-parent-init-called,
  not-callable,
  protected-access,
  redefined-builtin,
  redefined-outer-name,
  signature-differs,
- star-args,
  super-init-not-called,
- super-on-old-class,
- unpacking-non-sequence,
  unused-argument,
  unused-import,
  unused-variable,
+ raise-missing-from,
+ arguments-renamed,
+ unspecified-encoding,
+ unused-private-member,
 # "C" Coding convention violations
- bad-continuation,
  invalid-name,
  missing-docstring,
- superfluous-parens,
+ wrong-import-order,
+ consider-using-f-string,
 # "R" Refactor recommendations
- abstract-class-little-used,
- abstract-class-not-used,
  duplicate-code,
- interface-not-implemented,
+ inconsistent-return-statements,
  no-self-use,
+ redefined-argument-from-local,
  too-few-public-methods,
  too-many-ancestors,
  too-many-arguments,
@@ -66,6 +90,7 @@ disable=
  too-many-instance-attributes,
  too-many-lines,
  too-many-locals,
+ too-many-positional-arguments,
  too-many-public-methods,
  too-many-return-statements,
  too-many-statements
@@ -78,7 +103,7 @@ variable-rgx=[a-z_][a-z0-9_]{0,30}$
 argument-rgx=[a-z_][a-z0-9_]{1,30}$
 
 # Method names should be at least 3 characters long
-# and be lowecased with underscores
+# and be lowercased with underscores
 method-rgx=([a-z_][a-z0-9_]{2,}|setUp|tearDown)$
 
 # Module names matching neutron-* are ok (files in bin/)
@@ -98,18 +123,26 @@ max-line-length=79
 additional-builtins=_
 
 [CLASSES]
-# List of interface methods to ignore, separated by a comma.
-ignore-iface-methods=
+# List of valid names for the first argument in a class method.
+valid-classmethod-first-arg=cls
+
+# List of valid names for the first argument in a metaclass class method.
+valid-metaclass-classmethod-first-arg=cls
 
 [IMPORTS]
 # Deprecated modules which should not be used, separated by a comma
 deprecated-modules=
-# should use openstack.common.jsonutils
- json
+# should use oslo_serialization.jsonutils
+ json,
+ six
 
 [TYPECHECK]
 # List of module names for which member attributes should not be checked
-ignored-modules=six.moves,_MovedItems
+ignored-modules=_MovedItems
+# List of decorators that change the signature of a decorated function
+signature-mutators=
+ unittest.mock.patch,
+ unittest.mock._patch_object
 
 [REPORTS]
 # Tells whether to display a full report or only the messages

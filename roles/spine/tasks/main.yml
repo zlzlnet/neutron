@@ -1,0 +1,215 @@
+---
+- name: Workaround router advertisement packets polluting routing tables
+  become: true
+  ansible.builtin.shell:
+    cmd: |
+      for i in $(ls /proc/sys/net/ipv6/conf/*/forwarding); do echo 1 > $i; done
+  changed_when: false
+
+- name: Register interfaces
+  ansible.builtin.shell:
+    cmd: "ls -1 /proc/sys/net/ipv4/conf/*/rp_filter | cut -d/ -f7"
+  register: interfaces
+  changed_when: false
+
+- name: Disable reverse path forwarding validation
+  become: true
+  ansible.posix.sysctl:
+    name: "net.ipv4.conf.{{ item }}.rp_filter"
+    value: "0"
+    sysctl_set: true
+    sysctl_file: /etc/sysctl.d/99-sysctl.conf
+    state: present
+    reload: true
+  loop: "{{ interfaces.stdout_lines }}"
+  register: result
+  retries: 3
+  timeout: 60
+  until: result is not failed
+
+- name: Disable reverse path forwarding validation
+  become: true
+  ansible.posix.sysctl:
+    name: "{{ item.key }}"
+    value: "{{ item.value }}"
+    sysctl_set: true
+    sysctl_file: /etc/sysctl.d/99-sysctl.conf
+    state: present
+    reload: true
+  with_dict:
+    net.ipv4.conf.all.rp_filter: '0'
+    net.ipv4.conf.default.rp_filter: '0'
+  register: result
+  retries: 3
+  timeout: 60
+  until: result is not failed
+
+- name: Set IPv4 forwarding
+  become: true
+  ansible.posix.sysctl:
+    name: net.ipv4.ip_forward
+    value: '1'
+    sysctl_set: true
+    sysctl_file: /etc/sysctl.d/90-network.conf
+    state: present
+    reload: true
+
+- name: Set IPv6 forwarding
+  become: true
+  ansible.posix.sysctl:
+    name: net.ipv6.conf.all.forwarding
+    value: '1'
+    sysctl_set: true
+    sysctl_file: /etc/sysctl.d/90-network.conf
+    state: present
+    reload: true
+
+- name: Check installed packages
+  ansible.builtin.package_facts:
+    manager: auto
+
+- name: Install frr
+  become: true
+  ansible.builtin.package:
+    name: frr
+    state: present
+
+- name: Enable FRR BGP daemon
+  become: true
+  ansible.builtin.lineinfile:
+    path: /etc/frr/daemons
+    regexp: "^bgpd="
+    line: "bgpd=yes"
+    owner: frr
+    group: frr
+    mode: '640'
+
+- name: Enable FRR BFD daemon
+  become: true
+  ansible.builtin.lineinfile:
+    path: /etc/frr/daemons
+    regexp: "^bfdd="
+    line: "bfdd=yes"
+    owner: frr
+    group: frr
+    mode: '640'
+
+- name: Enable retain option of zebra
+  become: true
+  ansible.builtin.lineinfile:
+    path: /etc/frr/daemons
+    regexp: "^zebra_options="
+    line: "zebra_options=\"  -A 127.0.0.1 -s 90000000 -r \""
+    owner: frr
+    group: frr
+    mode: '640'
+
+- name: Configure FRR
+  become: true
+  ansible.builtin.template:
+    src: frr.conf.j2
+    dest: /etc/frr/frr.conf
+    owner: frr
+    group: frr
+    mode: '640'
+
+- name: Enable FRR Zebra daemon
+  become: true
+  ansible.builtin.lineinfile:
+    path: /etc/frr/daemons
+    regexp: "^zebra="
+    line: "zebra=yes"
+    owner: frr
+    group: frr
+    mode: '640'
+
+- name: Ensure FRR log directory is owned by frr
+  become: true
+  ansible.builtin.file:
+    path: /var/log/frr
+    owner: frr
+    group: frr
+    mode: '0755'
+    state: directory
+
+- name: Ensure FRR log file is writable by bgpd
+  become: true
+  ansible.builtin.file:
+    path: /var/log/frr/frr.log
+    owner: frr
+    group: frr
+    mode: '0644'
+    state: touch
+    access_time: preserve
+    modification_time: preserve
+
+# Pin static routes for VXLAN tunnel endpoint IPs via the physical
+# default gateway. This prevents FRR from installing BGP-learned routes
+# that would override the underlay path and create a routing loop on
+# vxlan_sys_*.
+# Static routes (admin distance 1) are always preferred over BGP (200).
+# Only needed when IPs are assigned as /32 (e.g. OVH); on /24 networks
+# peers are directly reachable via L2 and no conflicting route is learned.
+- name: Pin underlay routes for VXLAN endpoints via physical gateway
+  become: true
+  ansible.builtin.shell:
+    cmd: |
+      GW=$(ip route show default | awk '{print $3}')
+      DEV=$(ip route show default | awk '{print $5}')
+      {% for leaf in groups['leafs'] %}
+      ip route replace {{ hostvars[leaf].vxlan_local_ip | trim }}/32 via $GW dev $DEV
+      {% endfor %}
+      {% for compute in groups['compute'] %}
+      ip route replace {{ hostvars[compute].vxlan_local_ip | trim }}/32 via $GW dev $DEV
+      {% endfor %}
+  when: ansible_default_ipv4.prefix | int == 32
+  changed_when: true
+
+- name: Prepare spine host for EVPN
+  become: true
+  when: "'l2vpn evpn' in bgp_address_families"
+  block:
+    - name: Load VRF kernel module
+      ansible.builtin.shell: |
+        modprobe vrf
+
+    - name: Persist VRF module load on boot
+      ansible.builtin.copy:
+        dest: /etc/modules-load.d/vrf.conf
+        content: |
+          vrf
+        mode: "0644"
+
+    - name: Allow incoming EVPN VXLAN traffic
+      ansible.builtin.shell: |
+        iptables -I INPUT 1 -p udp --dport {{ evpn_vxlan_port }} -j ACCEPT
+
+    # Per-VNI traffic flows through VRF-enslaved interfaces
+    # (br-N). Without l3mdev_accept, return TCP/UDP packets
+    # arriving on VRF interfaces cannot be matched to sockets
+    # opened in the main namespace (e.g. tempest SSH).
+    - name: Allow main-namespace sockets to use VRF interfaces
+      ansible.posix.sysctl:
+        name: "{{ item }}"
+        value: "1"
+        sysctl_set: true
+        state: present
+      loop:
+        - net.ipv4.tcp_l3mdev_accept
+        - net.ipv4.udp_l3mdev_accept
+
+# When frr_start_service is false (default), FRR is left stopped
+# because peer interfaces may not exist yet. In the Zuul CI setup,
+# the controller-side BGP interfaces (br-bgp-*, VXLAN tunnels) are
+# not created until devstack runs local.sh. Starting FRR before all
+# peers exist can cause routing loops ("Dead loop on virtual device")
+# that make the node unreachable via SSH. The last compute node's
+# local.sh restarts FRR on leaf/spine via SSH once all interfaces
+# are ready. Set frr_start_service to true when interfaces are
+# guaranteed to exist at role execution time (e.g. KubeVirt VMs).
+- name: Set FRR service state
+  become: true
+  ansible.builtin.service:
+    name: frr
+    enabled: true
+    state: "{{ 'restarted' if frr_start_service else 'stopped' }}"

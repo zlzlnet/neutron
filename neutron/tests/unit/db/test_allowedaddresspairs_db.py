@@ -13,17 +13,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from neutron_lib.api.definitions import allowedaddresspairs as addr_apidef
+from neutron_lib.api.definitions import port_security as psec
+from neutron_lib.api import validators
+from neutron_lib import context as ctx
+from neutron_lib.db import api as db_api
+from neutron_lib.plugins import directory
+from oslo_config import cfg
+from webob import exc as web_exc
 
-from neutron.api.v2 import attributes as attr
 from neutron.db import allowedaddresspairs_db as addr_pair_db
 from neutron.db import db_base_plugin_v2
 from neutron.db import portsecurity_db
-from neutron.extensions import allowedaddresspairs as addr_pair
-from neutron.extensions import portsecurity as psec
 from neutron.extensions import securitygroup as secgroup
-from neutron import manager
-from neutron.tests.unit.db import test_db_base_plugin_v2
-from oslo_config import cfg
+from neutron.objects import ports as portsdb
+from neutron.tests.common import test_db_base_plugin_v2
 
 
 DB_PLUGIN_KLASS = ('neutron.tests.unit.db.test_allowedaddresspairs_db.'
@@ -33,10 +37,10 @@ DB_PLUGIN_KLASS = ('neutron.tests.unit.db.test_allowedaddresspairs_db.'
 class AllowedAddressPairTestCase(
         test_db_base_plugin_v2.NeutronDbPluginV2TestCase):
     def setUp(self, plugin=None, ext_mgr=None):
-        super(AllowedAddressPairTestCase, self).setUp(plugin)
+        super().setUp(plugin)
 
         # Check if a plugin supports security groups
-        plugin_obj = manager.NeutronManager.get_plugin()
+        plugin_obj = directory.get_plugin()
         self._skip_port_security = ('port-security' not in
                                     plugin_obj.supported_extension_aliases)
 
@@ -49,20 +53,20 @@ class AllowedAddressPairTestPlugin(portsecurity_db.PortSecurityDbMixin,
     associating ports with port security and allowed address pairs.
     """
 
-    supported_extension_aliases = ["allowed-address-pairs"]
+    supported_extension_aliases = [addr_apidef.ALIAS]
 
     def create_port(self, context, port):
         p = port['port']
-        with context.session.begin(subtransactions=True):
-            neutron_db = super(AllowedAddressPairTestPlugin, self).create_port(
+        with db_api.CONTEXT_WRITER.using(context):
+            neutron_db = super().create_port(
                 context, port)
             p.update(neutron_db)
-            if attr.is_attr_set(p.get(addr_pair.ADDRESS_PAIRS)):
+            if validators.is_attr_set(p.get(addr_apidef.ADDRESS_PAIRS)):
                 self._process_create_allowed_address_pairs(
                     context, p,
-                    p[addr_pair.ADDRESS_PAIRS])
+                    p[addr_apidef.ADDRESS_PAIRS])
             else:
-                p[addr_pair.ADDRESS_PAIRS] = None
+                p[addr_apidef.ADDRESS_PAIRS] = None
 
         return port['port']
 
@@ -71,19 +75,19 @@ class AllowedAddressPairTestPlugin(portsecurity_db.PortSecurityDbMixin,
             port)
         has_addr_pairs = self._check_update_has_allowed_address_pairs(port)
 
-        with context.session.begin(subtransactions=True):
-            ret_port = super(AllowedAddressPairTestPlugin, self).update_port(
+        with db_api.CONTEXT_WRITER.using(context):
+            ret_port = super().update_port(
                 context, id, port)
             # copy values over - but not fixed_ips
             port['port'].pop('fixed_ips', None)
             ret_port.update(port['port'])
 
             if (delete_addr_pairs or has_addr_pairs):
-                # delete address pairds and readd them
+                # delete address pairs and readd them
                 self._delete_allowed_address_pairs(context, id)
                 self._process_create_allowed_address_pairs(
                     context, ret_port,
-                    ret_port[addr_pair.ADDRESS_PAIRS])
+                    ret_port[addr_apidef.ADDRESS_PAIRS])
 
         return ret_port
 
@@ -91,23 +95,98 @@ class AllowedAddressPairTestPlugin(portsecurity_db.PortSecurityDbMixin,
 class AllowedAddressPairDBTestCase(AllowedAddressPairTestCase):
     def setUp(self, plugin=None, ext_mgr=None):
         plugin = plugin or DB_PLUGIN_KLASS
-        super(AllowedAddressPairDBTestCase,
-              self).setUp(plugin=plugin, ext_mgr=ext_mgr)
+        super().setUp(plugin=plugin, ext_mgr=ext_mgr)
 
 
 class TestAllowedAddressPairs(AllowedAddressPairDBTestCase):
+
+    def test_create_port_allowed_address_pairs_bad_format(self):
+        with self.network() as net:
+            bad_values = [False, True, 1.1, 1, ['ip_address'],
+                          ['mac_address']]
+            for value in bad_values:
+                self._create_port(
+                    self.fmt, net['network']['id'],
+                    expected_res_status=web_exc.HTTPBadRequest.code,
+                    arg_list=(addr_apidef.ADDRESS_PAIRS,),
+                    allowed_address_pairs=value)
 
     def test_create_port_allowed_address_pairs(self):
         with self.network() as net:
             address_pairs = [{'mac_address': '00:00:00:00:00:01',
                               'ip_address': '10.0.0.1'}]
             res = self._create_port(self.fmt, net['network']['id'],
-                                    arg_list=(addr_pair.ADDRESS_PAIRS,),
+                                    arg_list=(addr_apidef.ADDRESS_PAIRS,),
                                     allowed_address_pairs=address_pairs)
             port = self.deserialize(self.fmt, res)
-            self.assertEqual(port['port'][addr_pair.ADDRESS_PAIRS],
+            self.assertEqual(port['port'][addr_apidef.ADDRESS_PAIRS],
                              address_pairs)
             self._delete('ports', port['port']['id'])
+
+    def _test_aap_filter(self, aap_mac, aap_ip, filter_mac=None,
+                         filter_ip=None, matches=True):
+        with self.network() as net:
+            # create a non-matching port
+            self._create_port(self.fmt, net["network"]["id"])
+            address_pairs = [{'mac_address': aap_mac,
+                              'ip_address': aap_ip}]
+            res = self._create_port(self.fmt, net["network"]["id"],
+                                    arg_list=(addr_apidef.ADDRESS_PAIRS,),
+                                    allowed_address_pairs=address_pairs)
+            port = self.deserialize(self.fmt, res)
+            self.assertEqual(port['port'][addr_apidef.ADDRESS_PAIRS],
+                             address_pairs)
+            filters = {}
+            aap_filter = {'allowed_address_pairs': filters}
+            if filter_mac:
+                filters["mac_address"] = filter_mac
+            if filter_ip:
+                filters["ip_address"] = filter_ip
+
+            def do_test():
+                # Test both get_ports and get_objects as get_objects
+                # can modify the filter
+                ports = self.plugin.get_ports(ctx.get_admin_context(),
+                                              filters=aap_filter)
+                if matches:
+                    self.assertEqual(1, len(ports))
+                    self.assertEqual(port["port"]["id"], ports[0]['id'])
+                else:
+                    self.assertEqual(0, len(ports))
+                ports = portsdb.Port.get_objects(ctx.get_admin_context(),
+                                                 **aap_filter)
+                if matches:
+                    self.assertEqual(1, len(ports))
+                    self.assertEqual(port["port"]["id"], ports[0].id)
+                else:
+                    self.assertEqual(0, len(ports))
+
+            do_test()
+            # ensure that format {'ip_address': [xxx]} also works
+            for k, v in filters.items():
+                if isinstance(v, str):
+                    filters[k] = [v]
+            do_test()
+
+    def test_filter_ports_by_allowed_address_pairs_ip(self):
+        mac, ip = ("00:00:00:00:00:01", "10.0.0.1")
+        self._test_aap_filter(mac, ip, filter_ip=ip)
+
+    def test_filter_ports_by_allowed_address_pairs_mac(self):
+        mac, ip = ("00:00:00:00:00:01", "10.0.0.1")
+        self._test_aap_filter(mac, ip, filter_mac=mac)
+
+    def test_filter_ports_by_allowed_address_pairs_ip_and_mac(self):
+        mac, ip = ("00:00:00:00:00:01", "10.0.0.1")
+        self._test_aap_filter(mac, ip, filter_mac=mac, filter_ip=ip)
+
+    def test_filter_ports_by_allowed_address_pairs_multi_ip(self):
+        mac, ip = ("00:00:00:00:00:01", "10.0.0.1")
+        self._test_aap_filter(mac, ip, filter_ip=[ip, "10.0.0.2"])
+
+    def test_filter_ports_by_allowed_address_pairs_no_match(self):
+        mac, ip = ("00:00:00:00:00:01", "10.0.0.1")
+        self._test_aap_filter(mac, ip, filter_ip=["10.0.0.2"], matches=False)
 
     def test_create_port_security_true_allowed_address_pairs(self):
         if self._skip_port_security:
@@ -118,12 +197,12 @@ class TestAllowedAddressPairs(AllowedAddressPairDBTestCase):
                               'ip_address': '10.0.0.1'}]
             res = self._create_port(self.fmt, net['network']['id'],
                                     arg_list=('port_security_enabled',
-                                              addr_pair.ADDRESS_PAIRS,),
+                                              addr_apidef.ADDRESS_PAIRS,),
                                     port_security_enabled=True,
                                     allowed_address_pairs=address_pairs)
             port = self.deserialize(self.fmt, res)
-            self.assertEqual(port['port'][psec.PORTSECURITY], True)
-            self.assertEqual(port['port'][addr_pair.ADDRESS_PAIRS],
+            self.assertTrue(port['port'][psec.PORTSECURITY])
+            self.assertEqual(port['port'][addr_apidef.ADDRESS_PAIRS],
                              address_pairs)
             self._delete('ports', port['port']['id'])
 
@@ -136,21 +215,21 @@ class TestAllowedAddressPairs(AllowedAddressPairDBTestCase):
                               'ip_address': '10.0.0.1'}]
             res = self._create_port(self.fmt, net['network']['id'],
                                     arg_list=('port_security_enabled',
-                                              addr_pair.ADDRESS_PAIRS,),
+                                              addr_apidef.ADDRESS_PAIRS,),
                                     port_security_enabled=False,
                                     allowed_address_pairs=address_pairs)
             self.deserialize(self.fmt, res)
-            self.assertEqual(res.status_int, 409)
+            self.assertEqual(409, res.status_int)
 
             address_pairs = []
             res = self._create_port(self.fmt, net['network']['id'],
                                     arg_list=('port_security_enabled',
-                                              addr_pair.ADDRESS_PAIRS,),
+                                              addr_apidef.ADDRESS_PAIRS,),
                                     port_security_enabled=False,
                                     allowed_address_pairs=address_pairs)
             port = self.deserialize(self.fmt, res)
             self.assertFalse(port['port'][psec.PORTSECURITY])
-            self.assertEqual(port['port'][addr_pair.ADDRESS_PAIRS],
+            self.assertEqual(port['port'][addr_apidef.ADDRESS_PAIRS],
                              address_pairs)
             self._delete('ports', port['port']['id'])
 
@@ -163,6 +242,10 @@ class TestAllowedAddressPairs(AllowedAddressPairDBTestCase):
         address_pairs = [{'mac_address': '00:00:00:00:00:01',
                           'ip_address': '10.0.0.1222'}]
         self._create_port_with_address_pairs(address_pairs, 400)
+
+    def test_create_missing_mac_field(self):
+        address_pairs = [{'ip_address': '10.0.0.1'}]
+        self._create_port_with_address_pairs(address_pairs, 201)
 
     def test_create_missing_ip_field(self):
         address_pairs = [{'mac_address': '00:00:00:00:00:01'}]
@@ -205,7 +288,7 @@ class TestAllowedAddressPairs(AllowedAddressPairDBTestCase):
                 fixed_ips = [{'subnet_id': subnet['subnet']['id'],
                               'ip_address': '10.0.0.2'}]
                 res = self._create_port(self.fmt, network['network']['id'],
-                                        arg_list=(addr_pair.ADDRESS_PAIRS,
+                                        arg_list=(addr_apidef.ADDRESS_PAIRS,
                                         'fixed_ips'),
                                         allowed_address_pairs=address_pairs,
                                         fixed_ips=fixed_ips)
@@ -219,15 +302,33 @@ class TestAllowedAddressPairs(AllowedAddressPairDBTestCase):
                           'icbb': 'agreed'}]
         self._create_port_with_address_pairs(address_pairs, 400)
 
+    def test_create_port_with_unexpected_address_pairs_format(self):
+        address_pairs = {'mac_address': '00:00:00:00:00:01',
+                         'ip_address': '10.0.0.1'}
+        self._create_port_with_address_pairs(address_pairs, 400)
+
     def _create_port_with_address_pairs(self, address_pairs, ret_code):
         with self.network() as net:
             res = self._create_port(self.fmt, net['network']['id'],
-                                    arg_list=(addr_pair.ADDRESS_PAIRS,),
+                                    arg_list=(addr_apidef.ADDRESS_PAIRS,),
                                     allowed_address_pairs=address_pairs)
             port = self.deserialize(self.fmt, res)
             self.assertEqual(res.status_int, ret_code)
             if ret_code == 201:
                 self._delete('ports', port['port']['id'])
+
+    def test_update_port_allowed_address_pairs_bad_format(self):
+        with self.network() as net:
+            res = self._create_port(self.fmt, net['network']['id'])
+            port = self.deserialize(self.fmt, res)
+            bad_values = [False, True, 1.1, 1, ['ip_address'],
+                          ['mac_address']]
+            for value in bad_values:
+                update_port = {'port': {addr_apidef.ADDRESS_PAIRS: value}}
+                req = self.new_update_request('ports', update_port,
+                                              port['port']['id'])
+                res = req.get_response(self.api)
+                self.assertEqual(400, res.status_int)
 
     def test_update_add_address_pairs(self):
         with self.network() as net:
@@ -235,24 +336,37 @@ class TestAllowedAddressPairs(AllowedAddressPairDBTestCase):
             port = self.deserialize(self.fmt, res)
             address_pairs = [{'mac_address': '00:00:00:00:00:01',
                               'ip_address': '10.0.0.1'}]
-            update_port = {'port': {addr_pair.ADDRESS_PAIRS:
+            update_port = {'port': {addr_apidef.ADDRESS_PAIRS:
                                     address_pairs}}
             req = self.new_update_request('ports', update_port,
                                           port['port']['id'])
             port = self.deserialize(self.fmt, req.get_response(self.api))
-            self.assertEqual(port['port'][addr_pair.ADDRESS_PAIRS],
+            self.assertEqual(port['port'][addr_apidef.ADDRESS_PAIRS],
                              address_pairs)
             self._delete('ports', port['port']['id'])
+
+    def test_update_add_address_pairs_with_unexpected_format(self):
+        with self.network() as net:
+            res = self._create_port(self.fmt, net['network']['id'])
+            port = self.deserialize(self.fmt, res)
+            address_pairs = {'mac_address': '00:00:00:00:00:01',
+                             'ip_address': '10.0.0.1'}
+            update_port = {'port': {addr_apidef.ADDRESS_PAIRS:
+                                    address_pairs}}
+            req = self.new_update_request('ports', update_port,
+                                          port['port']['id'])
+            res = req.get_response(self.api)
+            self.assertEqual(400, res.status_int)
 
     def test_create_address_gets_port_mac(self):
         with self.network() as net:
             address_pairs = [{'ip_address': '23.23.23.23'}]
             res = self._create_port(self.fmt, net['network']['id'],
                                     arg_list=('port_security_enabled',
-                                              addr_pair.ADDRESS_PAIRS,),
+                                              addr_apidef.ADDRESS_PAIRS,),
                                     allowed_address_pairs=address_pairs)
             port = self.deserialize(self.fmt, res)['port']
-            port_addr_mac = port[addr_pair.ADDRESS_PAIRS][0]['mac_address']
+            port_addr_mac = port[addr_apidef.ADDRESS_PAIRS][0]['mac_address']
             self.assertEqual(port_addr_mac,
                              port['mac_address'])
             self._delete('ports', port['id'])
@@ -267,7 +381,7 @@ class TestAllowedAddressPairs(AllowedAddressPairDBTestCase):
                 # The port should not have any security-groups associated to it
                 with self.port(subnet=subnet,
                                arg_list=(psec.PORTSECURITY,
-                                         addr_pair.ADDRESS_PAIRS,
+                                         addr_apidef.ADDRESS_PAIRS,
                                          secgroup.SECURITYGROUPS),
                                port_security_enabled=True,
                                allowed_address_pairs=address_pairs,
@@ -279,17 +393,38 @@ class TestAllowedAddressPairs(AllowedAddressPairDBTestCase):
                     res = req.get_response(self.api)
                     self.assertEqual(409, res.status_int)
 
-    def test_create_port_remove_allowed_address_pairs(self):
+    def test_update_with_none_and_own_mac_for_duplicate_ip(self):
+        with self.network() as net:
+            res = self._create_port(self.fmt, net['network']['id'])
+            port = self.deserialize(self.fmt, res)
+            mac_address = port['port']['mac_address']
+            address_pairs = [{'ip_address': '10.0.0.1'},
+                             {'mac_address': mac_address,
+                              'ip_address': '10.0.0.1'}]
+            update_port = {'port': {addr_apidef.ADDRESS_PAIRS:
+                                    address_pairs}}
+            req = self.new_update_request('ports', update_port,
+                                          port['port']['id'])
+            res = req.get_response(self.api)
+            self.assertEqual(400, res.status_int)
+
+    def test_create_port_remove_allowed_address_pairs_with_list(self):
+        self._test_create_port_remove_allowed_address_pairs([])
+
+    def test_create_port_remove_allowed_address_pairs_with_none(self):
+        self._test_create_port_remove_allowed_address_pairs(None)
+
+    def _test_create_port_remove_allowed_address_pairs(self, update_value):
         with self.network() as net:
             address_pairs = [{'mac_address': '00:00:00:00:00:01',
                               'ip_address': '10.0.0.1'}]
             res = self._create_port(self.fmt, net['network']['id'],
-                                    arg_list=(addr_pair.ADDRESS_PAIRS,),
+                                    arg_list=(addr_apidef.ADDRESS_PAIRS,),
                                     allowed_address_pairs=address_pairs)
             port = self.deserialize(self.fmt, res)
-            update_port = {'port': {addr_pair.ADDRESS_PAIRS: []}}
+            update_port = {'port': {addr_apidef.ADDRESS_PAIRS: update_value}}
             req = self.new_update_request('ports', update_port,
                                           port['port']['id'])
             port = self.deserialize(self.fmt, req.get_response(self.api))
-            self.assertEqual(port['port'][addr_pair.ADDRESS_PAIRS], [])
+            self.assertEqual([], port['port'][addr_apidef.ADDRESS_PAIRS])
             self._delete('ports', port['port']['id'])

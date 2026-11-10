@@ -10,29 +10,31 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from neutron.api import extensions
-from neutron.api.v2 import attributes as attr
+from neutron_lib.api import extensions
+from neutron_lib import constants
+
+from neutron._i18n import _
 
 
 EXTENDED_ATTRIBUTES_2_0 = {
     'networks': {
         'network_extension': {'allow_post': True,
                               'allow_put': True,
-                              'default': attr.ATTR_NOT_SPECIFIED,
+                              'default': constants.ATTR_NOT_SPECIFIED,
                               'is_visible': True,
                               'enforce_policy': True},
     },
     'subnets': {
         'subnet_extension': {'allow_post': True,
                              'allow_put': True,
-                             'default': attr.ATTR_NOT_SPECIFIED,
+                             'default': constants.ATTR_NOT_SPECIFIED,
                              'is_visible': True,
                              'enforce_policy': True},
     },
     'ports': {
         'port_extension': {'allow_post': True,
                            'allow_put': True,
-                           'default': attr.ATTR_NOT_SPECIFIED,
+                           'default': constants.ATTR_NOT_SPECIFIED,
                            'is_visible': True,
                            'enforce_policy': True},
     },
@@ -60,5 +62,4 @@ class Fake_extension(extensions.ExtensionDescriptor):
     def get_extended_resources(self, version):
         if version == "2.0":
             return EXTENDED_ATTRIBUTES_2_0
-        else:
-            return {}
+        return {}

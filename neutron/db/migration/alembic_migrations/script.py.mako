@@ -13,21 +13,22 @@
 #    under the License.
 #
 
-"""${message}
+from alembic import op
+import sqlalchemy as sa
+${imports if imports else ""}
 
-Revision ID: ${up_revision}
-Revises: ${down_revision}
-Create Date: ${create_date}
-
-"""
+# ${message}
+#
+# Revision ID: ${up_revision}
+# Revises: ${down_revision}
+# Create Date: ${create_date}
 
 # revision identifiers, used by Alembic.
 revision = ${repr(up_revision)}
 down_revision = ${repr(down_revision)}
-
-from alembic import op
-import sqlalchemy as sa
-${imports if imports else ""}
+% if branch_labels:
+branch_labels = ${repr(branch_labels)}
+% endif
 
 
 def upgrade():

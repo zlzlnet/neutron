@@ -16,44 +16,54 @@
 """Base test cases for all neutron tests.
 """
 
-import contextlib
-import gc
-import logging as std_logging
+import abc
+import functools
+import inspect
+import logging
 import os
 import os.path
-import random
-import traceback
-import weakref
+import queue
+import threading
+from unittest import mock
+import warnings
 
-import eventlet.timeout
 import fixtures
-import mock
+from neutron_lib.callbacks import manager as registry_manager
+from neutron_lib.db import api as db_api
+from neutron_lib import fixture
+from neutron_lib.tests import tools as lib_test_tools
+from neutron_lib.tests.unit import fake_notifier
 from oslo_concurrency.fixture import lockutils
 from oslo_config import cfg
-from oslo_messaging import conffixture as messaging_conffixture
+from oslo_db import exception as db_exceptions
+from oslo_db import options as db_options
+from oslo_utils import excutils
+from oslo_utils import fileutils
 from oslo_utils import strutils
-import six
+from oslotest import base
+from osprofiler import profiler
+from sqlalchemy import exc as sqlalchemy_exc
 import testtools
 
+from neutron._i18n import _
 from neutron.agent.linux import external_process
-from neutron.callbacks import manager as registry_manager
-from neutron.callbacks import registry
+from neutron.api.rpc.callbacks.consumer import registry as rpc_consumer_reg
+from neutron.api.rpc.callbacks.producer import registry as rpc_producer_reg
 from neutron.common import config
-from neutron.common import rpc as n_rpc
+from neutron.conf.agent import common as agent_config
 from neutron.db import agentschedulers_db
 from neutron import manager
 from neutron import policy
-from neutron.tests import fake_notifier
+from neutron.quota import resource_registry
 from neutron.tests import post_mortem_debug
-from neutron.tests import tools
 
 
 CONF = cfg.CONF
-CONF.import_opt('state_path', 'neutron.common.config')
-LOG_FORMAT = "%(asctime)s %(levelname)8s [%(name)s] %(message)s"
 
 ROOTDIR = os.path.dirname(__file__)
 ETCDIR = os.path.join(ROOTDIR, 'etc')
+
+SUDO_CMD = 'sudo -n'
 
 
 def etcdir(*p):
@@ -64,44 +74,104 @@ def fake_use_fatal_exceptions(*args):
     return True
 
 
-def fake_consume_in_threads(self):
-    return []
-
-
-def get_rand_name(max_length=None, prefix='test'):
-    """Return a random string.
-
-    The string will start with 'prefix' and will be exactly 'max_length'.
-    If 'max_length' is None, then exactly 8 random characters, each
-    hexadecimal, will be added. In case len(prefix) <= len(max_length),
-    ValueError will be raised to indicate the problem.
-    """
-
-    if max_length:
-        length = max_length - len(prefix)
-        if length <= 0:
-            raise ValueError("'max_length' must be bigger than 'len(prefix)'.")
-
-        suffix = ''.join(str(random.randint(0, 9)) for i in range(length))
-    else:
-        suffix = hex(random.randint(0x10000000, 0x7fffffff))[2:]
-    return prefix + suffix
-
-
 def bool_from_env(key, strict=False, default=False):
     value = os.environ.get(key)
     return strutils.bool_from_string(value, strict=strict, default=default)
 
 
-def get_test_timeout(default=0):
-    return int(os.environ.get('OS_TEST_TIMEOUT', 0))
+def setup_test_logging(config_opts, log_dir, log_file_path_template):
+    # Have each test log into its own log file
+    # NOTE: oslo_log.log.setup() replaces the root logger's handlers on
+    # every call (see _setup_logging_from_conf()) but only removes the old
+    # ones, it never closes them. Since this is called once per test, that
+    # leaks one FileHandler (and its fd) per test for the lifetime of this
+    # worker process. Capture the handlers being replaced and close them
+    # ourselves once setup_logging() has installed their replacements.
+    old_handlers = list(logging.getLogger().handlers)
+
+    config_opts.set_override('debug', True)
+    fileutils.ensure_tree(log_dir, mode=0o755)
+    log_file = sanitize_log_path(
+        os.path.join(log_dir, log_file_path_template))
+    config_opts.set_override('log_file', log_file)
+    config.setup_logging()
+
+    for handler in old_handlers:
+        handler.close()
+
+
+def sanitize_log_path(path):
+    # Sanitize the string so that its log path is shell friendly
+    replace_map = {' ': '-', '(': '_', ')': '_'}
+    for s, r in replace_map.items():
+        path = path.replace(s, r)
+    return path
+
+
+def unstable_test(reason):
+    def decor(f):
+        @functools.wraps(f)
+        def inner(self, *args, **kwargs):
+            try:
+                return f(self, *args, **kwargs)
+            except Exception as e:
+                msg = ("%s was marked as unstable because of %s, "
+                       "failure was: %s") % (self.id(), reason, e)
+                raise self.skipTest(msg)
+        return inner
+    return decor
+
+
+def skip_if_timeout(reason):
+    def decor(f):
+        @functools.wraps(f)
+        def inner(self, *args, **kwargs):
+            try:
+                return f(self, *args, **kwargs)
+            except fixtures.TimeoutException:
+                msg = ("Timeout raised for test %s, skipping it "
+                       "because of: %s") % (self.id(), reason)
+                raise self.skipTest(msg)
+            except (sqlalchemy_exc.InterfaceError,
+                    db_exceptions.DBConnectionError):
+                # In case of db tests very often TimeoutException is reason of
+                # some sqlalchemy InterfaceError exception and that is final
+                # raised exception which needs to be handled
+                msg = ("DB connection broken in test %s. It is very likely "
+                       "that this happend because of test timeout. "
+                       "Skipping test because of: %s") % (self.id(), reason)
+                raise self.skipTest(msg)
+        return inner
+    return decor
+
+
+def set_timeout(timeout):
+    """Timeout decorator for test methods.
+
+    Use this decorator for tests that are expected to pass in very specific
+    amount of time, not common for all other tests.
+    It can have either big or small value.
+    """
+    def decor(f):
+        @functools.wraps(f)
+        def inner(self, *args, **kwargs):
+            self.useFixture(fixtures.Timeout(timeout, gentle=True))
+            return f(self, *args, **kwargs)
+        return inner
+    return decor
+
+
+def get_rootwrap_cmd():
+    return os.environ.get('OS_ROOTWRAP_CMD', SUDO_CMD)
+
+
+def get_rootwrap_daemon_cmd():
+    return os.environ.get('OS_ROOTWRAP_DAEMON_CMD')
 
 
 class AttributeDict(dict):
 
-    """
-    Provide attribute access (dict.key) to dictionary values.
-    """
+    """Provide attribute access (dict.key) to dictionary values."""
 
     def __getattr__(self, name):
         """Allow attribute access for all keys in the dict."""
@@ -110,7 +180,34 @@ class AttributeDict(dict):
         raise AttributeError(_("Unknown attribute '%s'.") % name)
 
 
-class DietTestCase(testtools.TestCase):
+def _catch_errors(f):
+    @functools.wraps(f)
+    def func(self, *args, **kwargs):
+        try:
+            return f(self, *args, **kwargs)
+        except db_exceptions.DBReferenceError:
+            # TODO(ralonsoh): fix the ``DBReferenceError`` issues in
+            # the functional tests. This is retrying the test execution once
+            # more. If it fails again, the test is skipped. See LP#2121935
+            self.skipTest(
+                'The test raised a ``DBReferenceError`` exception; please '
+                'check if this issue is a random occurrence or is '
+                'explicitly caused by the test')
+    return func
+
+
+class _CatchErrorsMetaclass(abc.ABCMeta):
+    def __init__(cls, name, bases, dct):
+        super().__init__(name, bases, dct)
+        for name, method in inspect.getmembers(
+                # NOTE(ihrachys): we should use isroutine because it will catch
+                # both unbound methods (python2) and functions (python3)
+                cls, predicate=inspect.isroutine):
+            if name.startswith('test_'):
+                setattr(cls, name, _catch_errors(method))
+
+
+class DietTestCase(base.BaseTestCase, metaclass=_CatchErrorsMetaclass):
     """Same great taste, less filling.
 
     BaseTestCase is responsible for doing lots of plugin-centric setup
@@ -119,7 +216,38 @@ class DietTestCase(testtools.TestCase):
     """
 
     def setUp(self):
-        super(DietTestCase, self).setUp()
+        super().setUp()
+
+        # NOTE(slaweq): Make deprecation warnings only happen once.
+        warnings.simplefilter("once", DeprecationWarning)
+
+        # NOTE(slaweq): Let's not display such warnings in tests as we know
+        # that we have many places where policy enforcement depends on values
+        # like is_admin or project_id and there can be a lot of such warnings
+        # in the logs
+        warnings.filterwarnings(
+            'ignore', message=(
+                'Policy enforcement is depending on the value of '))
+
+        # Suppress some log messages during test runs, otherwise it may cause
+        # issues with subunit parser when running on Python 3. It happened for
+        # example for neutron-functional tests.
+        # With this suppress of log levels DEBUG logs will not be captured by
+        # stestr on pythonlogging stream and will not cause this parser issue.
+        supress_logs = ['neutron', 'neutron_lib', 'stevedore', 'oslo_policy',
+                        'oslo_concurrency', 'oslo_db', 'alembic']
+        for supress_log in supress_logs:
+            logger = logging.getLogger(supress_log)
+            logger.setLevel(logging.ERROR)
+
+        # FIXME(amuller): this must be called in the Neutron unit tests base
+        # class. Moving this may cause non-deterministic failures. Bug #1489098
+        # for more info.
+        db_options.set_defaults(cfg.CONF, connection='sqlite://')
+
+        # NOTE(ykarel): Disable pool recycle as tables are dropped with sqlite
+        # memory db with connection close or reconnect
+        cfg.CONF.set_override('connection_recycle_time', -1, group='database')
 
         # Configure this first to ensure pm debugging support for setUp()
         debugger = os.environ.get('OS_POST_MORTEM_DEBUGGER')
@@ -128,87 +256,57 @@ class DietTestCase(testtools.TestCase):
                 debugger))
 
         # Make sure we see all relevant deprecation warnings when running tests
-        self.useFixture(tools.WarningsFixture())
+        self.useFixture(fixture.WarningsFixture(module_re=['^neutron\\.']))
 
-        if bool_from_env('OS_DEBUG'):
-            _level = std_logging.DEBUG
-        else:
-            _level = std_logging.INFO
-        capture_logs = bool_from_env('OS_LOG_CAPTURE')
-        if not capture_logs:
-            std_logging.basicConfig(format=LOG_FORMAT, level=_level)
-        self.log_fixture = self.useFixture(
-            fixtures.FakeLogger(
-                format=LOG_FORMAT,
-                level=_level,
-                nuke_handlers=capture_logs,
-            ))
+        self.useFixture(fixture.DBQueryHooksFixture())
 
-        test_timeout = get_test_timeout()
-        if test_timeout == -1:
-            test_timeout = 0
-        if test_timeout > 0:
-            self.useFixture(fixtures.Timeout(test_timeout, gentle=True))
-
-        # If someone does use tempfile directly, ensure that it's cleaned up
-        self.useFixture(fixtures.NestedTempfile())
-        self.useFixture(fixtures.TempHomeDir())
-
-        self.setup_double_mock_guard()
-        self.addCleanup(mock.patch.stopall)
-
-        if bool_from_env('OS_STDOUT_CAPTURE'):
-            stdout = self.useFixture(fixtures.StringStream('stdout')).stream
-            self.useFixture(fixtures.MonkeyPatch('sys.stdout', stdout))
-        if bool_from_env('OS_STDERR_CAPTURE'):
-            stderr = self.useFixture(fixtures.StringStream('stderr')).stream
-            self.useFixture(fixtures.MonkeyPatch('sys.stderr', stderr))
+        self.useFixture(fixture.DBResourceExtendFixture())
 
         self.addOnException(self.check_for_systemexit)
         self.orig_pid = os.getpid()
 
-    def setup_double_mock_guard(self):
-        # mock.patch.stopall() uses a set in python < 3.4 so patches may not
-        # be unwound in the same order they were applied. This can leak mocks
-        # and cause tests down the line to fail.
-        # More info: http://bugs.python.org/issue21239
-        #
-        # Use mock to patch mock.patch.start to check if a target has already
-        # been patched and fail if it has.
-        self.first_traceback = {}
-        orig_start = mock._patch.start
+        lib_test_tools.reset_random_seed()
 
-        def new_start(mself):
-            mytarget = mself.getter()
-            myattr = mself.attribute
-            for patch in mself._active_patches:
-                if (mytarget, myattr) == (patch.target, patch.attribute):
-                    key = str((patch.target, patch.attribute))
-                    self.fail("mock.patch was setup on an already patched "
-                              "target %s.%s. Stop the original patch before "
-                              "starting a new one. Traceback of 1st patch: %s"
-                              % (mytarget, myattr,
-                                 ''.join(self.first_traceback.get(key, []))))
-            self.first_traceback[
-                str((mytarget, myattr))] = traceback.format_stack()[:-2]
-            return orig_start(mself)
+        config.register_common_config_options()
 
-        mock.patch('mock._patch.start', new=new_start).start()
+        self.addCleanup(CONF.reset)
+        self.setup_config()
+
+    @staticmethod
+    def config_parse(conf=None, args=None):
+        """Create the default configurations."""
+        if args is None:
+            args = []
+        args += ['--config-file', etcdir('neutron.conf')]
+        if conf is None:
+            config.init(args=args)
+        else:
+            conf(args)
+
+    def setup_config(self, args=None):
+        """Tests that need a non-default config can override this method."""
+        self.config_parse(args=args)
+
+    def addOnException(self, handler):
+
+        def safe_handler(*args, **kwargs):
+            try:
+                return handler(*args, **kwargs)
+            except Exception:
+                with excutils.save_and_reraise_exception(reraise=False) as ctx:
+                    self.addDetail('failure in exception handler %s' % handler,
+                                   testtools.content.TracebackContent(
+                                       (ctx.type_, ctx.value, ctx.tb), self))
+
+        return super().addOnException(safe_handler)
 
     def check_for_systemexit(self, exc_info):
         if isinstance(exc_info[1], SystemExit):
             if os.getpid() != self.orig_pid:
                 # Subprocess - let it just exit
-                raise
-            self.fail("A SystemExit was raised during the test. %s"
-                      % traceback.format_exception(*exc_info))
-
-    @contextlib.contextmanager
-    def assert_max_execution_time(self, max_execution_time=5):
-        with eventlet.timeout.Timeout(max_execution_time, False):
-            yield
-            return
-        self.fail('Execution of this test timed out')
+                raise exc_info[1]
+            # This makes sys.exit(0) still a failure
+            self.force_failure = True
 
     def assertOrderedEqual(self, expected, actual):
         expect_val = self.sort_dict_lists(expected)
@@ -216,7 +314,7 @@ class DietTestCase(testtools.TestCase):
         self.assertEqual(expect_val, actual_val)
 
     def sort_dict_lists(self, dic):
-        for key, value in six.iteritems(dic):
+        for key, value in dic.items():
             if isinstance(value, list):
                 dic[key] = sorted(value)
             elif isinstance(value, dict):
@@ -244,10 +342,10 @@ class DietTestCase(testtools.TestCase):
                              {'key': k, 'exp': v, 'act': actual_superset[k]})
 
 
-class ProcessMonitorFixture(tools.SafeFixture):
+class ProcessMonitorFixture(fixtures.Fixture):
     """Test fixture to capture and cleanup any spawn process monitor."""
-    def setUp(self):
-        super(ProcessMonitorFixture, self).setUp()
+
+    def _setUp(self):
         self.old_callable = (
             external_process.ProcessMonitor._spawn_checking_thread)
         p = mock.patch("neutron.agent.linux.external_process.ProcessMonitor."
@@ -256,69 +354,59 @@ class ProcessMonitorFixture(tools.SafeFixture):
         p.start()
         self.instances = []
         self.addCleanup(self.stop)
+        cfg.CONF.set_override('check_child_processes_interval', 0.1,
+                              group='AGENT')
 
     def stop(self):
         for instance in self.instances:
             instance.stop()
 
     def record_calls(self, instance):
-        self.old_callable(instance)
+        thread = self.old_callable(instance)
         self.instances.append(instance)
+        return thread
 
 
 class BaseTestCase(DietTestCase):
 
-    @staticmethod
-    def config_parse(conf=None, args=None):
-        """Create the default configurations."""
-        # neutron.conf includes rpc_backend which needs to be cleaned up
-        if args is None:
-            args = []
-        args += ['--config-file', etcdir('neutron.conf')]
-        if conf is None:
-            config.init(args=args)
-        else:
-            conf(args)
-
     def setUp(self):
-        super(BaseTestCase, self).setUp()
-
-        # suppress all but errors here
-        capture_logs = bool_from_env('OS_LOG_CAPTURE')
-        self.useFixture(
-            fixtures.FakeLogger(
-                name='neutron.api.extensions',
-                format=LOG_FORMAT,
-                level=std_logging.ERROR,
-                nuke_handlers=capture_logs,
-            ))
+        super().setUp()
 
         self.useFixture(lockutils.ExternalLockFixture())
+        self.useFixture(fixture.APIDefinitionFixture())
 
         cfg.CONF.set_override('state_path', self.get_default_temp_dir().path)
 
-        self.addCleanup(CONF.reset)
         self.useFixture(ProcessMonitorFixture())
 
         self.useFixture(fixtures.MonkeyPatch(
-            'neutron.common.exceptions.NeutronException.use_fatal_exceptions',
+            'neutron_lib.exceptions.NeutronException.use_fatal_exceptions',
             fake_use_fatal_exceptions))
 
         self.useFixture(fixtures.MonkeyPatch(
             'oslo_config.cfg.find_config_files',
             lambda project=None, prog=None, extension=None: []))
 
-        self.setup_rpc_mocks()
-        self.setup_config()
-        self.setup_test_registry_instance()
+        self.useFixture(fixture.RPCFixture())
 
-        policy.init()
+        self._callback_manager = registry_manager.CallbacksManager()
+        self.useFixture(fixture.CallbackRegistryFixture(
+            callback_manager=self._callback_manager))
+        # Give a private copy of the directory to each test.
+        self.useFixture(fixture.PluginDirectoryFixture())
+
+        policy.init(suppress_deprecation_warnings=True)
         self.addCleanup(policy.reset)
+        self.addCleanup(resource_registry.unregister_all_resources)
+        self.addCleanup(db_api.sqla_remove_all)
+        self.addCleanup(rpc_consumer_reg.clear)
+        self.addCleanup(rpc_producer_reg.clear)
+        self.addCleanup(profiler.clean)
 
     def get_new_temp_dir(self):
         """Create a new temporary directory.
 
-        :returns fixtures.TempDir
+        :returns: fixtures.TempDir
         """
         return self.useFixture(fixtures.TempDir())
 
@@ -327,7 +415,7 @@ class BaseTestCase(DietTestCase):
 
         Returns the same directory during the whole test case.
 
-        :returns fixtures.TempDir
+        :returns: fixtures.TempDir
         """
         if not hasattr(self, '_temp_dir'):
             self._temp_dir = self.get_new_temp_dir()
@@ -346,41 +434,10 @@ class BaseTestCase(DietTestCase):
         :type filename: string
         :param root: temporary directory to create a new file in
         :type root: fixtures.TempDir
-        :returns absolute file path string
+        :returns: absolute file path string
         """
         root = root or self.get_default_temp_dir()
         return root.join(filename)
-
-    def setup_rpc_mocks(self):
-        # don't actually start RPC listeners when testing
-        self.useFixture(fixtures.MonkeyPatch(
-            'neutron.common.rpc.Connection.consume_in_threads',
-            fake_consume_in_threads))
-
-        self.useFixture(fixtures.MonkeyPatch(
-            'oslo_messaging.Notifier', fake_notifier.FakeNotifier))
-
-        self.messaging_conf = messaging_conffixture.ConfFixture(CONF)
-        self.messaging_conf.transport_driver = 'fake'
-        # NOTE(russellb) We want all calls to return immediately.
-        self.messaging_conf.response_timeout = 0
-        self.useFixture(self.messaging_conf)
-
-        self.addCleanup(n_rpc.clear_extra_exmods)
-        n_rpc.add_extra_exmods('neutron.test')
-
-        self.addCleanup(n_rpc.cleanup)
-        n_rpc.init(CONF)
-
-    def setup_test_registry_instance(self):
-        """Give a private copy of the registry to each test."""
-        self._callback_manager = registry_manager.CallbacksManager()
-        mock.patch.object(registry, '_get_callback_manager',
-                          return_value=self._callback_manager).start()
-
-    def setup_config(self, args=None):
-        """Tests that need a non-default config can override this method."""
-        self.config_parse(args=args)
 
     def config(self, **kw):
         """Override some configuration values.
@@ -395,13 +452,16 @@ class BaseTestCase(DietTestCase):
         test by the fixtures cleanup process.
         """
         group = kw.pop('group', None)
-        for k, v in six.iteritems(kw):
+        for k, v in kw.items():
             CONF.set_override(k, v, group)
 
-    def setup_coreplugin(self, core_plugin=None):
+    def setup_coreplugin(self, core_plugin=None, load_plugins=True):
         cp = PluginFixture(core_plugin)
         self.useFixture(cp)
         self.patched_dhcp_periodic = cp.patched_dhcp_periodic
+        self.patched_default_svc_plugins = cp.patched_default_svc_plugins
+        if load_plugins:
+            manager.init()
 
     def setup_notification_driver(self, notification_driver=None):
         self.addCleanup(fake_notifier.reset)
@@ -409,19 +469,87 @@ class BaseTestCase(DietTestCase):
             notification_driver = [fake_notifier.__name__]
         cfg.CONF.set_override("notification_driver", notification_driver)
 
+    def setup_rootwrap(self):
+        agent_config.register_root_helper(cfg.CONF)
+        self.config(group='AGENT',
+                    root_helper=get_rootwrap_cmd())
+        self.config(group='AGENT',
+                    root_helper_daemon=get_rootwrap_daemon_cmd())
 
-class PluginFixture(tools.SafeFixture):
+    def _simulate_concurrent_requests_process_and_raise(self, calls, args):
+        self._simulate_concurrent_requests_process(calls, args,
+                                                   raise_on_exception=True)
+
+    def _simulate_concurrent_requests_process(self, calls, args,
+                                              raise_on_exception=False):
+        class SimpleThread(threading.Thread):
+            def __init__(self, q):
+                super().__init__()
+                self.q = q
+                self.exception = None
+
+            def run(self):
+                try:
+                    while not self.q.empty():
+                        item = None
+                        try:
+                            item = self.q.get(False)
+                            func, func_args = item[0], item[1]
+                            func(*func_args)
+                        except queue.Empty:
+                            pass
+                        finally:
+                            if item:
+                                self.q.task_done()
+                except Exception as e:
+                    self.exception = e
+
+            def get_exception(self):
+                return self.exception
+
+        q = queue.Queue()
+        for func, func_args in zip(calls, args):
+            q.put_nowait((func, func_args))
+
+        threads = []
+        for z in range(len(calls)):
+            t = SimpleThread(q)
+            threads.append(t)
+            t.start()
+        q.join()
+
+        threads_exceptions = []
+        for t in threads:
+            e = t.get_exception()
+            if e:
+                if raise_on_exception:
+                    raise e
+                threads_exceptions.append(e)
+
+        return threads_exceptions
+
+
+class PluginFixture(fixtures.Fixture):
 
     def __init__(self, core_plugin=None):
-        super(PluginFixture, self).__init__()
+        super().__init__()
         self.core_plugin = core_plugin
 
-    def setUp(self):
-        super(PluginFixture, self).setUp()
+    def _setUp(self):
+        config.register_common_config_options()
+        # Do not load default service plugins in the testing framework
+        # as all the mocking involved can cause havoc.
+        self.default_svc_plugins_p = mock.patch(
+            'neutron.manager.NeutronManager._get_default_service_plugins')
+        self.patched_default_svc_plugins = self.default_svc_plugins_p.start()
         self.dhcp_periodic_p = mock.patch(
             'neutron.db.agentschedulers_db.DhcpAgentSchedulerDbMixin.'
-            'start_periodic_dhcp_agent_status_check')
+            'add_periodic_dhcp_agent_status_check')
         self.patched_dhcp_periodic = self.dhcp_periodic_p.start()
+        self.agent_health_check_p = mock.patch(
+            'neutron.db.agentschedulers_db.DhcpAgentSchedulerDbMixin.'
+            'add_agent_status_check_worker')
+        self.agent_health_check = self.agent_health_check_p.start()
         # Plugin cleanup should be triggered last so that
         # test-specific cleanup has a chance to release references.
         self.addCleanup(self.cleanup_core_plugin)
@@ -437,20 +565,34 @@ class PluginFixture(tools.SafeFixture):
         # TODO(marun) Fix plugins that do not properly initialize notifiers
         agentschedulers_db.AgentSchedulerDbMixin.agent_notifiers = {}
 
-        # Perform a check for deallocation only if explicitly
-        # configured to do so since calling gc.collect() after every
-        # test increases test suite execution time by ~50%.
-        check_plugin_deallocation = (
-            bool_from_env('OS_CHECK_PLUGIN_DEALLOCATION'))
-        if check_plugin_deallocation:
-            plugin = weakref.ref(nm._instance.plugin)
-
         nm.clear_instance()
 
-        if check_plugin_deallocation:
-            gc.collect()
 
-            # TODO(marun) Ensure that mocks are deallocated?
-            if plugin() and not isinstance(plugin(), mock.Base):
-                raise AssertionError(
-                    'The plugin for this test was not deallocated.')
+class Timeout(fixtures.Fixture):
+    """Setup per test timeouts.
+
+    In order to avoid test deadlocks we support setting up a test
+    timeout parameter read from the environment. In almost all
+    cases where the timeout is reached this means a deadlock.
+
+    A scaling factor allows extremely long tests to specify they
+    need more time.
+    """
+
+    def __init__(self, timeout=None, scaling=1):
+        super().__init__()
+        if timeout is None:
+            timeout = os.environ.get('OS_TEST_TIMEOUT', 0)
+        try:
+            self.test_timeout = int(timeout)
+        except ValueError:
+            # If timeout value is invalid do not set a timeout.
+            self.test_timeout = 0
+        if scaling < 1:
+            raise ValueError('scaling value must be >= 1')
+        self.test_timeout *= scaling
+
+    def setUp(self):
+        super().setUp()
+        if self.test_timeout > 0:
+            self.useFixture(fixtures.Timeout(self.test_timeout, gentle=True))

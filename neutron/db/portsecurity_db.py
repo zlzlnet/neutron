@@ -12,24 +12,29 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from neutron.api.v2 import attributes as attrs
-from neutron.db import db_base_plugin_v2
+from neutron_lib.api.definitions import network as net_def
+from neutron_lib.api.definitions import port as port_def
+from neutron_lib.api.definitions import port_security as psec
+from neutron_lib.api import validators
+from neutron_lib.db import resource_extend
+from neutron_lib.plugins import directory
+from neutron_lib.utils import net
+
 from neutron.db import portsecurity_db_common
-from neutron.extensions import portsecurity as psec
 
 
+@resource_extend.has_resource_extenders
 class PortSecurityDbMixin(portsecurity_db_common.PortSecurityDbCommon):
-    # Register dict extend functions for ports and networks
-    db_base_plugin_v2.NeutronDbPluginV2.register_dict_extend_funcs(
-        attrs.NETWORKS, ['_extend_port_security_dict'])
-    db_base_plugin_v2.NeutronDbPluginV2.register_dict_extend_funcs(
-        attrs.PORTS, ['_extend_port_security_dict'])
 
-    def _extend_port_security_dict(self, response_data, db_data):
+    @staticmethod
+    @resource_extend.extends([net_def.COLLECTION_NAME,
+                              port_def.COLLECTION_NAME])
+    def _extend_port_security_dict(response_data, db_data):
+        plugin = directory.get_plugin()
         if ('port-security' in
-            getattr(self, 'supported_extension_aliases', [])):
-            psec_value = db_data['port_security'][psec.PORTSECURITY]
-            response_data[psec.PORTSECURITY] = psec_value
+                getattr(plugin, 'supported_extension_aliases', [])):
+            super(PortSecurityDbMixin, plugin)._extend_port_security_dict(
+                response_data, db_data)
 
     def _determine_port_security_and_has_ip(self, context, port):
         """Returns a tuple of booleans (port_security_enabled, has_ip).
@@ -40,18 +45,17 @@ class PortSecurityDbMixin(portsecurity_db_common.PortSecurityDbCommon):
         """
         has_ip = self._ip_on_port(port)
         # we don't apply security groups for dhcp, router
-        if (port.get('device_owner') and
-                port['device_owner'].startswith('network:')):
+        if port.get('device_owner') and net.is_port_trusted(port):
             return (False, has_ip)
 
-        if attrs.is_attr_set(port.get(psec.PORTSECURITY)):
+        if validators.is_attr_set(port.get(psec.PORTSECURITY)):
             port_security_enabled = port[psec.PORTSECURITY]
 
         # If port has an ip and security_groups are passed in
         # conveniently set port_security_enabled to true this way
         # user doesn't also have to pass in port_security_enabled=True
         # when creating ports.
-        elif (has_ip and attrs.is_attr_set(port.get('security_groups'))):
+        elif has_ip and validators.is_attr_set(port.get('security_groups')):
             port_security_enabled = True
         else:
             port_security_enabled = self._get_network_security_binding(

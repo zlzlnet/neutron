@@ -13,88 +13,133 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import io
+import os
+import pwd
+
+from itertools import chain as iter_chain
+
 import jinja2
 import netaddr
-from oslo_config import cfg
+from neutron_lib import constants
+from neutron_lib.utils import file as file_utils
 from oslo_log import log as logging
-import six
 
 from neutron.agent.linux import external_process
 from neutron.agent.linux import utils
-from neutron.common import constants
-
 
 RADVD_SERVICE_NAME = 'radvd'
 RADVD_SERVICE_CMD = 'radvd'
+# We can configure max of 3 DNS servers in radvd RDNSS section.
+MAX_RDNSS_ENTRIES = 3
 
 LOG = logging.getLogger(__name__)
 
-OPTS = [
-    cfg.StrOpt('ra_confs',
-               default='$state_path/ra',
-               help=_('Location to store IPv6 RA config files')),
-]
-
-cfg.CONF.register_opts(OPTS)
 
 CONFIG_TEMPLATE = jinja2.Template("""interface {{ interface_name }}
 {
    AdvSendAdvert on;
-   MinRtrAdvInterval 3;
-   MaxRtrAdvInterval 10;
+   MinRtrAdvInterval {{ min_rtr_adv_interval }};
+   MaxRtrAdvInterval {{ max_rtr_adv_interval }};
 
-   {% if constants.DHCPV6_STATELESS in ra_modes %}
+   {%- if network_mtu >= constants.IPV6_MIN_MTU %}
+   AdvLinkMTU {{network_mtu}};
+   {% endif %}
+
+   {%- if constants.DHCPV6_STATELESS in ra_modes %}
    AdvOtherConfigFlag on;
    {% endif %}
 
-   {% if constants.DHCPV6_STATEFUL in ra_modes %}
+   {%- if constants.DHCPV6_STATEFUL in ra_modes %}
    AdvManagedFlag on;
    {% endif %}
 
-   {% for prefix in prefixes %}
+   {%- if dns_servers %}
+   RDNSS {% for dns in dns_servers %} {{ dns }} {% endfor %} {};
+   {% endif %}
+
+   {%- for prefix in auto_config_prefixes %}
    prefix {{ prefix }}
    {
         AdvOnLink on;
         AdvAutonomous on;
    };
    {% endfor %}
+
+   {%- for prefix in stateful_config_prefixes %}
+   prefix {{ prefix }}
+   {
+        AdvOnLink on;
+        AdvAutonomous off;
+   };
+   {% endfor %}
+
+   route fe80::a9fe:a9fe/128 {
+   };
 };
 """)
 
 
-class DaemonMonitor(object):
+class DaemonMonitor:
     """Manage the data and state of an radvd process."""
 
-    def __init__(self, router_id, router_ns, process_monitor, dev_name_helper):
+    def __init__(self, router_id, router_ns, process_monitor, dev_name_helper,
+                 agent_conf):
         self._router_id = router_id
         self._router_ns = router_ns
         self._process_monitor = process_monitor
         self._dev_name_helper = dev_name_helper
+        self._agent_conf = agent_conf
 
     def _generate_radvd_conf(self, router_ports):
-        radvd_conf = utils.get_conf_file_name(cfg.CONF.ra_confs,
+        radvd_conf = utils.get_conf_file_name(self._agent_conf.ra_confs,
                                               self._router_id,
                                               'radvd.conf',
                                               True)
-        buf = six.StringIO()
+        buf = io.StringIO()
         for p in router_ports:
             subnets = p.get('subnets', [])
             v6_subnets = [subnet for subnet in subnets if
-                    netaddr.IPNetwork(subnet['cidr']).version == 6]
+                          netaddr.IPNetwork(subnet['cidr']).version == 6]
             if not v6_subnets:
                 continue
             ra_modes = {subnet['ipv6_ra_mode'] for subnet in v6_subnets}
-            auto_config_prefixes = [subnet['cidr'] for subnet in v6_subnets if
-                    subnet['ipv6_ra_mode'] == constants.IPV6_SLAAC or
-                    subnet['ipv6_ra_mode'] == constants.DHCPV6_STATELESS]
+            auto_config_prefixes = [
+                subnet['cidr'] for subnet in v6_subnets
+                if (subnet['ipv6_ra_mode'] == constants.IPV6_SLAAC or
+                    subnet['ipv6_ra_mode'] == constants.DHCPV6_STATELESS)
+            ]
+            stateful_config_prefixes = [
+                subnet['cidr'] for subnet in v6_subnets
+                if subnet['ipv6_ra_mode'] == constants.DHCPV6_STATEFUL
+            ]
             interface_name = self._dev_name_helper(p['id'])
+            slaac_subnets = [
+                subnet for subnet in v6_subnets
+                if subnet['ipv6_ra_mode'] == constants.IPV6_SLAAC
+            ]
+            dns_servers = list(iter_chain(*[
+                subnet['dns_nameservers'] for subnet in slaac_subnets
+                if subnet.get('dns_nameservers')
+            ]))
+            network_mtu = p.get('mtu', 0)
+
             buf.write('%s' % CONFIG_TEMPLATE.render(
                 ra_modes=list(ra_modes),
                 interface_name=interface_name,
-                prefixes=auto_config_prefixes,
-                constants=constants))
+                auto_config_prefixes=auto_config_prefixes,
+                stateful_config_prefixes=stateful_config_prefixes,
+                dns_servers=dns_servers[0:MAX_RDNSS_ENTRIES],
+                n_const=constants,
+                constants=constants,
+                min_rtr_adv_interval=self._agent_conf.min_rtr_adv_interval,
+                max_rtr_adv_interval=self._agent_conf.max_rtr_adv_interval,
+                network_mtu=int(network_mtu)))
 
-        utils.replace_file(radvd_conf, buf.getvalue())
+        contents = buf.getvalue()
+        LOG.debug("radvd config = %s", contents)
+        # radvd conf file can't be writeable by self/group
+        file_utils.replace_file(radvd_conf, contents, file_mode=0o444)
         return radvd_conf
 
     def _get_radvd_process_manager(self, callback=None):
@@ -103,11 +148,17 @@ class DaemonMonitor(object):
             default_cmd_callback=callback,
             namespace=self._router_ns,
             service=RADVD_SERVICE_NAME,
-            conf=cfg.CONF,
+            conf=self._agent_conf,
             run_as_root=True)
 
     def _spawn_radvd(self, radvd_conf):
         def callback(pid_file):
+            if not self._agent_conf.radvd_user:
+                radvd_user = pwd.getpwuid(os.geteuid()).pw_name
+            elif self._agent_conf.radvd_user == 'root':
+                radvd_user = None
+            else:
+                radvd_user = self._agent_conf.radvd_user
             # we need to use -m syslog and f.e. not -m stderr (the default)
             # or -m stderr_syslog so that radvd 2.0+ will close stderr and
             # exit after daemonization; otherwise, the current thread will
@@ -117,6 +168,8 @@ class DaemonMonitor(object):
                          '-C', '%s' % radvd_conf,
                          '-p', '%s' % pid_file,
                          '-m', 'syslog']
+            if radvd_user:
+                radvd_cmd += ['-u', '%s' % radvd_user]
             return radvd_cmd
 
         pm = self._get_radvd_process_manager(callback)
@@ -143,7 +196,7 @@ class DaemonMonitor(object):
                                          service_name=RADVD_SERVICE_NAME)
         pm = self._get_radvd_process_manager()
         pm.disable()
-        utils.remove_conf_files(cfg.CONF.ra_confs, self._router_id)
+        utils.remove_conf_files(self._agent_conf.ra_confs, self._router_id)
         LOG.debug("radvd disabled for router %s", self._router_id)
 
     @property

@@ -13,49 +13,83 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import collections
 import copy
 
-import netaddr
-from oslo_config import cfg
-from oslo_db import api as oslo_db_api
+from neutron_lib.api import attributes
+from neutron_lib.api.definitions import \
+    security_groups_rules_belongs_to_default_sg as sg_rule_default
+from neutron_lib.api import faults
+from neutron_lib.callbacks import events
+from neutron_lib.callbacks import registry
+from neutron_lib import constants
+from neutron_lib.db import api as db_api
+from neutron_lib import exceptions
+from neutron_lib import rpc as n_rpc
+from neutron_lib.services import constants as service_const
 from oslo_log import log as logging
 from oslo_policy import policy as oslo_policy
 from oslo_utils import excutils
-import six
 import webob.exc
 
+from neutron._i18n import _
 from neutron.api import api_common
-from neutron.api.rpc.agentnotifiers import dhcp_rpc_agent_api
-from neutron.api.v2 import attributes
 from neutron.api.v2 import resource as wsgi_resource
-from neutron.common import constants as const
-from neutron.common import exceptions
-from neutron.common import rpc as n_rpc
-from neutron.db import api as db_api
-from neutron.i18n import _LE, _LI
 from neutron import policy
 from neutron import quota
+from neutron.quota import resource_registry
 
 
 LOG = logging.getLogger(__name__)
 
-FAULT_MAP = {exceptions.NotFound: webob.exc.HTTPNotFound,
-             exceptions.Conflict: webob.exc.HTTPConflict,
-             exceptions.InUse: webob.exc.HTTPConflict,
-             exceptions.BadRequest: webob.exc.HTTPBadRequest,
-             exceptions.ServiceUnavailable: webob.exc.HTTPServiceUnavailable,
-             exceptions.NotAuthorized: webob.exc.HTTPForbidden,
-             netaddr.AddrFormatError: webob.exc.HTTPBadRequest,
-             oslo_policy.PolicyNotAuthorized: webob.exc.HTTPForbidden
-             }
 
-
-class Controller(object):
+class Controller:
     LIST = 'list'
     SHOW = 'show'
     CREATE = 'create'
     UPDATE = 'update'
     DELETE = 'delete'
+
+    @property
+    def plugin(self):
+        return self._plugin
+
+    @property
+    def resource(self):
+        return self._resource
+
+    @property
+    def attr_info(self):
+        return self._attr_info
+
+    @property
+    def member_actions(self):
+        return self._member_actions
+
+    @property
+    def allow_pagination(self):
+        return self._allow_pagination
+
+    @property
+    def allow_sorting(self):
+        return self._allow_sorting
+
+    def _init_policy_attrs(self):
+        """Create the list of attributes required by policy.
+
+        If the attribute map contains a tenant_id policy, then include
+        project_id to bring the resource into the brave new world.
+
+        :return: sorted list of attributes required by policy
+
+        """
+        policy_attrs = {name for (name, info) in self._attr_info.items()
+                        if info.get('required_by_policy')}
+        if 'tenant_id' in policy_attrs:
+            policy_attrs.add('project_id')
+
+        # Could use list(), but sorted() makes testing easier.
+        return sorted(policy_attrs)
 
     def __init__(self, plugin, collection, resource, attr_info,
                  allow_bulk=False, member_actions=None, parent=None,
@@ -72,18 +106,9 @@ class Controller(object):
         self._native_bulk = self._is_native_bulk_supported()
         self._native_pagination = self._is_native_pagination_supported()
         self._native_sorting = self._is_native_sorting_supported()
-        self._policy_attrs = [name for (name, info) in self._attr_info.items()
-                              if info.get('required_by_policy')]
+        self._filter_validation = self._is_filter_validation_supported()
+        self._policy_attrs = self._init_policy_attrs()
         self._notifier = n_rpc.get_notifier('network')
-        # use plugin's dhcp notifier, if this is already instantiated
-        agent_notifiers = getattr(plugin, 'agent_notifiers', {})
-        self._dhcp_agent_notifier = (
-            agent_notifiers.get(const.AGENT_TYPE_DHCP) or
-            dhcp_rpc_agent_api.DhcpAgentNotifyAPI()
-        )
-        if cfg.CONF.notify_nova_on_port_data_changes:
-            from neutron.notifiers import nova
-            self._nova_notifier = nova.Notifier()
         self._member_actions = member_actions
         self._primary_key = self._get_primary_key()
         if self._allow_pagination and self._native_pagination:
@@ -93,10 +118,10 @@ class Controller(object):
                     _("Native pagination depend on native sorting")
                 )
             if not self._allow_sorting:
-                LOG.info(_LI("Allow sorting is enabled because native "
-                             "pagination requires native sorting"))
+                LOG.info("Allow sorting is enabled because native "
+                         "pagination requires native sorting")
                 self._allow_sorting = True
-
+        self.parent = parent
         if parent:
             self._parent_id_name = '%s_id' % parent['member_name']
             parent_part = '_%s' % parent['member_name']
@@ -104,15 +129,15 @@ class Controller(object):
             self._parent_id_name = None
             parent_part = ''
         self._plugin_handlers = {
-            self.LIST: 'get%s_%s' % (parent_part, self._collection),
-            self.SHOW: 'get%s_%s' % (parent_part, self._resource)
+            self.LIST: f'get{parent_part}_{self._collection}',
+            self.SHOW: f'get{parent_part}_{self._resource}'
         }
         for action in [self.CREATE, self.UPDATE, self.DELETE]:
-            self._plugin_handlers[action] = '%s%s_%s' % (action, parent_part,
-                                                         self._resource)
+            self._plugin_handlers[action] = '{}{}_{}'.format(
+                action, parent_part, self._resource)
 
     def _get_primary_key(self, default_primary_key='id'):
-        for key, value in six.iteritems(self._attr_info):
+        for key, value in self._attr_info.items():
             if value.get('primary_key', False):
                 return key
         return default_primary_key
@@ -123,14 +148,13 @@ class Controller(object):
         return getattr(self._plugin, native_bulk_attr_name, False)
 
     def _is_native_pagination_supported(self):
-        native_pagination_attr_name = ("_%s__native_pagination_support"
-                                       % self._plugin.__class__.__name__)
-        return getattr(self._plugin, native_pagination_attr_name, False)
+        return api_common.is_native_pagination_supported(self._plugin)
 
     def _is_native_sorting_supported(self):
-        native_sorting_attr_name = ("_%s__native_sorting_support"
-                                    % self._plugin.__class__.__name__)
-        return getattr(self._plugin, native_sorting_attr_name, False)
+        return api_common.is_native_sorting_supported(self._plugin)
+
+    def _is_filter_validation_supported(self):
+        return api_common.is_filter_validation_supported(self._plugin)
 
     def _exclude_attributes_by_policy(self, context, data):
         """Identifies attributes to exclude according to authZ policies.
@@ -140,20 +164,32 @@ class Controller(object):
         to see them.
         """
         attributes_to_exclude = []
-        for attr_name in data.keys():
+        for attr_name in data:
+            # NOTE(haleyb): If no attribute data was found and this
+            # attribute name is 'project_id', we must also check if there
+            # is data for 'tenant_id'. This can happen for some of the
+            # older object definitions like Port, Network, Subnet, etc.
             attr_data = self._attr_info.get(attr_name)
+            if not attr_data and attr_name == 'project_id':
+                attr_data = self._attr_info.get('tenant_id')
             if attr_data and attr_data['is_visible']:
                 if policy.check(
-                    context,
-                    '%s:%s' % (self._plugin_handlers[self.SHOW], attr_name),
-                    data,
-                    might_not_exist=True,
-                    pluralized=self._collection):
+                        context,
+                        '{}:{}'.format(self._plugin_handlers[self.SHOW],
+                                       attr_name),
+                        data,
+                        might_not_exist=True,
+                        pluralized=self._collection):
                     # this attribute is visible, check next one
                     continue
             # if the code reaches this point then either the policy check
             # failed or the attribute was not visible in the first place
             attributes_to_exclude.append(attr_name)
+            # NOTE(haleyb): As mentioned above, we treat 'project_id'
+            # and 'tenant_id' as equivalent.
+            if attr_name == 'project_id':
+                attributes_to_exclude.append('tenant_id')
+
         return attributes_to_exclude
 
     def _view(self, context, data, fields_to_strip=None):
@@ -168,13 +204,13 @@ class Controller(object):
         """
         fields_to_strip = ((fields_to_strip or []) +
                            self._exclude_attributes_by_policy(context, data))
-        return self._filter_attributes(context, data, fields_to_strip)
+        return self._filter_attributes(data, fields_to_strip)
 
-    def _filter_attributes(self, context, data, fields_to_strip=None):
+    def _filter_attributes(self, data, fields_to_strip=None):
         if not fields_to_strip:
             return data
-        return dict(item for item in six.iteritems(data)
-                    if (item[0] not in fields_to_strip))
+        return dict(item for item in data.items()
+                    if item[0] not in fields_to_strip)
 
     def _do_field_list(self, original_fields):
         fields_to_add = None
@@ -187,36 +223,59 @@ class Controller(object):
 
     def __getattr__(self, name):
         if name in self._member_actions:
+            @db_api.retry_db_errors
             def _handle_action(request, id, **kwargs):
                 arg_list = [request.context, id]
-                # Ensure policy engine is initialized
-                policy.init()
                 # Fetch the resource and verify if the user can access it
                 try:
-                    resource = self._item(request, id, True)
-                except oslo_policy.PolicyNotAuthorized:
+                    parent_id = kwargs.get(self._parent_id_name)
+                    resource = self._item(request,
+                                          id,
+                                          do_authz=True,
+                                          field_list=None,
+                                          parent_id=parent_id)
+                except (oslo_policy.PolicyNotAuthorized,
+                        oslo_policy.InvalidScope):
                     msg = _('The resource could not be found.')
                     raise webob.exc.HTTPNotFound(msg)
                 body = kwargs.pop('body', None)
                 # Explicit comparison with None to distinguish from {}
                 if body is not None:
                     arg_list.append(body)
+                    try:
+                        resource.update(body[self._resource])
+                        # Make a list of attributes to be updated to inform the
+                        # policy engine which attributes are set explicitly so
+                        # that it can distinguish them from the ones that are
+                        # set to their default values.
+                        resource[constants.ATTRIBUTES_TO_UPDATE] = body[
+                            self._resource].keys()
+                    except KeyError:
+                        pass
+
                 # It is ok to raise a 403 because accessibility to the
                 # object was checked earlier in this method
                 policy.enforce(request.context,
                                name,
                                resource,
                                pluralized=self._collection)
-                return getattr(self._plugin, name)(*arg_list, **kwargs)
+                ret_value = getattr(self._plugin, name)(*arg_list, **kwargs)
+                # It is simply impossible to predict whether one of this
+                # actions alters resource usage. For instance a project port
+                # is created when a router interface is added. Therefore it is
+                # important to mark as dirty resources whose counters have
+                # been altered by this operation
+                resource_registry.set_resources_dirty(request.context)
+                return ret_value
+
             return _handle_action
-        else:
-            raise AttributeError()
+        raise AttributeError()
 
     def _get_pagination_helper(self, request):
         if self._allow_pagination and self._native_pagination:
             return api_common.PaginationNativeHelper(request,
                                                      self._primary_key)
-        elif self._allow_pagination:
+        if self._allow_pagination:
             return api_common.PaginationEmulatedHelper(request,
                                                        self._primary_key)
         return api_common.NoPaginationHelper(request, self._primary_key)
@@ -224,7 +283,7 @@ class Controller(object):
     def _get_sorting_helper(self, request):
         if self._allow_sorting and self._native_sorting:
             return api_common.SortingNativeHelper(request, self._attr_info)
-        elif self._allow_sorting:
+        if self._allow_sorting:
             return api_common.SortingEmulatedHelper(request, self._attr_info)
         return api_common.NoSortingHelper(request, self._attr_info)
 
@@ -235,9 +294,11 @@ class Controller(object):
         # plugin before returning.
         original_fields, fields_to_add = self._do_field_list(
             api_common.list_args(request, 'fields'))
-        filters = api_common.get_filters(request, self._attr_info,
-                                         ['fields', 'sort_key', 'sort_dir',
-                                          'limit', 'marker', 'page_reverse'])
+        filters = api_common.get_filters(
+            request, self._attr_info,
+            ['fields', 'sort_key', 'sort_dir',
+             'limit', 'marker', 'page_reverse'],
+            is_filter_validation_supported=self._filter_validation)
         kwargs = {'filters': filters,
                   'fields': original_fields}
         sorting_helper = self._get_sorting_helper(request)
@@ -257,12 +318,15 @@ class Controller(object):
             # FIXME(salvatore-orlando): obj_getter might return references to
             # other resources. Must check authZ on them too.
             # Omit items from list that should not be visible
-            obj_list = [obj for obj in obj_list
-                        if policy.check(request.context,
-                                        self._plugin_handlers[self.SHOW],
-                                        obj,
-                                        plugin=self._plugin,
-                                        pluralized=self._collection)]
+            tmp_list = []
+            for obj in obj_list:
+                self._set_parent_id_into_ext_resources_request(
+                    request, obj, parent_id, is_get=True)
+                if policy.check(
+                        request.context, self._plugin_handlers[self.SHOW],
+                        obj, pluralized=self._collection):
+                    tmp_list.append(obj)
+            obj_list = tmp_list
         # Use the first element in the list for discriminating which attributes
         # should be filtered out because of authZ policies
         # fields_to_add contains a list of attributes added for request policy
@@ -274,12 +338,14 @@ class Controller(object):
                 request.context, obj_list[0])
         collection = {self._collection:
                       [self._filter_attributes(
-                          request.context, obj,
-                          fields_to_strip=fields_to_strip)
+                          obj, fields_to_strip=fields_to_strip)
                        for obj in obj_list]}
         pagination_links = pagination_helper.get_links(obj_list)
         if pagination_links:
             collection[self._collection + "_links"] = pagination_links
+        # Synchronize usage trackers, if needed
+        resource_registry.resync_resource(
+            request.context, self._resource, request.context.project_id)
         return collection
 
     def _item(self, request, id, do_authz=False, field_list=None,
@@ -291,6 +357,8 @@ class Controller(object):
             kwargs[self._parent_id_name] = parent_id
         obj_getter = getattr(self._plugin, action)
         obj = obj_getter(request.context, id, **kwargs)
+        self._set_parent_id_into_ext_resources_request(
+            request, obj, parent_id, is_get=True)
         # Check authz
         # FIXME(salvatore-orlando): obj_getter might return references to
         # other resources. Must check authZ on them too.
@@ -301,26 +369,13 @@ class Controller(object):
                            pluralized=self._collection)
         return obj
 
-    def _send_dhcp_notification(self, context, data, methodname):
-        if cfg.CONF.dhcp_agent_notification:
-            if self._collection in data:
-                for body in data[self._collection]:
-                    item = {self._resource: body}
-                    self._dhcp_agent_notifier.notify(context, item, methodname)
-            else:
-                self._dhcp_agent_notifier.notify(context, data, methodname)
-
-    def _send_nova_notification(self, action, orig, returned):
-        if hasattr(self, '_nova_notifier'):
-            self._nova_notifier.send_network_change(action, orig, returned)
-
+    @db_api.retry_db_errors
     def index(self, request, **kwargs):
         """Returns a list of the requested entity."""
         parent_id = kwargs.get(self._parent_id_name)
-        # Ensure policy engine is initialized
-        policy.init()
         return self._items(request, True, parent_id)
 
+    @db_api.retry_db_errors
     def show(self, request, id, **kwargs):
         """Returns detailed information about the requested entity."""
         try:
@@ -330,8 +385,6 @@ class Controller(object):
             field_list, added_fields = self._do_field_list(
                 api_common.list_args(request, "fields"))
             parent_id = kwargs.get(self._parent_id_name)
-            # Ensure policy engine is initialized
-            policy.init()
             return {self._resource:
                     self._view(request.context,
                                self._item(request,
@@ -340,7 +393,7 @@ class Controller(object):
                                           field_list=field_list,
                                           parent_id=parent_id),
                                fields_to_strip=added_fields)}
-        except oslo_policy.PolicyNotAuthorized:
+        except (oslo_policy.PolicyNotAuthorized, oslo_policy.InvalidScope):
             # To avoid giving away information, pretend that it
             # doesn't exist
             msg = _('The resource could not be found.')
@@ -356,7 +409,6 @@ class Controller(object):
                 fields_to_strip = self._exclude_attributes_by_policy(
                     request.context, item)
                 objs.append(self._filter_attributes(
-                    request.context,
                     obj_creator(request.context, **kwargs),
                     fields_to_strip=fields_to_strip))
             return objs
@@ -374,8 +426,8 @@ class Controller(object):
                     except Exception:
                         # broad catch as our only purpose is to log the
                         # exception
-                        LOG.exception(_LE("Unable to undo add for "
-                                          "%(resource)s %(id)s"),
+                        LOG.exception("Unable to undo add for "
+                                      "%(resource)s %(id)s",
                                       {'resource': self._resource,
                                        'id': obj['id']})
                 # TODO(salvatore-orlando): The object being processed when the
@@ -383,103 +435,149 @@ class Controller(object):
                 # We need a way for ensuring that if it has been created,
                 # it is then deleted
 
-    @oslo_db_api.wrap_db_retry(max_retries=db_api.MAX_RETRIES,
-                               retry_on_deadlock=True)
     def create(self, request, body=None, **kwargs):
-        """Creates a new instance of the requested entity."""
-        parent_id = kwargs.get(self._parent_id_name)
         self._notifier.info(request.context,
                             self._resource + '.create.start',
                             body)
-        body = Controller.prepare_request_body(request.context, body, True,
-                                               self._resource, self._attr_info,
-                                               allow_bulk=self._allow_bulk)
+        return self._create(request, body, **kwargs)
+
+    @db_api.retry_db_errors
+    def _create(self, request, body, **kwargs):
+        """Creates a new instance of the requested entity."""
+        parent_id = kwargs.get(self._parent_id_name)
+        try:
+            body = Controller.prepare_request_body(
+                request.context, body, True, self._resource, self._attr_info,
+                allow_bulk=self._allow_bulk)
+        except Exception as e:
+            LOG.warning("An exception happened while processing the request "
+                        "body. The exception message is [%s].", e)
+            raise e
+
         action = self._plugin_handlers[self.CREATE]
         # Check authz
         if self._collection in body:
             # Have to account for bulk create
             items = body[self._collection]
-            deltas = {}
-            bulk = True
         else:
             items = [body]
-            bulk = False
-        # Ensure policy engine is initialized
-        policy.init()
+        # Store requested resource amounts grouping them by project
+        # This won't work with multiple resources. However because of the
+        # current structure of this controller there will hardly be more than
+        # one resource for which reservations are being made
+        request_deltas = collections.defaultdict(int)
         for item in items:
-            self._validate_network_tenant_ownership(request,
-                                                    item[self._resource])
+            self._validate_network_project_ownership(request,
+                                                     item[self._resource])
+            self._belongs_to_default_sg(request, item[self._resource])
+            # For ext resources policy check, we support two types, such as
+            # parent_id is in request body, another type is parent_id is in
+            # request url, which we can get from kwargs.
+            self._set_parent_id_into_ext_resources_request(
+                request, item[self._resource], parent_id)
             policy.enforce(request.context,
                            action,
                            item[self._resource],
                            pluralized=self._collection)
-            try:
-                tenant_id = item[self._resource]['tenant_id']
-                count = quota.QUOTAS.count(request.context, self._resource,
-                                           self._plugin, self._collection,
-                                           tenant_id)
-                if bulk:
-                    delta = deltas.get(tenant_id, 0) + 1
-                    deltas[tenant_id] = delta
-                else:
-                    delta = 1
-                kwargs = {self._resource: count + delta}
-            except exceptions.QuotaResourceUnknown as e:
-                # We don't want to quota this resource
-                LOG.debug(e)
-            else:
-                quota.QUOTAS.limit_check(request.context,
-                                         item[self._resource]['tenant_id'],
-                                         **kwargs)
+            if 'project_id' not in item[self._resource]:
+                # no project_id - no quota check
+                continue
+            project_id = item[self._resource]['project_id']
+            request_deltas[project_id] += 1
+        # Quota enforcement
+        reservations = []
+        try:
+            for (project, delta) in request_deltas.items():
+                reservation = quota.QUOTAS.make_reservation(
+                    request.context,
+                    project,
+                    {self._resource: delta},
+                    self._plugin)
+                if reservation:
+                    reservations.append(reservation)
+        except exceptions.QuotaResourceUnknown as e:
+            # We don't want to quota this resource
+            LOG.debug(e)
 
         def notify(create_result):
+            # Ensure usage trackers for all resources affected by this API
+            # operation are marked as dirty
+            # Commit the reservation(s)
+            for reservation in reservations:
+                quota.QUOTAS.commit_reservation(
+                    request.context, reservation.reservation_id)
+            resource_registry.set_resources_dirty(request.context)
+
             notifier_method = self._resource + '.create.end'
             self._notifier.info(request.context,
                                 notifier_method,
                                 create_result)
-            self._send_dhcp_notification(request.context,
-                                         create_result,
-                                         notifier_method)
+            registry.publish(self._resource, events.BEFORE_RESPONSE, self,
+                             payload=events.APIEventPayload(
+                                 request.context, notifier_method, action,
+                                 request_body=body,
+                                 states=({}, create_result,),
+                                 collection_name=self._collection))
             return create_result
 
-        kwargs = {self._parent_id_name: parent_id} if parent_id else {}
+        def do_create(body, bulk=False, emulated=False):
+            kwargs = {self._parent_id_name: parent_id} if parent_id else {}
+            if bulk and not emulated:
+                obj_creator = getattr(self._plugin, "%s_bulk" % action)
+            else:
+                obj_creator = getattr(self._plugin, action)
+            try:
+                if emulated:
+                    return self._emulate_bulk_create(obj_creator, request,
+                                                     body, parent_id)
+                if self._collection in body:
+                    # This is weird but fixing it requires changes to the
+                    # plugin interface
+                    kwargs.update({self._collection: body})
+                else:
+                    kwargs.update({self._resource: body})
+                return obj_creator(request.context, **kwargs)
+            except Exception:
+                # In case of failure the plugin will always raise an
+                # exception. Cancel the reservation
+                with excutils.save_and_reraise_exception():
+                    for reservation in reservations:
+                        quota.QUOTAS.cancel_reservation(
+                            request.context, reservation.reservation_id)
+
         if self._collection in body and self._native_bulk:
             # plugin does atomic bulk create operations
-            obj_creator = getattr(self._plugin, "%s_bulk" % action)
-            objs = obj_creator(request.context, body, **kwargs)
+            objs = do_create(body, bulk=True)
             # Use first element of list to discriminate attributes which
             # should be removed because of authZ policies
             fields_to_strip = self._exclude_attributes_by_policy(
                 request.context, objs[0])
-            return notify({self._collection: [self._filter_attributes(
-                request.context, obj, fields_to_strip=fields_to_strip)
-                for obj in objs]})
-        else:
-            obj_creator = getattr(self._plugin, action)
-            if self._collection in body:
-                # Emulate atomic bulk behavior
-                objs = self._emulate_bulk_create(obj_creator, request,
-                                                 body, parent_id)
-                return notify({self._collection: objs})
-            else:
-                kwargs.update({self._resource: body})
-                obj = obj_creator(request.context, **kwargs)
-                self._send_nova_notification(action, {},
-                                             {self._resource: obj})
-                return notify({self._resource: self._view(request.context,
-                                                          obj)})
+            return notify({self._collection:
+                           [self._filter_attributes(
+                               obj, fields_to_strip=fields_to_strip)
+                            for obj in objs]})
+        if self._collection in body:
+            # Emulate atomic bulk behavior
+            objs = do_create(body, bulk=True, emulated=True)
+            return notify({self._collection: objs})
+        obj = do_create(body)
+        return notify({self._resource: self._view(request.context, obj)})
 
-    @oslo_db_api.wrap_db_retry(max_retries=db_api.MAX_RETRIES,
-                               retry_on_deadlock=True)
     def delete(self, request, id, **kwargs):
         """Deletes the specified entity."""
+        if request.body:
+            msg = _('Request body is not supported in DELETE.')
+            raise webob.exc.HTTPBadRequest(msg)
         self._notifier.info(request.context,
                             self._resource + '.delete.start',
                             {self._resource + '_id': id})
+        return self._delete(request, id, **kwargs)
+
+    @db_api.retry_db_errors
+    def _delete(self, request, id, **kwargs):
         action = self._plugin_handlers[self.DELETE]
 
         # Check authz
-        policy.init()
         parent_id = kwargs.get(self._parent_id_name)
         obj = self._item(request, id, parent_id=parent_id)
         try:
@@ -487,29 +585,39 @@ class Controller(object):
                            action,
                            obj,
                            pluralized=self._collection)
-        except oslo_policy.PolicyNotAuthorized:
+        except (oslo_policy.PolicyNotAuthorized, oslo_policy.InvalidScope):
             # To avoid giving away information, pretend that it
-            # doesn't exist
+            # doesn't exist if policy does not authorize SHOW
+            with excutils.save_and_reraise_exception() as ctxt:
+                if not policy.check(request.context,
+                                    self._plugin_handlers[self.SHOW],
+                                    obj,
+                                    pluralized=self._collection):
+                    ctxt.reraise = False
             msg = _('The resource could not be found.')
             raise webob.exc.HTTPNotFound(msg)
 
         obj_deleter = getattr(self._plugin, action)
         obj_deleter(request.context, id, **kwargs)
+        # A delete operation usually alters resource usage, so mark affected
+        # usage trackers as dirty
+        resource_registry.set_resources_dirty(request.context)
         notifier_method = self._resource + '.delete.end'
+        result = {self._resource: self._view(request.context, obj)}
+        notifier_payload = {self._resource + '_id': id}
+        notifier_payload.update(result)
         self._notifier.info(request.context,
                             notifier_method,
-                            {self._resource + '_id': id})
-        result = {self._resource: self._view(request.context, obj)}
-        self._send_nova_notification(action, {}, result)
-        self._send_dhcp_notification(request.context,
-                                     result,
-                                     notifier_method)
+                            notifier_payload)
 
-    @oslo_db_api.wrap_db_retry(max_retries=db_api.MAX_RETRIES,
-                               retry_on_deadlock=True)
+        registry.publish(self._resource, events.BEFORE_RESPONSE, self,
+                         payload=events.APIEventPayload(
+                             request.context, notifier_method, action,
+                             states=({}, obj, result,),
+                             collection_name=self._collection))
+
     def update(self, request, id, body=None, **kwargs):
         """Updates the specified entity's attributes."""
-        parent_id = kwargs.get(self._parent_id_name)
         try:
             payload = body.copy()
         except AttributeError:
@@ -519,19 +627,32 @@ class Controller(object):
         self._notifier.info(request.context,
                             self._resource + '.update.start',
                             payload)
-        body = Controller.prepare_request_body(request.context, body, False,
-                                               self._resource, self._attr_info,
-                                               allow_bulk=self._allow_bulk)
+        return self._update(request, id, body, **kwargs)
+
+    @db_api.retry_db_errors
+    def _update(self, request, id, body, **kwargs):
+        try:
+            body = Controller.prepare_request_body(
+                request.context, body, False, self._resource, self._attr_info,
+                allow_bulk=self._allow_bulk)
+        except Exception as e:
+            LOG.warning("An exception happened while processing the request "
+                        "body. The exception message is [%s].", e)
+            raise e
+
         action = self._plugin_handlers[self.UPDATE]
         # Load object to check authz
         # but pass only attributes in the original body and required
         # by the policy engine to the policy 'brain'
-        field_list = [name for (name, value) in six.iteritems(self._attr_info)
+        field_list = [name for (name, value) in self._attr_info.items()
                       if (value.get('required_by_policy') or
                           value.get('primary_key') or
                           'default' not in value)]
-        # Ensure policy engine is initialized
-        policy.init()
+        parent_id = kwargs.get(self._parent_id_name)
+        # If the parent_id exist, we should get orig_obj with
+        # self._parent_id_name field.
+        if parent_id and self._parent_id_name not in field_list:
+            field_list.append(self._parent_id_name)
         orig_obj = self._item(request, id, field_list=field_list,
                               parent_id=parent_id)
         orig_object_copy = copy.copy(orig_obj)
@@ -539,53 +660,53 @@ class Controller(object):
         # Make a list of attributes to be updated to inform the policy engine
         # which attributes are set explicitly so that it can distinguish them
         # from the ones that are set to their default values.
-        orig_obj[const.ATTRIBUTES_TO_UPDATE] = body[self._resource].keys()
+        orig_obj[constants.ATTRIBUTES_TO_UPDATE] = body[self._resource].keys()
+        # Then get the ext_parent_id, format to ext_parent_parent_resource_id
+        if self._parent_id_name in orig_obj:
+            self._set_parent_id_into_ext_resources_request(
+                request, orig_obj, parent_id)
         try:
             policy.enforce(request.context,
                            action,
                            orig_obj,
                            pluralized=self._collection)
-        except oslo_policy.PolicyNotAuthorized:
+        except (oslo_policy.PolicyNotAuthorized, oslo_policy.InvalidScope):
+            # To avoid giving away information, pretend that it
+            # doesn't exist if policy does not authorize SHOW
             with excutils.save_and_reraise_exception() as ctxt:
-                # If a tenant is modifying it's own object, it's safe to return
-                # a 403. Otherwise, pretend that it doesn't exist to avoid
-                # giving away information.
-                if request.context.tenant_id != orig_obj['tenant_id']:
+                if not policy.check(request.context,
+                                    self._plugin_handlers[self.SHOW],
+                                    orig_obj,
+                                    pluralized=self._collection):
                     ctxt.reraise = False
             msg = _('The resource could not be found.')
             raise webob.exc.HTTPNotFound(msg)
 
-        obj_updater = getattr(self._plugin, action)
+        if self._native_bulk and hasattr(self._plugin, "%s_bulk" % action):
+            obj_updater = getattr(self._plugin, "%s_bulk" % action)
+        else:
+            obj_updater = getattr(self._plugin, action)
+
         kwargs = {self._resource: body}
         if parent_id:
             kwargs[self._parent_id_name] = parent_id
         obj = obj_updater(request.context, id, **kwargs)
+        # Usually an update operation does not alter resource usage, but as
+        # there might be side effects it might be worth checking for changes
+        # in resource usage here as well (e.g: a project port is created when a
+        # router interface is added)
+        resource_registry.set_resources_dirty(request.context)
+
         result = {self._resource: self._view(request.context, obj)}
         notifier_method = self._resource + '.update.end'
         self._notifier.info(request.context, notifier_method, result)
-        self._send_dhcp_notification(request.context,
-                                     result,
-                                     notifier_method)
-        self._send_nova_notification(action, orig_object_copy, result)
+        registry.publish(self._resource, events.BEFORE_RESPONSE, self,
+                         payload=events.APIEventPayload(
+                             request.context, notifier_method, action,
+                             request_body=body,
+                             states=(orig_object_copy, result,),
+                             collection_name=self._collection))
         return result
-
-    @staticmethod
-    def _populate_tenant_id(context, res_dict, is_create):
-
-        if (('tenant_id' in res_dict and
-             res_dict['tenant_id'] != context.tenant_id and
-             not context.is_admin)):
-            msg = _("Specifying 'tenant_id' other than authenticated "
-                    "tenant in request requires admin privileges")
-            raise webob.exc.HTTPBadRequest(msg)
-
-        if is_create and 'tenant_id' not in res_dict:
-            if context.tenant_id:
-                res_dict['tenant_id'] = context.tenant_id
-            else:
-                msg = _("Running without keystone AuthN requires "
-                        " that tenant_id is specified")
-                raise webob.exc.HTTPBadRequest(msg)
 
     @staticmethod
     def prepare_request_body(context, body, is_create, resource, attr_info,
@@ -611,13 +732,20 @@ class Controller(object):
                                                      "not supported"))
                 if not body[collection]:
                     raise webob.exc.HTTPBadRequest(_("Resources required"))
-                bulk_body = [
-                    Controller.prepare_request_body(
-                        context, item if resource in item
-                        else {resource: item}, is_create, resource, attr_info,
-                        allow_bulk) for item in body[collection]
-                ]
-                return {collection: bulk_body}
+                try:
+                    bulk_body = [
+                        Controller.prepare_request_body(
+                            context, item if resource in item
+                            else {resource: item}, is_create, resource,
+                            attr_info, allow_bulk) for item in body[collection]
+                    ]
+                    return {collection: bulk_body}
+                except Exception as e:
+                    LOG.warning(
+                        "An exception happened while processing the request "
+                        "body. The exception message is [%s].", e)
+                    raise e
+
             res_dict = body.get(resource)
         except (AttributeError, TypeError):
             msg = _("Body contains invalid data")
@@ -625,61 +753,31 @@ class Controller(object):
         if res_dict is None:
             msg = _("Unable to find '%s' in request body") % resource
             raise webob.exc.HTTPBadRequest(msg)
+        if not isinstance(res_dict, dict):
+            msg = _("Object '%s' contains invalid data") % resource
+            raise webob.exc.HTTPBadRequest(msg)
 
-        Controller._populate_tenant_id(context, res_dict, is_create)
-        Controller._verify_attributes(res_dict, attr_info)
+        attr_ops = attributes.AttributeInfo(attr_info)
+        attr_ops.populate_project_id(context, res_dict, is_create)
+        attributes.populate_project_info(attr_info)
+        attr_ops.verify_attributes(res_dict)
 
         if is_create:  # POST
-            for attr, attr_vals in six.iteritems(attr_info):
-                if attr_vals['allow_post']:
-                    if ('default' not in attr_vals and
-                        attr not in res_dict):
-                        msg = _("Failed to parse request. Required "
-                                "attribute '%s' not specified") % attr
-                        raise webob.exc.HTTPBadRequest(msg)
-                    res_dict[attr] = res_dict.get(attr,
-                                                  attr_vals.get('default'))
-                else:
-                    if attr in res_dict:
-                        msg = _("Attribute '%s' not allowed in POST") % attr
-                        raise webob.exc.HTTPBadRequest(msg)
+            attr_ops.fill_post_defaults(
+                res_dict, exc_cls=webob.exc.HTTPBadRequest)
         else:  # PUT
-            for attr, attr_vals in six.iteritems(attr_info):
+            for attr, attr_vals in attr_info.items():
                 if attr in res_dict and not attr_vals['allow_put']:
                     msg = _("Cannot update read-only attribute %s") % attr
                     raise webob.exc.HTTPBadRequest(msg)
 
-        for attr, attr_vals in six.iteritems(attr_info):
-            if (attr not in res_dict or
-                res_dict[attr] is attributes.ATTR_NOT_SPECIFIED):
-                continue
-            # Convert values if necessary
-            if 'convert_to' in attr_vals:
-                res_dict[attr] = attr_vals['convert_to'](res_dict[attr])
-            # Check that configured values are correct
-            if 'validate' not in attr_vals:
-                continue
-            for rule in attr_vals['validate']:
-                res = attributes.validators[rule](res_dict[attr],
-                                                  attr_vals['validate'][rule])
-                if res:
-                    msg_dict = dict(attr=attr, reason=res)
-                    msg = _("Invalid input for %(attr)s. "
-                            "Reason: %(reason)s.") % msg_dict
-                    raise webob.exc.HTTPBadRequest(msg)
+        attr_ops.convert_values(res_dict, exc_cls=webob.exc.HTTPBadRequest)
         return body
 
-    @staticmethod
-    def _verify_attributes(res_dict, attr_info):
-        extra_keys = set(res_dict.keys()) - set(attr_info.keys())
-        if extra_keys:
-            msg = _("Unrecognized attribute(s) '%s'") % ', '.join(extra_keys)
-            raise webob.exc.HTTPBadRequest(msg)
-
-    def _validate_network_tenant_ownership(self, request, resource_item):
+    def _validate_network_project_ownership(self, request, resource_item):
         # TODO(salvatore-orlando): consider whether this check can be folded
         # in the policy engine
-        if (request.context.is_admin or request.context.is_advsvc or
+        if (request.context.is_admin or request.context.is_service_role or
                 self._resource not in ('port', 'subnet')):
             return
         network = self._plugin.get_network(
@@ -689,15 +787,55 @@ class Controller(object):
         if network.get('shared'):
             return
 
-        network_owner = network['tenant_id']
+        network_owner = network['project_id']
 
-        if network_owner != resource_item['tenant_id']:
-            msg = _("Tenant %(tenant_id)s not allowed to "
-                    "create %(resource)s on this network")
-            raise webob.exc.HTTPForbidden(msg % {
-                "tenant_id": resource_item['tenant_id'],
-                "resource": self._resource,
-            })
+        if network_owner != resource_item['project_id']:
+            # NOTE(kevinbenton): we raise a 404 to hide the existence of the
+            # network from the project since they don't have access to it.
+            msg = _('The resource could not be found.')
+            raise webob.exc.HTTPNotFound(msg)
+
+    def _set_parent_id_into_ext_resources_request(
+            self, request, resource_item, parent_id, is_get=False):
+        if not parent_id:
+            return
+
+        # This will pass most create/update/delete cases
+        if not is_get and (request.context.is_admin or
+                           request.context.is_service_role or
+                           self.parent['member_name'] not in
+                           service_const.EXT_PARENT_RESOURCE_MAPPING or
+                           resource_item.get(self._parent_id_name)):
+            return
+
+        # Then we arrive here, that means the request or get obj contains
+        # ext_parent. If this func is called by list/get, and it contains
+        # _parent_id_name. We need to re-add the ex_parent prefix to policy.
+        if is_get:
+            if (not request.context.is_admin or
+                    not request.context.is_service_role and
+                    self.parent['member_name'] in
+                    service_const.EXT_PARENT_RESOURCE_MAPPING):
+                resource_item.setdefault(
+                    "{}_{}".format(constants.EXT_PARENT_PREFIX,
+                                   self._parent_id_name),
+                    parent_id)
+        # If this func is called by create/update/delete, we just add.
+        else:
+            resource_item.setdefault(
+                "{}_{}".format(constants.EXT_PARENT_PREFIX,
+                               self._parent_id_name),
+                parent_id)
+
+    def _belongs_to_default_sg(self, request, resource_item):
+        """Add the SG default flag to the SG rules during the creation"""
+        if self._resource != 'security_group_rule':
+            return
+
+        default_sg_id = self._plugin.get_default_security_group(
+            request.context.elevated(), resource_item['project_id'])
+        resource_item[sg_rule_default.BELONGS_TO_DEFAULT_SG] = (
+            default_sg_id == resource_item['security_group_id'])
 
 
 def create_resource(collection, resource, plugin, params, allow_bulk=False,
@@ -708,4 +846,4 @@ def create_resource(collection, resource, plugin, params, allow_bulk=False,
                             allow_pagination=allow_pagination,
                             allow_sorting=allow_sorting)
 
-    return wsgi_resource.Resource(controller, FAULT_MAP)
+    return wsgi_resource.Resource(controller, faults.FAULT_MAP)

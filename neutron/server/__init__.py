@@ -1,5 +1,3 @@
-#!/usr/bin/env python
-
 # Copyright 2011 VMware, Inc.
 # All Rights Reserved.
 #
@@ -15,48 +13,69 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-# If ../neutron/__init__.py exists, add ../ to Python search path, so that
-# it will override what happens to be installed in /usr/(local/)lib/python...
-
+import logging as sys_logging
+import os
 import sys
 
-import eventlet
 from oslo_config import cfg
-from oslo_log import log as logging
 
+from neutron._i18n import _
 from neutron.common import config
-from neutron.i18n import _LI
-from neutron import service
 
-LOG = logging.getLogger(__name__)
+# NOTE(annp): These environment variables are required for deploying
+# neutron-api under mod_wsgi. Currently, these variables are set as DevStack's
+# default. If you intend to use other tools for deploying neutron-api under
+# mod_wsgi, you should export these variables with your values.
+
+NEUTRON_CONF = 'neutron.conf'
+NEUTRON_CONF_DIR = '/etc/neutron/'
+NEUTRON_PLUGIN_CONF = 'plugins/ml2/ml2_conf.ini'
 
 
-def main():
+def _get_config_files(env=None):
+    if env is None:
+        env = os.environ
+    dirname = env.get('OS_NEUTRON_CONFIG_DIR', NEUTRON_CONF_DIR).strip()
+
+    files = [s.strip() for s in
+             env.get('OS_NEUTRON_CONFIG_FILES', '').split(';') if s.strip()]
+
+    if not files:
+        files = [NEUTRON_CONF, NEUTRON_PLUGIN_CONF]
+
+    return [os.path.join(dirname, fname) for fname in files]
+
+
+def _init_configuration(prog=None):
     # the configuration will be read into the cfg.CONF global data structure
-    config.init(sys.argv[1:])
+    conf_files = _get_config_files()
+    config.register_common_config_options()
+    config.init(sys.argv[1:], default_config_files=conf_files,
+                prog=prog)
+    config.setup_logging()
+    config.set_config_defaults()
     if not cfg.CONF.config_file:
         sys.exit(_("ERROR: Unable to find configuration file via the default"
                    " search paths (~/.neutron/, ~/, /etc/neutron/, /etc/) and"
                    " the '--config-file' option!"))
+
+
+def boot_server(server_func, prog=None):
+    # During the call to gmr.TextGuruMeditation.setup_autorun(), Guru
+    # Meditation Report tries to start logging.
+    # Set a handler here to accommodate this.
+    # NOTE(amorin) This was introduced to mitigate bug #1532053 which seems
+    # not triggered anymore.
+    # But, while fixing bug #2021814 we decided to be conservative and keep
+    # this to avoid any further side effect.
+    logger = sys_logging.getLogger(None)
+    if not logger.handlers:
+        logger.addHandler(sys_logging.StreamHandler())
+
+    _init_configuration(prog=prog)
+    config.setup_gmr()
     try:
-        pool = eventlet.GreenPool()
-
-        neutron_api = service.serve_wsgi(service.NeutronApiService)
-        api_thread = pool.spawn(neutron_api.wait)
-
-        try:
-            neutron_rpc = service.serve_rpc()
-        except NotImplementedError:
-            LOG.info(_LI("RPC was already started in parent process by "
-                         "plugin."))
-        else:
-            rpc_thread = pool.spawn(neutron_rpc.wait)
-
-            # api and rpc should die together.  When one dies, kill the other.
-            rpc_thread.link(lambda gt: api_thread.kill())
-            api_thread.link(lambda gt: rpc_thread.kill())
-
-        pool.waitall()
+        return server_func()
     except KeyboardInterrupt:
         pass
     except RuntimeError as e:

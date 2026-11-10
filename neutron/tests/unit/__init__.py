@@ -13,7 +13,6 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from oslo_config import cfg
-
-
-cfg.CONF.use_stderr = False
+# NOTE(ralonsoh): remove once the default backend is ``BackendType.THREADING``
+from oslo_service import backend as oslo_service_backend
+oslo_service_backend.init_backend(oslo_service_backend.BackendType.THREADING)

@@ -15,20 +15,22 @@
 
 import os
 
+from neutron.api import api_common
+
 
 def get_view_builder(req):
     base_url = req.application_url
     return ViewBuilder(base_url)
 
 
-class ViewBuilder(object):
+class ViewBuilder:
 
     def __init__(self, base_url):
         """Object initialization.
 
         :param base_url: url of the root wsgi application
         """
-        self.base_url = base_url
+        self.base_url = api_common.prepare_url(base_url)
 
     def build(self, version_data):
         """Generic method used to generate a version entity."""
@@ -55,4 +57,4 @@ class ViewBuilder(object):
 
     def generate_href(self, version_number):
         """Create an url that refers to a specific version_number."""
-        return os.path.join(self.base_url, version_number)
+        return os.path.join(self.base_url, version_number, '')

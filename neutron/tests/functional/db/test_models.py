@@ -15,10 +15,11 @@
 
 import sqlalchemy
 
-from neutron.tests import base
+from neutron.db.migration.models import head
+from neutron.tests.functional import base
 
 
-class TestDBCreation(base.BaseTestCase):
+class TestDBCreation(base.BaseLoggingTestCase):
     """Check database schema can be created without conflicts.
 
     For each test case is created a SQLite memory database.
@@ -26,7 +27,7 @@ class TestDBCreation(base.BaseTestCase):
     """
 
     def setUp(self):
-        super(TestDBCreation, self).setUp()
+        super().setUp()
         self.engine = sqlalchemy.create_engine('sqlite://')
 
     def _test_creation(self, module):
@@ -34,5 +35,4 @@ class TestDBCreation(base.BaseTestCase):
         metadata.create_all(self.engine)
 
     def test_head_creation(self):
-        from neutron.db.migration.models import head
         self._test_creation(head)

@@ -1,0 +1,10 @@
+#!/bin/bash
+
+# Neutron flavors plugin
+# ----------------------
+
+FLAVORS_PLUGIN=flavors
+
+function configure_flavors {
+    neutron_service_plugin_class_add $FLAVORS_PLUGIN
+}

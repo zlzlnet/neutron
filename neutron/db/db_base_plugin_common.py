@@ -13,24 +13,85 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import functools
+
 import netaddr
 
+from neutron_lib.api.definitions import network as net_def
+from neutron_lib.api.definitions import port as port_def
+from neutron_lib.api.definitions import subnet as subnet_def
+from neutron_lib.api.definitions import subnetpool as subnetpool_def
+from neutron_lib.api import validators
+from neutron_lib import constants
+from neutron_lib.db import api as db_api
+from neutron_lib.db import model_query
+from neutron_lib.db import resource_extend
+from neutron_lib.db import utils as db_utils
+from neutron_lib import exceptions
+from neutron_lib.utils import net
 from oslo_config import cfg
 from oslo_log import log as logging
 from sqlalchemy.orm import exc
 
-from neutron.api.v2 import attributes
-from neutron.common import constants
-from neutron.common import exceptions as n_exc
-from neutron.common import utils
-from neutron.db import common_db_mixin
 from neutron.db import models_v2
-from neutron.ipam import utils as ipam_utils
+from neutron.db import rbac_db_models
+from neutron.objects import base as base_obj
+from neutron.objects import ports as port_obj
+from neutron.objects import subnet as subnet_obj
+from neutron.objects import subnetpool as subnetpool_obj
 
 LOG = logging.getLogger(__name__)
 
 
-class DbBasePluginCommon(common_db_mixin.CommonDbMixin):
+def convert_result_to_dict(f):
+    @functools.wraps(f)
+    def inner(*args, **kwargs):
+        result = f(*args, **kwargs)
+
+        if result is None:
+            return None
+        if isinstance(result, list):
+            return [r.to_dict() for r in result]
+        return result.to_dict()
+    return inner
+
+
+def filter_fields(f):
+    @functools.wraps(f)
+    def inner_filter(*args, **kwargs):
+        result = f(*args, **kwargs)
+        fields = kwargs.get('fields')
+        if not fields:
+            try:
+                pos = f.__code__.co_varnames.index('fields')
+                fields = args[pos]
+            except (IndexError, ValueError):
+                return result
+
+        def _do_filter(d):
+            return {k: v for k, v in d.items() if k in fields}
+
+        if isinstance(result, list):
+            return [_do_filter(obj) for obj in result]
+        return _do_filter(result)
+    return inner_filter
+
+
+def make_result_with_fields(f):
+    @functools.wraps(f)
+    def inner(*args, **kwargs):
+        fields = kwargs.get('fields')
+        result = f(*args, **kwargs)
+        if fields is None:
+            return result
+        if isinstance(result, list):
+            return [db_utils.resource_fields(r, fields) for r in result]
+        return db_utils.resource_fields(result, fields)
+
+    return inner
+
+
+class DbBasePluginCommon:
     """Stores getters and helper methods for db_base_plugin_v2
 
     All private getters and simple helpers like _make_*_dict were moved from
@@ -41,8 +102,14 @@ class DbBasePluginCommon(common_db_mixin.CommonDbMixin):
     """
 
     @staticmethod
-    def _generate_mac():
-        return utils.get_random_mac(cfg.CONF.base_mac.split(':'))
+    def _generate_macs(mac_count=1):
+        mac_maker = net.random_mac_generator(cfg.CONF.base_mac.split(':'))
+        return [next(mac_maker) for x in range(mac_count)]
+
+    @db_api.CONTEXT_READER
+    def _is_mac_in_use(self, context, network_id, mac_address):
+        return port_obj.Port.objects_exist(context, network_id=network_id,
+                                           mac_address=mac_address)
 
     @staticmethod
     def _delete_ip_allocation(context, network_id, subnet_id, ip_address):
@@ -53,12 +120,12 @@ class DbBasePluginCommon(common_db_mixin.CommonDbMixin):
                   {'ip_address': ip_address,
                    'network_id': network_id,
                    'subnet_id': subnet_id})
-        context.session.query(models_v2.IPAllocation).filter_by(
-            network_id=network_id,
-            ip_address=ip_address,
-            subnet_id=subnet_id).delete()
+        port_obj.IPAllocation.delete_objects(
+            context, network_id=network_id, ip_address=ip_address,
+            subnet_id=subnet_id)
 
     @staticmethod
+    @db_api.CONTEXT_WRITER
     def _store_ip_allocation(context, ip_address, network_id, subnet_id,
                              port_id):
         LOG.debug("Allocated IP %(ip_address)s "
@@ -67,47 +134,77 @@ class DbBasePluginCommon(common_db_mixin.CommonDbMixin):
                    'network_id': network_id,
                    'subnet_id': subnet_id,
                    'port_id': port_id})
-        allocated = models_v2.IPAllocation(
-            network_id=network_id,
-            port_id=port_id,
-            ip_address=ip_address,
-            subnet_id=subnet_id
-        )
-        context.session.add(allocated)
+        allocated = port_obj.IPAllocation(
+            context, network_id=network_id, port_id=port_id,
+            ip_address=ip_address, subnet_id=subnet_id)
+        # NOTE(lujinluo): Add IPAllocations obj to the port fixed_ips
+        # in Port OVO integration, i.e. the same way we did in
+        # Ib32509d974c8654131112234bcf19d6eae8f7cca
+        allocated.create()
 
-    @classmethod
-    def _check_gateway_in_subnet(cls, cidr, gateway):
-        """Validate that the gateway is on the subnet."""
-        ip = netaddr.IPAddress(gateway)
-        if ip.version == 4 or (ip.version == 6 and not ip.is_link_local()):
-            return ipam_utils.check_subnet_ip(cidr, gateway)
-        return True
+    def _make_subnet_dict(self, subnet, fields=None, context=None):
+        if isinstance(subnet, subnet_obj.Subnet):
+            standard_attr_id = subnet.db_obj.standard_attr_id
+        else:
+            standard_attr_id = subnet.standard_attr_id
 
-    def _make_subnet_dict(self, subnet, fields=None):
+        # TODO(haleyb): migrate "tenant_id" to "project_id", remove in G+2
+        if subnet.get('tenant_id') and subnet.get('project_id') is None:
+            subnet['project_id'] = subnet['tenant_id']
+            LOG.warning('project_id key not found in subnet dictionary, using '
+                        'tenant_id instead. This support has been deprecated '
+                        'and will be removed in a future release.')
         res = {'id': subnet['id'],
                'name': subnet['name'],
-               'tenant_id': subnet['tenant_id'],
+               'project_id': subnet['project_id'],
                'network_id': subnet['network_id'],
                'ip_version': subnet['ip_version'],
-               'cidr': subnet['cidr'],
-               'subnetpool_id': subnet.get('subnetpool_id'),
-               'allocation_pools': [{'start': pool['first_ip'],
-                                     'end': pool['last_ip']}
-                                    for pool in subnet['allocation_pools']],
-               'gateway_ip': subnet['gateway_ip'],
+               'subnetpool_id': subnet['subnetpool_id'],
                'enable_dhcp': subnet['enable_dhcp'],
                'ipv6_ra_mode': subnet['ipv6_ra_mode'],
                'ipv6_address_mode': subnet['ipv6_address_mode'],
-               'dns_nameservers': [dns['address']
-                                   for dns in subnet['dns_nameservers']],
-               'host_routes': [{'destination': route['destination'],
-                                'nexthop': route['nexthop']}
-                               for route in subnet['routes']],
-               'shared': subnet['shared']
+               'standard_attr_id': standard_attr_id,
                }
-        # Call auxiliary extend functions, if any
-        self._apply_dict_extend_functions(attributes.SUBNETS, res, subnet)
-        return self._fields(res, fields)
+        res['gateway_ip'] = str(
+            subnet['gateway_ip']) if subnet['gateway_ip'] is not None else None
+        # TODO(korzen) this method can get subnet as DB object or Subnet OVO,
+        # so temporary workaround will be to fill in the fields in separate
+        # ways. After converting all code pieces to use Subnet OVO, the latter
+        # 'else' can be deleted
+        if isinstance(subnet, subnet_obj.Subnet):
+            res['cidr'] = str(subnet.cidr)
+            res['allocation_pools'] = [{'start': str(pool.start),
+                                        'end': str(pool.end)}
+                                       for pool in subnet.allocation_pools]
+            res['host_routes'] = [{'destination': str(route.destination),
+                                   'nexthop': str(route.nexthop)}
+                                  for route in subnet.host_routes]
+            res['dns_nameservers'] = [str(dns.address)
+                                      for dns in subnet.dns_nameservers]
+            res['shared'] = subnet.shared
+            # Call auxiliary extend functions, if any
+            resource_extend.apply_funcs(subnet_def.COLLECTION_NAME,
+                                        res, subnet.db_obj)
+        else:
+            res['cidr'] = subnet['cidr']
+            res['allocation_pools'] = [{'start': pool['first_ip'],
+                                        'end': pool['last_ip']}
+                                       for pool in subnet['allocation_pools']]
+            res['host_routes'] = [{'destination': route['destination'],
+                                   'nexthop': route['nexthop']}
+                                  for route in subnet['routes']]
+            res['dns_nameservers'] = [dns['address']
+                                      for dns in subnet['dns_nameservers']]
+
+            # The shared attribute for a subnet is the same
+            # as its parent network
+            res['shared'] = self._is_network_shared(context,
+                                                    subnet.rbac_entries)
+            # Call auxiliary extend functions, if any
+            resource_extend.apply_funcs(subnet_def.COLLECTION_NAME,
+                                        res, subnet)
+
+        return db_utils.resource_fields(res, fields)
 
     def _make_subnetpool_dict(self, subnetpool, fields=None):
         default_prefixlen = str(subnetpool['default_prefixlen'])
@@ -115,155 +212,164 @@ class DbBasePluginCommon(common_db_mixin.CommonDbMixin):
         max_prefixlen = str(subnetpool['max_prefixlen'])
         res = {'id': subnetpool['id'],
                'name': subnetpool['name'],
-               'tenant_id': subnetpool['tenant_id'],
+               'project_id': subnetpool['project_id'],
                'default_prefixlen': default_prefixlen,
                'min_prefixlen': min_prefixlen,
                'max_prefixlen': max_prefixlen,
+               'is_default': subnetpool['is_default'],
                'shared': subnetpool['shared'],
-               'prefixes': [prefix['cidr']
+               'prefixes': [str(prefix.cidr)
                             for prefix in subnetpool['prefixes']],
                'ip_version': subnetpool['ip_version'],
-               'default_quota': subnetpool['default_quota']}
-        return self._fields(res, fields)
+               'default_quota': subnetpool['default_quota'],
+               'address_scope_id': subnetpool['address_scope_id']}
+        resource_extend.apply_funcs(
+            subnetpool_def.COLLECTION_NAME, res, subnetpool.db_obj)
+        return db_utils.resource_fields(res, fields)
 
     def _make_port_dict(self, port, fields=None,
-                        process_extensions=True):
+                        process_extensions=True,
+                        with_fixed_ips=True,
+                        bulk=False):
+        if isinstance(port, port_obj.Port):
+            port_data = port.db_obj
+            standard_attr_id = port.db_obj.standard_attr_id
+        else:
+            port_data = port
+            standard_attr_id = port.standard_attr_id
+
+        mac = port["mac_address"]
+        if isinstance(mac, netaddr.EUI):
+            mac.dialect = netaddr.mac_unix_expanded
         res = {"id": port["id"],
                'name': port['name'],
                "network_id": port["network_id"],
-               'tenant_id': port['tenant_id'],
-               "mac_address": port["mac_address"],
+               'project_id': port['project_id'],
+               "mac_address": str(mac),
                "admin_state_up": port["admin_state_up"],
                "status": port["status"],
-               "fixed_ips": [{'subnet_id': ip["subnet_id"],
-                              'ip_address': ip["ip_address"]}
-                             for ip in port["fixed_ips"]],
                "device_id": port["device_id"],
-               "device_owner": port["device_owner"]}
+               "device_owner": port["device_owner"],
+               'standard_attr_id': standard_attr_id,
+               }
+        if with_fixed_ips:
+            res["fixed_ips"] = [
+                {'subnet_id': ip["subnet_id"],
+                 'ip_address': str(
+                     ip["ip_address"])} for ip in port["fixed_ips"]]
         # Call auxiliary extend functions, if any
         if process_extensions:
-            self._apply_dict_extend_functions(
-                attributes.PORTS, res, port)
-        return self._fields(res, fields)
+            res['bulk'] = bulk
+            resource_extend.apply_funcs(
+                port_def.COLLECTION_NAME, res, port_data)
+            res.pop('bulk')
+        return db_utils.resource_fields(res, fields)
 
+    @db_api.CONTEXT_READER
     def _get_network(self, context, id):
         try:
-            network = self._get_by_id(context, models_v2.Network, id)
+            network = model_query.get_by_id(context, models_v2.Network, id)
         except exc.NoResultFound:
-            raise n_exc.NetworkNotFound(net_id=id)
+            raise exceptions.NetworkNotFound(net_id=id)
         return network
 
-    def _get_subnet(self, context, id):
-        try:
-            subnet = self._get_by_id(context, models_v2.Subnet, id)
-        except exc.NoResultFound:
-            raise n_exc.SubnetNotFound(subnet_id=id)
+    @db_api.CONTEXT_READER
+    def _network_exists(self, context, network_id):
+        query = model_query.query_with_hooks(
+            context, models_v2.Network, field='id')
+        return query.filter(models_v2.Network.id == network_id).one_or_none()
+
+    def _get_subnet_object(self, context, id):
+        subnet = subnet_obj.Subnet.get_object(context, id=id)
+        if not subnet:
+            raise exceptions.SubnetNotFound(subnet_id=id)
         return subnet
 
     def _get_subnetpool(self, context, id):
-        try:
-            return self._get_by_id(context, models_v2.SubnetPool, id)
-        except exc.NoResultFound:
-            raise n_exc.SubnetPoolNotFound(subnetpool_id=id)
+        subnetpool = subnetpool_obj.SubnetPool.get_object(
+            context, id=id)
+        if not subnetpool:
+            raise exceptions.SubnetPoolNotFound(subnetpool_id=id)
+        return subnetpool
 
-    def _get_all_subnetpools(self, context):
-        # NOTE(tidwellr): see note in _get_all_subnets()
-        return context.session.query(models_v2.SubnetPool).all()
-
-    def _get_port(self, context, id):
+    @db_api.CONTEXT_READER
+    def _get_port(self, context, id, lazy_fields=None):
         try:
-            port = self._get_by_id(context, models_v2.Port, id)
+            port = model_query.get_by_id(context, models_v2.Port, id,
+                                         lazy_fields=lazy_fields)
         except exc.NoResultFound:
-            raise n_exc.PortNotFound(port_id=id)
+            raise exceptions.PortNotFound(port_id=id)
         return port
 
-    def _get_dns_by_subnet(self, context, subnet_id):
-        dns_qry = context.session.query(models_v2.DNSNameServer)
-        return dns_qry.filter_by(subnet_id=subnet_id).all()
-
     def _get_route_by_subnet(self, context, subnet_id):
-        route_qry = context.session.query(models_v2.SubnetRoute)
-        return route_qry.filter_by(subnet_id=subnet_id).all()
+        return subnet_obj.Route.get_objects(context,
+                                            subnet_id=subnet_id)
 
-    def _get_router_gw_ports_by_network(self, context, network_id):
-        port_qry = context.session.query(models_v2.Port)
-        return port_qry.filter_by(network_id=network_id,
-                device_owner=constants.DEVICE_OWNER_ROUTER_GW).all()
-
+    @db_api.CONTEXT_READER
     def _get_subnets_by_network(self, context, network_id):
-        subnet_qry = context.session.query(models_v2.Subnet)
-        return subnet_qry.filter_by(network_id=network_id).all()
+        return subnet_obj.Subnet.get_objects(context, network_id=network_id)
 
+    @db_api.CONTEXT_READER
     def _get_subnets_by_subnetpool(self, context, subnetpool_id):
-        subnet_qry = context.session.query(models_v2.Subnet)
-        return subnet_qry.filter_by(subnetpool_id=subnetpool_id).all()
+        return subnet_obj.Subnet.get_objects(context,
+                                             subnetpool_id=subnetpool_id)
 
-    def _get_all_subnets(self, context):
-        # NOTE(salvatore-orlando): This query might end up putting
-        # a lot of stress on the db. Consider adding a cache layer
-        return context.session.query(models_v2.Subnet).all()
-
-    def _get_subnets(self, context, filters=None, fields=None,
-                     sorts=None, limit=None, marker=None,
-                     page_reverse=False):
-        marker_obj = self._get_marker_obj(context, 'subnet', limit, marker)
-        return self._get_collection(context, models_v2.Subnet,
-                                    self._make_subnet_dict,
-                                    filters=filters, fields=fields,
-                                    sorts=sorts,
-                                    limit=limit,
-                                    marker_obj=marker_obj,
-                                    page_reverse=page_reverse)
+    def _get_subnets(self, context, filters=None, sorts=None, limit=None,
+                     marker=None, page_reverse=False):
+        pager = base_obj.Pager(sorts, limit, page_reverse, marker)
+        filters = filters or {}
+        # turn the CIDRs into a proper subnets
+        if filters.get('cidr'):
+            filters.update(
+                {'cidr': [netaddr.IPNetwork(x).cidr for x in filters['cidr']]})
+        return subnet_obj.Subnet.get_objects(context, _pager=pager,
+                                             validate_filters=False,
+                                             **filters)
 
     def _make_network_dict(self, network, fields=None,
-                           process_extensions=True):
+                           process_extensions=True, context=None):
+        # TODO(slaweq): Remove 'tenant_id' in the 2027.1 cycle, when it will
+        # not be registered for OwnerCheck anymore.
         res = {'id': network['id'],
                'name': network['name'],
-               'tenant_id': network['tenant_id'],
+               'tenant_id': network['project_id'],
+               'project_id': network['project_id'],
                'admin_state_up': network['admin_state_up'],
                'mtu': network.get('mtu', constants.DEFAULT_NETWORK_MTU),
                'status': network['status'],
-               'shared': network['shared'],
                'subnets': [subnet['id']
-                           for subnet in network['subnets']]}
-        # TODO(pritesh): Move vlan_transparent to the extension module.
-        # vlan_transparent here is only added if the vlantransparent
-        # extension is enabled.
-        if ('vlan_transparent' in network and network['vlan_transparent'] !=
-            attributes.ATTR_NOT_SPECIFIED):
-            res['vlan_transparent'] = network['vlan_transparent']
+                           for subnet in network['subnets']],
+               'standard_attr_id': network.standard_attr_id}
+        res['shared'] = self._is_network_shared(context, network.rbac_entries)
         # Call auxiliary extend functions, if any
         if process_extensions:
-            self._apply_dict_extend_functions(
-                attributes.NETWORKS, res, network)
-        return self._fields(res, fields)
+            resource_extend.apply_funcs(net_def.COLLECTION_NAME, res, network)
+        return db_utils.resource_fields(res, fields)
 
-    def _make_subnet_args(self, context, shared, detail,
-                          subnet, subnetpool_id=None):
-        args = {'tenant_id': detail.tenant_id,
+    def _is_network_shared(self, context, rbac_entries):
+        # The shared attribute for a network now reflects if the network
+        # is shared to the calling project via an RBAC entry.
+        matches = ('*',) + ((context.project_id,) if context else ())
+        for entry in rbac_entries:
+            if (entry.action == rbac_db_models.ACCESS_SHARED and
+                    entry.target_project in matches):
+                return True
+        return False
+
+    def _make_subnet_args(self, detail, subnet, subnetpool_id):
+        args = {'project_id': detail.project_id,
                 'id': detail.subnet_id,
                 'name': subnet['name'],
                 'network_id': subnet['network_id'],
                 'ip_version': subnet['ip_version'],
-                'cidr': str(detail.subnet_cidr),
+                'cidr': detail.subnet_cidr,
                 'subnetpool_id': subnetpool_id,
                 'enable_dhcp': subnet['enable_dhcp'],
-                'gateway_ip': self._gateway_ip_str(subnet, detail.subnet_cidr),
-                'shared': shared}
+                'gateway_ip': detail.gateway_ip,
+                'description': subnet.get('description')}
         if subnet['ip_version'] == 6 and subnet['enable_dhcp']:
-            if attributes.is_attr_set(subnet['ipv6_ra_mode']):
+            if validators.is_attr_set(subnet['ipv6_ra_mode']):
                 args['ipv6_ra_mode'] = subnet['ipv6_ra_mode']
-            if attributes.is_attr_set(subnet['ipv6_address_mode']):
+            if validators.is_attr_set(subnet['ipv6_address_mode']):
                 args['ipv6_address_mode'] = subnet['ipv6_address_mode']
         return args
-
-    def _make_fixed_ip_dict(self, ips):
-        # Excludes from dict all keys except subnet_id and ip_address
-        return [{'subnet_id': ip["subnet_id"],
-                 'ip_address': ip["ip_address"]}
-                for ip in ips]
-
-    def _gateway_ip_str(self, subnet, cidr_net):
-        if subnet.get('gateway_ip') is attributes.ATTR_NOT_SPECIFIED:
-                return str(cidr_net.network + 1)
-        return subnet.get('gateway_ip')

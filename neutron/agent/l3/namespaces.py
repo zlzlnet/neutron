@@ -13,10 +13,12 @@
 #    under the License.
 #
 
+import functools
+
 from oslo_log import log as logging
+from oslo_utils import excutils
 
 from neutron.agent.linux import ip_lib
-from neutron.i18n import _LE
 
 LOG = logging.getLogger(__name__)
 
@@ -43,7 +45,7 @@ def get_prefix_from_ns_name(ns_name):
     :returns: The prefix ending with a '-' or None if there is no '-'
     """
     dash_index = ns_name.find('-')
-    if 0 <= dash_index:
+    if dash_index >= 0:
         return ns_name[:dash_index + 1]
 
 
@@ -54,11 +56,30 @@ def get_id_from_ns_name(ns_name):
     :returns: Identifier or None if there is no - to end the prefix
     """
     dash_index = ns_name.find('-')
-    if 0 <= dash_index:
+    if dash_index >= 0:
         return ns_name[dash_index + 1:]
 
 
-class Namespace(object):
+def check_ns_existence(f):
+    @functools.wraps(f)
+    def wrapped(self, *args, **kwargs):
+        if not self.exists():
+            LOG.warning('Namespace %(name)s does not exist. Skipping '
+                        '%(func)s',
+                        {'name': self.name, 'func': f.__name__})
+            return
+        try:
+            return f(self, *args, **kwargs)
+        except RuntimeError:
+            with excutils.save_and_reraise_exception() as ctx:
+                if not self.exists():
+                    LOG.debug('Namespace %(name)s was concurrently deleted',
+                              self.name)
+                    ctx.reraise = False
+    return wrapped
+
+
+class Namespace:
 
     def __init__(self, name, agent_conf, driver, use_ipv6):
         self.name = name
@@ -67,21 +88,43 @@ class Namespace(object):
         self.driver = driver
         self.use_ipv6 = use_ipv6
 
-    def create(self):
-        ip_wrapper = self.ip_wrapper_root.ensure_namespace(self.name)
-        cmd = ['sysctl', '-w', 'net.ipv4.ip_forward=1']
-        ip_wrapper.netns.execute(cmd)
+    def create(self, ipv6_forwarding=True,
+               conntrack_tcp_timeout_established=0):
+        self.ip_wrapper_root.ensure_namespace(self.name)
+        # See networking (netdev) tree, file
+        # Documentation/networking/ip-sysctl.txt for an explanation of
+        # these sysctl values.
+        # Here's what we are setting:
+        # 1) nf_conntrack_tcp_be_liberal=1 - Be liberal in the state tracking
+        #    to avoid issues with TCP window scaling
+        # 2) ip_forward=1 - Turn on IP forwarding
+        # 3) arp_ignore=1 - Reply only if the target IP address is local
+        #    address configured on the incoming interface
+        # 4) arp_announce=2 - Always use the best local address
+        # 5) forwarding=0/1 - Turn on/off IPv6 forwarding
+        # 6) nf_conntrack_tcp_timeout_established - Expire the established
+        #    TCP connections idle for this time, if configured
+        cmd = ['net.netfilter.nf_conntrack_tcp_be_liberal=1',
+               'net.ipv4.ip_forward=1',
+               'net.ipv4.conf.all.arp_ignore=1',
+               'net.ipv4.conf.all.arp_announce=2']
         if self.use_ipv6:
-            cmd = ['sysctl', '-w', 'net.ipv6.conf.all.forwarding=1']
-            ip_wrapper.netns.execute(cmd)
+            cmd.append(
+                'net.ipv6.conf.all.forwarding=%d' % int(ipv6_forwarding))
+        if conntrack_tcp_timeout_established:
+            cmd.append('net.netfilter.nf_conntrack_tcp_timeout_established='
+                       '%d' % conntrack_tcp_timeout_established)
+        ip_lib.sysctl(cmd, namespace=self.name)
 
     def delete(self):
-        if self.agent_conf.router_delete_namespaces:
-            try:
-                self.ip_wrapper_root.netns.delete(self.name)
-            except RuntimeError:
-                msg = _LE('Failed trying to delete namespace: %s')
-                LOG.exception(msg, self.name)
+        try:
+            self.ip_wrapper_root.netns.delete(self.name)
+        except RuntimeError:
+            msg = 'Failed trying to delete namespace: %s'
+            LOG.exception(msg, self.name)
+
+    def exists(self):
+        return self.ip_wrapper_root.netns.exists(self.name)
 
 
 class RouterNamespace(Namespace):
@@ -89,16 +132,23 @@ class RouterNamespace(Namespace):
     def __init__(self, router_id, agent_conf, driver, use_ipv6):
         self.router_id = router_id
         name = self._get_ns_name(router_id)
-        super(RouterNamespace, self).__init__(
+        super().__init__(
             name, agent_conf, driver, use_ipv6)
 
     @classmethod
     def _get_ns_name(cls, router_id):
         return build_ns_name(NS_PREFIX, router_id)
 
+    def create(self, ipv6_forwarding=True):
+        super().create(
+            ipv6_forwarding=ipv6_forwarding,
+            conntrack_tcp_timeout_established=(
+                self.agent_conf.conntrack_tcp_timeout_established))
+
+    @check_ns_existence
     def delete(self):
         ns_ip = ip_lib.IPWrapper(namespace=self.name)
-        for d in ns_ip.get_devices(exclude_loopback=True):
+        for d in ns_ip.get_devices():
             if d.name.startswith(INTERNAL_DEV_PREFIX):
                 # device is on default bridge
                 self.driver.unplug(d.name, namespace=self.name,
@@ -108,8 +158,7 @@ class RouterNamespace(Namespace):
             elif d.name.startswith(EXTERNAL_DEV_PREFIX):
                 self.driver.unplug(
                     d.name,
-                    bridge=self.agent_conf.external_network_bridge,
                     namespace=self.name,
                     prefix=EXTERNAL_DEV_PREFIX)
 
-        super(RouterNamespace, self).delete()
+        super().delete()

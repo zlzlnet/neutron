@@ -13,15 +13,13 @@
 
 # These tables are in the neutron database, but their models have moved
 # to separate repositories. We skip the migration checks for these tables.
+# BGP models in openstack/neutron-dynamic-routing
+REPO_NEUTRON_DYNAMIC_ROUTING_TABLES = [
+    'bgp_speakers',
+    'bgp_peers',
+    'bgp_speaker_network_bindings',
+    'bgp_speaker_peer_bindings',
+    'bgp_speaker_dragent_bindings',
+]
 
-VPNAAS_TABLES = ['vpnservices', 'ipsecpolicies', 'ipsecpeercidrs',
-                 'ipsec_site_connections', 'cisco_csr_identifier_map',
-                 'ikepolicies']
-
-LBAAS_TABLES = ['vips', 'sessionpersistences', 'pools', 'healthmonitors',
-                'poolstatisticss', 'members', 'poolloadbalanceragentbindings',
-                'embrane_pool_port', 'poolmonitorassociations']
-
-FWAAS_TABLES = ['firewall_rules', 'firewalls', 'firewall_policies']
-
-TABLES = (FWAAS_TABLES + LBAAS_TABLES + VPNAAS_TABLES)
+TABLES = REPO_NEUTRON_DYNAMIC_ROUTING_TABLES

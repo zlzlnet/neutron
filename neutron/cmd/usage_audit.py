@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 # Copyright (c) 2012 New Dream Network, LLC (DreamHost)
 # All Rights Reserved.
 #
@@ -20,18 +19,24 @@ subnets.
 
 import sys
 
+from neutron_lib import context
+from neutron_lib.plugins import constants
+from neutron_lib.plugins import directory
+from neutron_lib import rpc as n_rpc
+
 from neutron.common import config
-from neutron.common import rpc as n_rpc
-from neutron import context
 from neutron import manager
 
 
 def main():
+    config.register_common_config_options()
     config.init(sys.argv[1:])
     config.setup_logging()
 
     cxt = context.get_admin_context()
-    plugin = manager.NeutronManager.get_plugin()
+    manager.init()
+    plugin = directory.get_plugin()
+    l3_plugin = directory.get_plugin(constants.L3)
     notifier = n_rpc.get_notifier('network')
     for network in plugin.get_networks(cxt):
         notifier.info(cxt, 'network.exists', {'network': network})
@@ -39,7 +44,7 @@ def main():
         notifier.info(cxt, 'subnet.exists', {'subnet': subnet})
     for port in plugin.get_ports(cxt):
         notifier.info(cxt, 'port.exists', {'port': port})
-    for router in plugin.get_routers(cxt):
+    for router in l3_plugin.get_routers(cxt):
         notifier.info(cxt, 'router.exists', {'router': router})
-    for floatingip in plugin.get_floatingips(cxt):
+    for floatingip in l3_plugin.get_floatingips(cxt):
         notifier.info(cxt, 'floatingip.exists', {'floatingip': floatingip})

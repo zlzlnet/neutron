@@ -13,20 +13,22 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from neutron_lib.api.definitions import servicetype as svctype_apidef
+from neutron_lib import exceptions
+from neutron_lib.plugins import directory
+from neutron_lib.services import base as service_base
 from oslo_utils import uuidutils
 
 from neutron.api import extensions
 from neutron.api.v2 import base
-from neutron.common import exceptions
 from neutron.db import servicetype_db
-from neutron.extensions import servicetype
-from neutron import manager
-from neutron.plugins.common import constants
-from neutron.services import service_base
+from neutron import neutron_plugin_base_v2
 
 
 RESOURCE_NAME = "dummy"
 COLLECTION_NAME = "%ss" % RESOURCE_NAME
+DUMMY_SERVICE_TYPE = "DUMMY"
+DUMMY_SERVICE_WITH_REQUIRE_TYPE = "DUMMY_REQIURE"
 
 # Attribute Map for dummy resource
 RESOURCE_ATTRIBUTE_MAP = {
@@ -37,9 +39,9 @@ RESOURCE_ATTRIBUTE_MAP = {
         'name': {'allow_post': True, 'allow_put': True,
                  'validate': {'type:string': None},
                  'is_visible': True, 'default': ''},
-        'tenant_id': {'allow_post': True, 'allow_put': False,
-                      'required_by_policy': True,
-                      'is_visible': True},
+        'project_id': {'allow_post': True, 'allow_put': False,
+                       'required_by_policy': True,
+                       'is_visible': True},
         'service_type': {'allow_post': True,
                          'allow_put': False,
                          'validate': {'type:servicetype_ref': None},
@@ -49,15 +51,15 @@ RESOURCE_ATTRIBUTE_MAP = {
 }
 
 
-class Dummy(object):
+class Dummy:
 
     @classmethod
     def get_name(cls):
-        return "dummy"
+        return RESOURCE_NAME
 
     @classmethod
     def get_alias(cls):
-        return "dummy"
+        return RESOURCE_NAME
 
     @classmethod
     def get_description(cls):
@@ -70,8 +72,7 @@ class Dummy(object):
     @classmethod
     def get_resources(cls):
         """Returns Extended Resource for dummy management."""
-        q_mgr = manager.NeutronManager.get_instance()
-        dummy_inst = q_mgr.get_service_plugins()['DUMMY']
+        dummy_inst = directory.get_plugin(DUMMY_SERVICE_TYPE)
         controller = base.create_resource(
             COLLECTION_NAME, RESOURCE_NAME, dummy_inst,
             RESOURCE_ATTRIBUTE_MAP[COLLECTION_NAME])
@@ -80,22 +81,24 @@ class Dummy(object):
 
 
 class DummyServicePlugin(service_base.ServicePluginBase):
-    """This is a simple plugin for managing instantes of a fictional 'dummy'
+    """This is a simple plugin for managing instances of a fictional 'dummy'
         service. This plugin is provided as a proof-of-concept of how
         advanced service might leverage the service type extension.
-        Ideally, instances of real advanced services, such as load balancing
+        Ideally, instances of real advanced services, such as firewall
         or VPN will adopt a similar solution.
     """
 
-    supported_extension_aliases = ['dummy', servicetype.EXT_ALIAS]
-    agent_notifiers = {'dummy': 'dummy_agent_notifier'}
+    supported_extension_aliases = [RESOURCE_NAME, svctype_apidef.ALIAS]
+    path_prefix = "/dummy_svc"
+    agent_notifiers = {RESOURCE_NAME: 'dummy_agent_notifier'}
 
     def __init__(self):
         self.svctype_mgr = servicetype_db.ServiceTypeManager.get_instance()
         self.dummys = {}
 
-    def get_plugin_type(self):
-        return constants.DUMMY
+    @classmethod
+    def get_plugin_type(cls):
+        return DUMMY_SERVICE_TYPE
 
     def get_plugin_description(self):
         return "Neutron Dummy Service Plugin"
@@ -110,7 +113,7 @@ class DummyServicePlugin(service_base.ServicePluginBase):
             raise exceptions.NotFound()
 
     def create_dummy(self, context, dummy):
-        d = dummy['dummy']
+        d = dummy[RESOURCE_NAME]
         d['id'] = uuidutils.generate_uuid()
         self.dummys[d['id']] = d
         self.svctype_mgr.increase_service_type_refcount(context,
@@ -128,3 +131,65 @@ class DummyServicePlugin(service_base.ServicePluginBase):
                                                             svc_type_id)
         except KeyError:
             raise exceptions.NotFound()
+
+
+class DummyWithRequireServicePlugin(DummyServicePlugin):
+    required_service_plugins = ['dummy']
+
+    @classmethod
+    def get_plugin_type(cls):
+        return DUMMY_SERVICE_WITH_REQUIRE_TYPE
+
+    def get_plugin_description(self):
+        return "Neutron Dummy Service Plugin with requirements"
+
+
+class DummyCorePluginWithoutDatastore(
+        neutron_plugin_base_v2.NeutronPluginBaseV2):
+    def create_subnet(self, context, subnet):
+        pass
+
+    def update_subnet(self, context, id, subnet):
+        pass
+
+    def get_subnet(self, context, id, fields=None):
+        pass
+
+    def get_subnets(self, context, filters=None, fields=None,
+                    sorts=None, limit=None, marker=None, page_reverse=False):
+        pass
+
+    def delete_subnet(self, context, id):
+        pass
+
+    def create_network(self, context, network):
+        pass
+
+    def update_network(self, context, id, network):
+        pass
+
+    def get_network(self, context, id, fields=None):
+        pass
+
+    def get_networks(self, context, filters=None, fields=None,
+                     sorts=None, limit=None, marker=None, page_reverse=False):
+        pass
+
+    def delete_network(self, context, id):
+        pass
+
+    def create_port(self, context, port):
+        pass
+
+    def update_port(self, context, id, port):
+        pass
+
+    def get_port(self, context, id, fields=None):
+        pass
+
+    def get_ports(self, context, filters=None, fields=None,
+                  sorts=None, limit=None, marker=None, page_reverse=False):
+        pass
+
+    def delete_port(self, context, id):
+        pass

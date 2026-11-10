@@ -1,0 +1,1484 @@
+# Copyright 2020 Red Hat, Inc.
+#
+#    Licensed under the Apache License, Version 2.0 (the "License"); you may
+#    not use this file except in compliance with the License. You may obtain
+#    a copy of the License at
+#
+#         http://www.apache.org/licenses/LICENSE-2.0
+#
+#    Unless required by applicable law or agreed to in writing, software
+#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+#    License for the specific language governing permissions and limitations
+#    under the License.
+import datetime
+import functools
+import subprocess
+import threading
+from unittest import mock
+
+import fixtures as og_fixtures
+from neutron_lib.api.definitions import allowedaddresspairs
+from neutron_lib.api.definitions import external_net
+from neutron_lib.api.definitions import portbindings
+from neutron_lib.api.definitions import provider_net
+from neutron_lib import context
+from neutron_lib.plugins import constants as plugin_constants
+from neutron_lib.plugins import directory
+from oslo_concurrency import processutils
+from oslo_utils import strutils
+from oslo_utils import timeutils
+from oslo_utils import uuidutils
+from ovsdbapp.backend.ovs_idl import event
+from ovsdbapp.backend.ovs_idl import idlutils
+import tenacity
+
+from neutron.common.ovn import constants as ovn_const
+from neutron.common.ovn import utils as ovn_utils
+from neutron.common import utils as n_utils
+from neutron.conf.plugins.ml2.drivers.ovn import ovn_conf
+from neutron.db import ovn_hash_ring_db as db_hash_ring
+from neutron.plugins.ml2.drivers.ovn.agent import neutron_agent
+from neutron.plugins.ml2.drivers.ovn.mech_driver.ovsdb import ovn_client
+from neutron.plugins.ml2.drivers.ovn.mech_driver.ovsdb import ovsdb_monitor
+from neutron.tests.functional import base
+from neutron.tests.functional.resources.ovsdb import events as test_events
+from neutron.tests.functional.resources.ovsdb import fixtures
+from neutron.tests.functional.resources import process
+from neutron.tests.unit.api import test_extensions
+from neutron.tests.unit.extensions import test_l3
+
+
+class WaitForDataPathBindingCreateEvent(event.WaitEvent):
+    event_name = 'WaitForDataPathBindingCreateEvent'
+
+    def __init__(self, net_name):
+        table = 'Datapath_Binding'
+        events = (self.ROW_CREATE,)
+        self._net_name = net_name
+        self.core_plugin = directory.get_plugin()
+        self.context = context.get_admin_context()
+        super().__init__(events, table, None, timeout=15)
+
+    def match_fn(self, event, row, old=None):
+        ls_name = row.external_ids.get('name')
+        networks = self.core_plugin.get_networks(
+            self.context, filters={'name': [self._net_name]})
+        try:
+            return ovn_utils.ovn_name(networks[0]['id']) == ls_name
+        except (IndexError, KeyError):
+            return False
+
+
+class WaitForChassisPrivateCreateEvent(event.WaitEvent):
+    event_name = 'WaitForChassisPrivateCreateEvent'
+
+    def __init__(self, chassis_name):
+        events = (self.ROW_CREATE,)
+        conditions = (('name', '=', chassis_name),)
+        super().__init__(events, 'Chassis_Private', conditions, timeout=15)
+
+
+class WaitForChassisAgentDeleteEvent(event.WaitEvent):
+    event_name = 'WaitForChassisAgentDeleteEvent'
+
+    def __init__(self):
+        events = (self.ROW_UPDATE,)
+        super().__init__(events, 'SB_Global', {}, timeout=15)
+
+    def match_fn(self, event, row, old=None):
+        try:
+            return (old.external_ids.get('delete_agent') !=
+                    row.external_ids['delete_agent'])
+        except (AttributeError, KeyError):
+            return False
+
+
+class WaitForPortBindingFIPEvent(event.WaitEvent):
+    event_name = 'WaitForPortBindingFIPEvent'
+
+    def __init__(self, fip):
+        events = (self.ROW_UPDATE, )
+        self._fip = fip
+        super().__init__(events, 'Port_Binding', {}, timeout=15)
+
+    def match_fn(self, event, row, old=None):
+        try:
+            return (row.external_ids[ovn_const.OVN_PORT_FIP_EXT_ID_KEY] ==
+                    self._fip)
+        except (AttributeError, KeyError):
+            return False
+
+
+class DistributedLockTestEvent(event.WaitEvent):
+    ONETIME = False
+    COUNTER = 0
+
+    def __init__(self):
+        table = 'Logical_Switch_Port'
+        events = (self.ROW_CREATE,)
+        super().__init__(
+            events, table, (), timeout=15)
+        self.event_name = 'DistributedLockTestEvent'
+
+    def run(self, event, row, old):
+        self.COUNTER += 1
+        self.event.set()
+
+
+class WaitForLogicalSwitchPortUpdateEvent(event.WaitEvent):
+    event_name = 'WaitForDataPathBindingCreateEvent'
+
+    def __init__(self):
+        table = 'Logical_Switch_Port'
+        events = (self.ROW_UPDATE,)
+        super().__init__(events, table, None, timeout=15)
+
+
+class WaitForLogicalRouterPortCreateEvent(event.WaitEvent):
+    event_name = 'WaitForLogicalRouterPortCreateEvent'
+
+    def __init__(self):
+        table = 'Logical_Router_Port'
+        events = (self.ROW_CREATE,)
+        super().__init__(events, table, None, timeout=15)
+
+
+class GlobalTestEvent(DistributedLockTestEvent):
+    GLOBAL = True
+
+
+class WaitForPortBindingCreateEvent(event.WaitEvent):
+    event_name = 'WaitForPortBindingCreateEvent'
+
+    def __init__(self, net_name):
+        table = 'Port_Binding'
+        events = (self.ROW_CREATE,)
+        conditions = (('external_ids', '=',
+                       {ovn_const.OVN_NETWORK_NAME_EXT_ID_KEY: net_name}),)
+        super().__init__(events, table, conditions, timeout=15)
+
+
+class WaitForPortBindingChassisBindEvent(event.WaitEvent):
+    """Wait until a logical port is bound to a single chassis on SB."""
+
+    event_name = 'WaitForPortBindingChassisBindEvent'
+
+    def __init__(self, logical_port, chassis_name, timeout=10):
+        self._logical_port = logical_port
+        self._chassis_name = chassis_name
+        super().__init__(
+            (self.ROW_UPDATE,), 'Port_Binding', None, timeout=timeout)
+
+    def match_fn(self, event, row, old=None):
+        if row.logical_port != self._logical_port:
+            return False
+        if not row.chassis:
+            return False
+        try:
+            if row.chassis[0].name != self._chassis_name:
+                return False
+        except (IndexError, AttributeError):
+            return False
+        old_chassis = getattr(old, 'chassis', None)
+        if hasattr(old, 'chassis') and row.chassis == old_chassis:
+            return False
+        return True
+
+
+class TestNBDbMonitor(base.TestOVNFunctionalBase):
+
+    def setUp(self):
+        super().setUp()
+        self.chassis = self.add_fake_chassis('ovs-host1')
+        self.l3_plugin = directory.get_plugin(plugin_constants.L3)
+        self.net = self._make_network(self.fmt, 'net1', True)
+        self._make_subnet(self.fmt, self.net, '20.0.0.1', '20.0.0.0/24',
+                          ip_version=4)
+
+    def create_port(self, device_owner='compute:nova', host='ovs-host1',
+                    allowed_address_pairs=None):
+        allowed_address_pairs = allowed_address_pairs or []
+        arg_list = ('device_owner', 'device_id', portbindings.HOST_ID,
+                    allowedaddresspairs.ADDRESS_PAIRS)
+        host_arg = {'device_owner': device_owner,
+                    'device_id': uuidutils.generate_uuid(),
+                    portbindings.HOST_ID: host,
+                    allowedaddresspairs.ADDRESS_PAIRS: allowed_address_pairs
+                    }
+        port_res = self._create_port(self.fmt, self.net['network']['id'],
+                                     is_admin=True,
+                                     arg_list=arg_list, **host_arg)
+        port = self.deserialize(self.fmt, port_res)['port']
+        return port
+
+    def _create_fip(self, port, fip_address):
+        e1 = self._make_network(self.fmt, 'e1', True, as_admin=True,
+                                arg_list=('router:external',
+                                          'provider:network_type',
+                                          'provider:physical_network'),
+                                **{'router:external': True,
+                                   'provider:network_type': 'flat',
+                                   'provider:physical_network': 'public'})
+        res = self._create_subnet(self.fmt, e1['network']['id'],
+                                  '100.0.0.0/24', gateway_ip='100.0.0.254',
+                                  allocation_pools=[{'start': '100.0.0.2',
+                                                     'end': '100.0.0.253'}],
+                                  enable_dhcp=False)
+        e1_s1 = self.deserialize(self.fmt, res)
+        r1 = self.l3_plugin.create_router(
+            self.context,
+            {'router': {
+                'name': 'r1', 'admin_state_up': True,
+                'project_id': self._project_id,
+                'external_gateway_info': {
+                    'enable_snat': True,
+                    'network_id': e1['network']['id'],
+                    'external_fixed_ips': [
+                        {'ip_address': '100.0.0.2',
+                         'subnet_id': e1_s1['subnet']['id']}]}}})
+        self.l3_plugin.add_router_interface(
+            self.context, r1['id'],
+            {'subnet_id': port['fixed_ips'][0]['subnet_id']})
+        r1_f2 = self.l3_plugin.create_floatingip(
+            self.context, {'floatingip': {
+                'project_id': self._project_id,
+                'floating_network_id': e1['network']['id'],
+                'subnet_id': None,
+                'floating_ip_address': fip_address,
+                'port_id': port['id']}})
+        return r1_f2
+
+    @tenacity.retry(
+        retry=tenacity.retry_if_exception_type(subprocess.TimeoutExpired),
+        wait=tenacity.wait_exponential(multiplier=0.02, max=1),
+        reraise=True)
+    def _check_mac_binding_exists(self, macb_id):
+        cmd = ['ovsdb-client', 'transact',
+               self.mech_driver.sb_ovn.connection_string]
+
+        cmd += ['["OVN_Southbound", {"op": "select", "table": "MAC_Binding", '
+                '"where": [["_uuid", "==", ["uuid", "%s"]]]}]' % macb_id]
+
+        out, _ = processutils.execute(*cmd, log_errors=False, timeout=3)
+        return str(macb_id) in out
+
+    def test_floatingip_mac_bindings(self):
+        """Check that MAC_Binding entries are cleared on FIP add/removal
+
+        This test will:
+        * Create a MAC_Binding entry for an IP address on the
+        'network1' datapath.
+        * Create a FIP with that same IP address on an external.
+        network and associate it to a Neutron port on a private network.
+        * Check that the MAC_Binding entry gets deleted.
+        * Create a new MAC_Binding entry for the same IP address.
+        * Delete the FIP.
+        * Check that the MAC_Binding entry gets deleted.
+        """
+        net_name = 'network1'
+        self.mech_driver.sb_ovn.idl.update_tables(
+            ['MAC_Binding'], self.mech_driver.sb_schema_helper.schema_json)
+        row_event = WaitForDataPathBindingCreateEvent(net_name)
+        self.mech_driver.sb_ovn.idl.notify_handler.watch_event(row_event)
+        net = self._make_network(self.fmt, net_name, True)
+        self.assertTrue(row_event.wait())
+        ls_name = ovn_utils.ovn_name(net['network']['id'])
+        dp = self.sb_api.db_find(
+            'Datapath_Binding',
+            ('external_ids', '=', {'name': ls_name})).execute()
+        macb_id = self.sb_api.db_create('MAC_Binding', datapath=dp[0]['_uuid'],
+                                        ip='100.0.0.21').execute()
+        port = self.create_port()
+
+        # Ensure that the MAC_Binding entry gets deleted after creating a FIP
+        fip_event = WaitForPortBindingFIPEvent('100.0.0.21')
+        self.mech_driver.sb_ovn.idl.notify_handler.watch_event(fip_event)
+        fip = self._create_fip(port, '100.0.0.21')
+        self.assertTrue(fip_event.wait())
+        # TODO(ralonsoh): restore the timeout=15 value (or even lower) once
+        # the eventlet removal finishes.
+        n_utils.wait_until_true(
+            lambda: not self._check_mac_binding_exists(macb_id),
+            timeout=30, sleep=1)
+
+        # Now that the FIP is created, add a new MAC_Binding entry with the
+        # same IP address
+        macb_id = self.sb_api.db_create('MAC_Binding', datapath=dp[0]['_uuid'],
+                                        ip='100.0.0.21').execute()
+
+        # Ensure that the MAC_Binding entry gets deleted after deleting the FIP
+        self.l3_plugin.delete_floatingip(self.context, fip['id'])
+        # TODO(ralonsoh): restore the timeout=15 value (or even lower) once
+        # the eventlet removal finishes.
+        n_utils.wait_until_true(
+            lambda: not self._check_mac_binding_exists(macb_id),
+            timeout=30, sleep=1)
+
+    def _test_port_binding_and_status(self, port_id, action, status):
+        # This function binds or unbinds port to chassis and
+        # checks if port status matches with input status
+        core_plugin = directory.get_plugin()
+        self.sb_api.check_for_row_by_value_and_retry(
+            'Port_Binding', 'logical_port', port_id)
+
+        def check_port_status(status):
+            port = core_plugin.get_ports(
+                self.context, filters={'id': [port_id]})[0]
+            return port['status'] == status
+        with self.sb_api.transaction(check_error=True) as txn:
+            if action == 'bind':
+                txn.add(self.sb_api.lsp_bind(
+                    port_id, self.chassis, may_exist=True))
+                up = True
+            else:
+                txn.add(self.sb_api.lsp_unbind(port_id))
+                up = False
+            # TODO(jlibosva): Remove once commit
+            #                 a8dcb36c33fe7720e20de4d85bad2f461d102a01 is
+            #                 available in ovsdbapp release
+            txn.add(self.sb_api.db_set('Port_Binding', port_id, up=up))
+        n_utils.wait_until_true(lambda: check_port_status(status))
+
+    def test_port_up_down_events(self):
+        """Test the port up down events.
+
+        This test case creates a port, binds the port to chassis,
+        tests if the ovsdb monitor calls mech_driver to set port status
+        to 'ACTIVE'. Then unbinds the port and checks if the port status
+        is set to "DOWN'
+        """
+        port = self.create_port()
+        self._test_port_binding_and_status(port['id'], 'bind', 'ACTIVE')
+        self._test_port_binding_and_status(port['id'], 'unbind', 'DOWN')
+
+    def _create_workers(self, row_event, worker_num):
+        self.mech_driver.nb_ovn.idl.notify_handler.watch_event(row_event)
+        worker_list = [self.mech_driver.nb_ovn]
+
+        # Create 10 fake workers
+        for _ in range(worker_num):
+            node_uuid = uuidutils.generate_uuid()
+            db_hash_ring.add_node(
+                self.context, ovn_const.HASH_RING_ML2_GROUP, node_uuid)
+            fake_driver = mock.MagicMock(
+                node_uuid=node_uuid,
+                hash_ring_group=ovn_const.HASH_RING_ML2_GROUP)
+            _idl = ovsdb_monitor.OvnNbIdl.from_server(
+                self.ovsdb_server_mgr.get_ovsdb_connection_path(),
+                self.nb_api.schema_helper, fake_driver)
+            worker = self.useFixture(
+                fixtures.OVNIdlConnectionFixture(
+                    idl=_idl, timeout=10)).connection
+            worker.idl.notify_handler.watch_event(row_event)
+            worker.start()
+            worker_list.append(worker)
+
+        # Refresh the hash rings just in case
+        for worker in worker_list:
+            worker.idl._hash_ring.refresh()
+
+        # Assert we have 11 active workers in the ring
+        self.assertEqual(
+            worker_num + 1,
+            len(db_hash_ring.get_active_nodes(
+                self.context,
+                interval=ovn_const.HASH_RING_NODES_TIMEOUT,
+                group_name=ovn_const.HASH_RING_ML2_GROUP)))
+
+        return worker_list
+
+    def test_distributed_lock(self):
+        row_event = DistributedLockTestEvent()
+        self._create_workers(row_event, worker_num=10)
+        # Trigger the event
+        self.create_port()
+
+        # Wait for the event to complete
+        self.assertTrue(row_event.wait())
+
+        # Assert that only one worker handled the event
+        self.assertEqual(1, row_event.COUNTER)
+
+    def test_global_events(self):
+        worker_num = 10
+        distributed_event = DistributedLockTestEvent()
+        global_event = GlobalTestEvent()
+        worker_list = self._create_workers(distributed_event, worker_num)
+        for worker in worker_list:
+            worker.idl.notify_handler.watch_event(global_event)
+
+        # This should generate one distributed even handled by a single worker
+        # and one global event, that should be handled by all workers
+        self.create_port()
+
+        # Wait for the distributed event to complete
+        self.assertTrue(distributed_event.wait())
+
+        # Assert that only one worker handled the distributed event
+        self.assertEqual(1, distributed_event.COUNTER)
+
+        n_utils.wait_until_true(
+            lambda: global_event.COUNTER == worker_num + 1,
+            exception=Exception(
+                "Fanout event didn't get handled expected %d times" %
+                (worker_num + 1)))
+
+    def _find_port_binding(self, port_id):
+        cmd = self.sb_api.db_find_rows('Port_Binding',
+                                       ('logical_port', '=', port_id))
+        rows = cmd.execute(check_error=True)
+        return rows[0] if rows else None
+
+    def _set_port_binding_virtual_parent(self, port_id, parent_port_id):
+        pb_port_parent = self.sb_api.db_find_rows(
+            'Port_Binding', ('logical_port', '=', parent_port_id)).execute(
+            check_error=True)[0]
+        pb_port_vip = self.sb_api.db_find_rows(
+            'Port_Binding', ('logical_port', '=', port_id)).execute(
+            check_error=True)[0]
+        pb_virtual_parent = str(pb_port_parent.uuid)
+        self.sb_api.db_set(
+            'Port_Binding', pb_port_vip.uuid,
+            ('chassis', pb_port_parent.chassis),
+            ('virtual_parent', pb_virtual_parent)).execute(check_error=True)
+
+    def _check_port_binding_type(self, port_id, port_type):
+        def is_port_binding_type(port_id, port_type):
+            bp = self._find_port_binding(port_id)
+            if not bp:
+                return False
+            return port_type == bp.type
+
+        check = functools.partial(is_port_binding_type, port_id, port_type)
+        n_utils.wait_until_true(check, timeout=10)
+
+    def _check_port_virtual_parents(self, port_id, vparents):
+        def is_port_virtual_parents(port_id, vparents):
+            bp = self._find_port_binding(port_id)
+            vp = bp.options.get(ovn_const.LSP_OPTIONS_VIRTUAL_PARENTS_KEY)
+
+            # If the given vparents is None, or if the current value is None
+            # Then just do a check on that, no need to split strings if it
+            # is not required
+            if None in (vp, vparents):
+                return vp == vparents
+
+            # Since the virtual parents is a string, representing a list of
+            # ports, we should make a set() and compare sets
+            bp_set = set(vp.split(','))
+            vp_set = set(vparents.split(','))
+            return bp_set == vp_set
+
+        check = functools.partial(is_port_virtual_parents, port_id, vparents)
+        n_utils.wait_until_true(check, timeout=10)
+
+    @mock.patch.object(ovn_client.OVNClient, 'update_virtual_port_parent_host')
+    def test_virtual_port_parent_host_update(self, mock_update_vip_phost):
+        # NOTE: because we can't simulate traffic from a port, this check is
+        # not done in this test. This test checks the VIP host is unset when
+        # the port allowed address pairs are removed.
+        vip = self.create_port(device_owner='', host='')
+        vip_address = vip['fixed_ips'][0]['ip_address']
+        allowed_address_pairs = [{'ip_address': vip_address}]
+        port = self.create_port()
+        self._check_port_binding_type(vip['id'], '')
+
+        # 1) Set the allowed address pairs.
+        data = {'port': {'allowed_address_pairs': allowed_address_pairs}}
+        req = self.new_update_request('ports', data, port['id'])
+        req.get_response(self.api)
+        # This test checks that the VIP "Port_Binding" register gets the type
+        # and the corresponding "virtual-parents".
+        self._check_port_binding_type(vip['id'], ovn_const.LSP_TYPE_VIRTUAL)
+        self._check_port_virtual_parents(vip['id'], port['id'])
+
+        # 2) Unset the allowed address pairs.
+        # Assign the VIP again and delete the virtual port.
+        # Before unsetting the allowed address pairs, we first manually add
+        # the Port_Binding.virtual_parent of the virtual port. That happens
+        # when an ovn-controller detects traffic with the VIP and assign the
+        # port hosting the VIP as virtual parent.
+        self._set_port_binding_virtual_parent(vip['id'], port['id'])
+        mock_update_vip_phost.reset_mock()
+        data = {'port': {'allowed_address_pairs': []}}
+        req = self.new_update_request('ports', data, port['id'])
+        req.get_response(self.api)
+        self._check_port_binding_type(vip['id'], '')
+        self._check_port_virtual_parents(vip['id'], None)
+        n_utils.wait_until_true(lambda: mock_update_vip_phost.called,
+                                timeout=10)
+        # The virtual port is no longer considered as virtual. The
+        # "Port_Binding" register is deleted.
+        mock_update_vip_phost.assert_called_once_with(
+            mock.ANY, vip['id'], chassis_id=None)
+
+        # 3) Set again the allowed address pairs.
+        mock_update_vip_phost.reset_mock()
+        data = {'port': {'allowed_address_pairs': allowed_address_pairs}}
+        req = self.new_update_request('ports', data, port['id'])
+        req.get_response(self.api)
+        # This test checks that the VIP "Port_Binding" register gets the type
+        # and the corresponding "virtual-parents".
+        self._check_port_binding_type(vip['id'], ovn_const.LSP_TYPE_VIRTUAL)
+        self._check_port_virtual_parents(vip['id'], port['id'])
+        mock_update_vip_phost.reset_mock()
+        self._delete('ports', vip['id'])
+        n_utils.wait_until_true(lambda: mock_update_vip_phost.called,
+                                timeout=10)
+        # The virtual port is deleted and so the associated "Port_Binding".
+        # With OVN v22.03.3 sometimes 2 delete events are received with the
+        # same arguments.
+        # TODO(lajoskatona): check when new OVN version is out
+        # if this behaviour is changed.
+        mock_update_vip_phost.assert_called_with(
+            mock.ANY, vip['id'], chassis_id=None)
+
+    @mock.patch.object(ovn_client.OVNClient, 'update_virtual_port_parent_host')
+    def test_non_virtual_port_no_host_update(self, mock_update_vip_phost):
+        # The ``PortBindingUpdateVirtualPortsEvent`` delete event should affect
+        # only to virtual ports. This check is done for virtual ports in
+        # ``update_virtual_port_parent_host``.
+        port = self.create_port()
+        self._delete('ports', port['id'], as_admin=True)
+        # We actively wait for 5 seconds for the ``Port_Binding`` event to
+        # arrive and be processed, but the port host must not be updated.
+        self.assertRaises(n_utils.WaitTimeout, n_utils.wait_until_true,
+                          lambda: mock_update_vip_phost.called, timeout=5)
+
+    def _check_port_parent_host_set(self, port_id, hostname):
+        # This function checks if given hostname matches the values in the
+        # neutron DB as well as in the OVN DB for the port with given port_id
+        core_plugin = directory.get_plugin()
+
+        # Get port from neutron DB
+        port = core_plugin.get_ports(
+            self.context, filters={'id': [port_id]})[0]
+
+        # Get port from OVN DB
+        pb = self._find_port_binding(port_id)
+        ovn_pb_hostname = pb.external_ids.get(
+            ovn_const.OVN_PARENT_HOSTNAME_EXT_ID_KEY)
+
+        # Check that both neutron and ovn are the same as given hostname
+        return port[portbindings.VIF_DETAILS][
+            'parent_hostname'] == hostname == ovn_pb_hostname
+
+    def _check_port_and_port_binding_revision_number(self, port_id):
+
+        def is_port_and_port_binding_same_revision_number(port_id):
+            # This function checks if given port matches the revision_number
+            # in the neutron DB as well as in the OVN DB for the port_binding
+            core_plugin = directory.get_plugin()
+
+            # Get port from neutron DB
+            port = core_plugin.get_ports(
+                self.context, filters={'id': [port_id]})[0]
+
+            # Get port binding from OVN DB
+            bp = self._find_port_binding(port_id)
+            ovn_port_binding_revision_number = bp.external_ids.get(
+                ovn_const.OVN_REV_NUM_EXT_ID_KEY, ovn_const.INITIAL_REV_NUM)
+
+            # Check that both neutron and ovn are the same as given host_id
+            return port['revision_number'] == int(
+                ovn_port_binding_revision_number)
+
+        check = functools.partial(
+            is_port_and_port_binding_same_revision_number, port_id)
+        n_utils.wait_until_true(check, timeout=10)
+
+    def test_virtual_port_parent_host_update_upon_failover(self):
+        # NOTE: we can't simulate traffic, but we can simulate the event that
+        # would've been triggered by OVN, which is what we do.
+
+        # The test is based to test_virtual_port_host_update, though in this
+        # test we actually test the
+        # ``OVNMechanismDriver.update_virtual_port_parent_host`` method,
+        # that updates the parent hostname in the Neutron port VIF details and
+        # OVN. We do not extensively check if the allowed-address-pair is
+        # being kept up-to-date, since test_virtual_port_host_update does this
+        # already.
+
+        # 1) Setup a second chassis
+        second_chassis_name = 'ovs-host2'
+        second_chassis = self.add_fake_chassis(second_chassis_name)
+
+        # 2) Create port with the VIP for allowed address pair setup
+        vip = self.create_port(device_owner='', host='')
+        vip_address = vip['fixed_ips'][0]['ip_address']
+        allowed_address_pairs = [{'ip_address': vip_address}]
+        self._check_port_binding_type(vip['id'], '')
+        self._check_port_and_port_binding_revision_number(vip['id'])
+
+        # 3) Create two ports with the allowed address pairs set.
+        hosts = ('ovs-host1', second_chassis_name)
+        ports = []
+        for idx, host in enumerate(hosts):
+            ports.append(self.create_port(host=host))
+            data = {'port': {'allowed_address_pairs': allowed_address_pairs}}
+            req = self.new_update_request('ports', data, ports[idx]['id'])
+            req.get_response(self.api)
+
+        port_ids = [p['id'] for p in ports]
+
+        # 4) Check that the vip port has become virtual and that both parents
+        # have been assigned to the port binding
+        self._check_port_binding_type(vip['id'], ovn_const.LSP_TYPE_VIRTUAL)
+        self._check_port_virtual_parents(vip['id'], ','.join(port_ids))
+        self._check_port_and_port_binding_revision_number(vip['id'])
+
+        # 5) Bind the ports to a host, so a chassis is bound, which is
+        # required for the update_virtual_port_host method. Without this
+        # chassis set, it will not set a hostname in the DB's
+        self._test_port_binding_and_status(ports[0]['id'], 'bind', 'ACTIVE')
+        self.chassis = second_chassis
+        self._test_port_binding_and_status(ports[1]['id'], 'bind', 'ACTIVE')
+        self._check_port_and_port_binding_revision_number(vip['id'])
+
+        # 6) For both ports, bind vip on parent and check parent hostname in
+        # DBs
+        for idx, port in enumerate(ports):
+            # Set port binding to the first port, and update the chassis
+            self._set_port_binding_virtual_parent(vip['id'], port['id'])
+            self._check_port_and_port_binding_revision_number(vip['id'])
+
+            # Check if the parent hostname has been updated in OVN and DB
+            # by the event that eventually calls for method
+            # OVNMechanismDriver.update_virtual_port_parent_host
+            n_utils.wait_until_true(
+                lambda: self._check_port_parent_host_set(
+                    vip['id'], hosts[idx]), timeout=10)
+            self._check_port_and_port_binding_revision_number(vip['id'])
+
+    def _create_router(self):
+        net_args = {external_net.EXTERNAL: True,
+                    provider_net.NETWORK_TYPE: 'geneve'}
+        net = self._make_network(self.fmt, 'e1', True, as_admin=True,
+                                 arg_list=tuple(net_args.keys()), **net_args)
+        res = self._create_subnet(self.fmt, net['network']['id'],
+                                  '120.0.0.0/24')
+        subnet = self.deserialize(self.fmt, res)
+        external_gateway_info = {
+            'enable_snat': True, 'network_id': net['network']['id'],
+            'external_fixed_ips': [{'ip_address': '120.0.0.2',
+                                    'subnet_id': subnet['subnet']['id']}]}
+        router = self.l3_plugin.create_router(
+            self.context,
+            {'router': {'name': uuidutils.generate_uuid(),
+                        'admin_state_up': True, 'project_id': self._project_id,
+                        'external_gateway_info': external_gateway_info}})
+        return router
+
+    def test_ha_chassis_group_router_event(self):
+        def _check_high_prio_chassis(num_chassis):
+            lr = self.nb_api.lookup('Logical_Router', ovn_r_name)
+            hp_chassis_lr = lr.options['chassis']
+            hcg = self.nb_api.lookup('HA_Chassis_Group', ovn_r_name)
+            self.assertEqual(num_chassis, len(hcg.ha_chassis))
+            hp_chassis_hcg = max(hcg.ha_chassis, key=lambda hc: hc.priority)
+            self.assertEqual(hp_chassis_lr, hp_chassis_hcg.chassis_name)
+
+        chassis_list = []
+        num_chassis = 5
+        for idx in range(num_chassis):
+            chassis_list.append(
+                self.add_fake_chassis('host-%s' % str(idx), azs=[],
+                                      enable_chassis_as_gw=True))
+
+        router = self._create_router()
+        ovn_r_name = ovn_utils.ovn_name(router['id'])
+        _check_high_prio_chassis(len(chassis_list))
+
+        lr = self.nb_api.lookup('Logical_Router', ovn_r_name)
+        row_event = test_events.WaitForLogicalRouterUpdate()
+        self.mech_driver.nb_ovn.idl.notify_handler.watch_event(row_event)
+        self.del_fake_chassis(lr.options['chassis'])
+        self.assertTrue(row_event.wait())
+        _check_high_prio_chassis(num_chassis - 1)
+
+    def test_ha_chassis_group_router_event_physnet(self):
+        """Regression test for LP#2158987.
+
+        When a router's external network has a physnet, the gateway LRP
+        uses ha_chassis_group directly and OVN handles HA natively.
+        HAChassisGroupRouterEvent must NOT set LR.options.chassis in
+        this case, as northd rejects the combination as
+        "Bad configuration".
+        """
+        physnet = 'physnet_lp2158987'
+        num_chassis = 3
+        chassis_list = []
+        for idx in range(num_chassis):
+            chassis_list.append(
+                self.add_fake_chassis(
+                    'host-physnet-%s' % str(idx), azs=[],
+                    physical_nets=[physnet],
+                    enable_chassis_as_gw=True))
+
+        net_args = {external_net.EXTERNAL: True,
+                    provider_net.NETWORK_TYPE: 'flat',
+                    provider_net.PHYSICAL_NETWORK: physnet}
+        net = self._make_network(self.fmt, 'ext-flat', True, as_admin=True,
+                                 arg_list=tuple(net_args.keys()), **net_args)
+        res = self._create_subnet(self.fmt, net['network']['id'],
+                                  '120.1.0.0/24')
+        subnet = self.deserialize(self.fmt, res)
+        external_gateway_info = {
+            'enable_snat': True, 'network_id': net['network']['id'],
+            'external_fixed_ips': [{'ip_address': '120.1.0.2',
+                                    'subnet_id': subnet['subnet']['id']}]}
+        router = self.l3_plugin.create_router(
+            self.context,
+            {'router': {'name': uuidutils.generate_uuid(),
+                        'admin_state_up': True,
+                        'project_id': self._project_id,
+                        'external_gateway_info': external_gateway_info}})
+        ovn_r_name = ovn_utils.ovn_name(router['id'])
+
+        lr = self.nb_api.lookup('Logical_Router', ovn_r_name)
+        self.assertNotIn('chassis', lr.options)
+        gw_lrps = [lrp for lrp in lr.ports if strutils.bool_from_string(
+            lrp.external_ids.get(ovn_const.OVN_ROUTER_IS_EXT_GW))]
+        self.assertEqual(1, len(gw_lrps))
+        self.assertTrue(gw_lrps[0].ha_chassis_group)
+
+        hcg = self.nb_api.lookup('HA_Chassis_Group', ovn_r_name)
+        self.assertGreater(len(hcg.ha_chassis), 0)
+
+        row_event_lr = test_events.WaitForLogicalRouterUpdate()
+        self.mech_driver.nb_ovn.idl.notify_handler.watch_event(row_event_lr)
+        self.del_fake_chassis(chassis_list[0])
+        # Give the event time to (incorrectly) fire; it should not update LR.
+        row_event_lr.wait()
+
+        lr = self.nb_api.lookup('Logical_Router', ovn_r_name)
+        self.assertNotIn(
+            'chassis', lr.options,
+            'LP#2158987: HAChassisGroupRouterEvent must not set '
+            'LR.options.chassis on a physnet router that uses '
+            'LRP.ha_chassis_group')
+
+        gw_lrps = [lrp for lrp in lr.ports if strutils.bool_from_string(
+            lrp.external_ids.get(ovn_const.OVN_ROUTER_IS_EXT_GW))]
+        self.assertTrue(gw_lrps[0].ha_chassis_group)
+
+
+class TestSBDbMonitor(base.TestOVNFunctionalBase, test_l3.L3NatTestCaseMixin):
+
+    def setUp(self, **kwargs):
+        super().setUp(**kwargs)
+        self.physnet = 'public'
+        self.chassis = self.add_fake_chassis(
+            'ovs-host1', physical_nets=[self.physnet],
+            enable_chassis_as_gw=True)
+        self.l3_plugin = directory.get_plugin(plugin_constants.L3)
+        ext_mgr = test_l3.L3TestExtensionManager()
+        self.ext_api = test_extensions.setup_extensions_middleware(ext_mgr)
+        self.handler = event.RowEventHandler()
+        self.sb_api.idl.notify = self.handler.notify
+
+    def _find_port_binding(self, port_type):
+        rows = self.sb_api.db_find_rows(
+            'Port_Binding', ('type', '=', port_type)).execute(check_error=True)
+        return rows[0] if rows else None
+
+    def test_router_port_binding(self):
+        # This test will check the router GW port creation and binding.
+        def check_ext_ids():
+            pb = self._find_port_binding(ovn_const.OVN_CHASSIS_REDIRECT)
+            _, lrp = list(
+                self.nb_api.tables['Logical_Router_Port'].rows.items())[0]
+            if pb.external_ids == {}:
+                # The current version of OVN installed in FT CI could not have
+                # [1]. In this case, the Port_Binding.external_ids value is an
+                # empty dictionary.
+                # [1]https://www.mail-archive.com/ovs-dev@openvswitch.org/
+                #    msg62836.html
+                return True
+            return lrp.external_ids == pb.external_ids
+
+        arg_dict = {external_net.EXTERNAL: True,
+                    provider_net.NETWORK_TYPE: 'flat',
+                    provider_net.PHYSICAL_NETWORK: self.physnet}
+        ext_net = self._make_network(self.fmt, 'ext_net', True, as_admin=True,
+                                     arg_list=tuple(arg_dict.keys()),
+                                     **arg_dict)
+        self._make_subnet(self.fmt, ext_net, '10.251.0.1', '10.251.0.0/24',
+                          enable_dhcp=True)
+        router = self._make_router(self.fmt, self._project_id)
+        row_event = test_events.WaitForCreatePortBindingEventPerType()
+        self.handler.watch_event(row_event)
+        self._add_external_gateway_to_router(router['router']['id'],
+                                             ext_net['network']['id'])
+        self.assertTrue(row_event.wait())
+
+        # Check SB pb.external_ids == NB lrp.external_ids
+        port_binding = self._find_port_binding(ovn_const.OVN_CHASSIS_REDIRECT)
+        self.sb_api.db_set('Port_Binding', port_binding.uuid,
+                           ('up', True)).execute(check_error=True)
+        try:
+            n_utils.wait_until_true(check_ext_ids, timeout=5)
+        except n_utils.WaitTimeout:
+            pb = self._find_port_binding(ovn_const.OVN_CHASSIS_REDIRECT)
+            _, lrp = list(
+                self.nb_api.tables['Logical_Router_Port'].rows.items())[0]
+            self.fail('pb.ext_ids: %s  --  lrp.ext_ids: %s' %
+                      (pb.external_ids, lrp.external_ids))
+
+
+class TestAgentMonitor(base.TestOVNFunctionalBase):
+    FAKE_CHASSIS_HOST = 'fake-chassis-host'
+
+    def setUp(self):
+        super().setUp()
+        self.l3_plugin = directory.get_plugin(plugin_constants.L3)
+        self.mock_ovsdb_idl = mock.Mock()
+        self.handler = self.sb_api.idl.notify_handler
+        self.mock_ovsdb_idl = mock.Mock()
+        chassis_name = uuidutils.generate_uuid()
+        row_event = WaitForChassisPrivateCreateEvent(chassis_name)
+        self.mech_driver.sb_ovn.idl.notify_handler.watch_event(row_event)
+        self.chassis_name = self.add_fake_chassis(
+            self.FAKE_CHASSIS_HOST, name=chassis_name,
+            enable_chassis_as_gw=True)
+        self.assertTrue(row_event.wait())
+        n_utils.wait_until_true(
+            lambda: len(list(neutron_agent.AgentCache())) == 1)
+
+    def test_agent_change_controller(self):
+        self.assertIsInstance(
+            neutron_agent.AgentCache().get(self.chassis_name),
+            neutron_agent.ControllerGatewayAgent)
+        self.sb_api.db_set(
+            'Chassis', self.chassis_name,
+            ('other_config',
+             {'ovn-cms-options': ''})).execute(check_error=True)
+        n_utils.wait_until_true(
+            lambda:
+            isinstance(neutron_agent.AgentCache().get(self.chassis_name),
+                       neutron_agent.ControllerAgent))
+
+        # Change back to gw chassis
+        self.sb_api.db_set(
+            'Chassis', self.chassis_name,
+            ('other_config',
+             {'ovn-cms-options': 'enable-chassis-as-gw'})).execute(
+                 check_error=True)
+        n_utils.wait_until_true(
+            lambda:
+            isinstance(neutron_agent.AgentCache().get(self.chassis_name),
+                       neutron_agent.ControllerGatewayAgent))
+
+    def test_agent_updated_at_use_nb_cfg_timestamp(self):
+        def check_agent_ts():
+            agent = neutron_agent.AgentCache().get(self.chassis_name)
+            chassis_ts = self.sb_api.db_get(
+                'Chassis_Private', self.chassis_name,
+                'nb_cfg_timestamp').execute(check_error=True)
+            updated_at = datetime.datetime.fromtimestamp(
+                int(chassis_ts / 1000), datetime.UTC)
+            return agent.updated_at == updated_at
+
+        timestamp = timeutils.utcnow_ts()
+        nb_cfg_timestamp = timestamp * 1000
+        self.sb_api.db_set('Chassis_Private', self.chassis_name, (
+            'nb_cfg_timestamp', nb_cfg_timestamp)).execute(check_error=True)
+        # Also increment nb_cfg by 1 to trigger ChassisAgentWriteEvent which
+        # is responsible to update AgentCache
+        old_nb_cfg = self.sb_api.db_get('Chassis_Private', self.chassis_name,
+                                        'nb_cfg').execute(check_error=True)
+        self.sb_api.db_set('Chassis_Private', self.chassis_name, (
+            'nb_cfg', old_nb_cfg + 1)).execute(check_error=True)
+        try:
+            n_utils.wait_until_true(check_agent_ts, timeout=5)
+        except n_utils.WaitTimeout:
+            agent = neutron_agent.AgentCache().get(self.chassis_name)
+            chassis_ts = self.sb_api.db_get(
+                'Chassis_Private', self.chassis_name,
+                'nb_cfg_timestamp').execute(check_error=True)
+            self.fail('Chassis timestamp: %s, agent updated_at: %s' %
+                      (chassis_ts, str(agent.updated_at)))
+
+    def test_agent_restart(self):
+        def check_agent_up():
+            agent = neutron_agent.AgentCache().get(self.chassis_name)
+            return agent.alive
+
+        def check_agent_down():
+            return not check_agent_up()
+
+        def check_nb_cfg_timestamp_is_not_null():
+            agent = neutron_agent.AgentCache().get(self.chassis_name)
+            return agent.updated_at != 0
+
+        # Set nb_cfg to some realistic value, so that the alive check can
+        # actually work
+        self.nb_api.db_set(
+            'NB_Global', '.', ('nb_cfg', 1337)).execute(check_error=True)
+        self.sb_api.db_set(
+            'Chassis_Private', self.chassis_name, ('nb_cfg', 1337)
+        ).execute(check_error=True)
+
+        chassis_uuid = self.sb_api.db_get(
+            'Chassis', self.chassis_name, 'uuid').execute(check_error=True)
+
+        self.assertTrue(check_agent_up())
+        n_utils.wait_until_true(check_nb_cfg_timestamp_is_not_null, timeout=5)
+
+        # Lets start by shutting down the ovn-controller
+        # (where it will remove the Chassis_Private table entry)
+        self.sb_api.db_destroy(
+            'Chassis_Private', self.chassis_name).execute(check_error=True)
+        try:
+            n_utils.wait_until_true(check_agent_down, timeout=5)
+        except n_utils.WaitTimeout:
+            self.fail('Agent did not go down after Chassis_Private removal')
+
+        # Now the ovn-controller starts up again and has not yet synced with
+        # the southbound database
+        self.sb_api.db_create(
+            'Chassis_Private', name=self.chassis_name,
+            external_ids={}, chassis=chassis_uuid,
+            nb_cfg_timestamp=0, nb_cfg=0
+        ).execute(check_error=True)
+        self.assertTrue(check_agent_down())
+
+        # Now the ovn-controller has synced with the southbound database
+        nb_cfg_timestamp = timeutils.utcnow_ts() * 1000
+        with self.sb_api.transaction() as txn:
+            txn.add(self.sb_api.db_set('Chassis_Private', self.chassis_name,
+                                       ('nb_cfg_timestamp', nb_cfg_timestamp)))
+            txn.add(self.sb_api.db_set('Chassis_Private', self.chassis_name,
+                                       ('nb_cfg', 1337)))
+        try:
+            n_utils.wait_until_true(check_agent_up, timeout=5)
+        except n_utils.WaitTimeout:
+            self.fail('Agent did not go up after sync is done')
+        self.assertTrue(check_nb_cfg_timestamp_is_not_null())
+
+    def test_agent_chassis_deleted(self):
+        """Test agent down when Chassis deleted, not Chassis_Private.
+
+        When a Chassis record is deleted while Chassis_Private remains,
+        the ChassisAgentChassisClearedEvent should mark the agent as down.
+        Also verifies that the agent recovers when the Chassis is recreated.
+        Related-Bug: #2148211
+        """
+        def check_agent_up():
+            agent = neutron_agent.AgentCache().get(self.chassis_name)
+            return agent.alive
+
+        def check_agent_down():
+            return not check_agent_up()
+
+        # Set nb_cfg so alive check works.
+        self.nb_api.db_set(
+            'NB_Global', '.', ('nb_cfg', 1337)).execute(check_error=True)
+        self.sb_api.db_set(
+            'Chassis_Private', self.chassis_name, ('nb_cfg', 1337)
+        ).execute(check_error=True)
+
+        self.assertTrue(check_agent_up())
+
+        # Delete the Chassis but keep Chassis_Private (simulates an
+        # admin manually deleting the Chassis or ungraceful shutdown
+        # cleanup that only removes Chassis). Note: we cannot use
+        # sb_api.chassis_del() here because that helper also deletes the
+        # associated Chassis_Private row, which would prevent us from
+        # testing the orphaned Chassis_Private scenario.
+        self.sb_api.db_destroy(
+            'Chassis', self.chassis_name).execute(check_error=True)
+        try:
+            n_utils.wait_until_true(check_agent_down, timeout=5)
+        except n_utils.WaitTimeout:
+            self.fail('Agent did not go down after Chassis deletion')
+
+        # Verify as_dict() still works with a deleted Chassis, i.e. the
+        # agent can be listed via the API without crashing.
+        agent = neutron_agent.AgentCache().get(self.chassis_name)
+        agent_dict = agent.as_dict()
+        self.assertFalse(agent_dict['alive'])
+
+        # Simulate ovn-controller reconnecting: recreate the Chassis and
+        # update the orphaned Chassis_Private to reference it.
+        self._counter += 1
+        chassis = self.sb_api.chassis_add(
+            self.chassis_name, ['geneve'],
+            '172.24.4.%d' % self._counter,
+            other_config={
+                'ovn-cms-options': 'enable-chassis-as-gw',
+                'ovn-bridge-mappings': ''},
+            hostname=self.FAKE_CHASSIS_HOST
+        ).execute(check_error=True)
+        nb_cfg_timestamp = timeutils.utcnow_ts() * 1000
+        with self.sb_api.transaction() as txn:
+            txn.add(self.sb_api.db_set(
+                'Chassis_Private', self.chassis_name,
+                ('chassis', chassis.uuid)))
+            txn.add(self.sb_api.db_set(
+                'Chassis_Private', self.chassis_name,
+                ('nb_cfg', 1337)))
+            txn.add(self.sb_api.db_set(
+                'Chassis_Private', self.chassis_name,
+                ('nb_cfg_timestamp', nb_cfg_timestamp)))
+        try:
+            n_utils.wait_until_true(check_agent_up, timeout=5)
+        except n_utils.WaitTimeout:
+            self.fail('Agent did not recover after Chassis recreation')
+
+    def test_agent_removal(self):
+        agents = neutron_agent.AgentCache().get_agents()
+        agent_id = agents[0].agent_id
+
+        row_event = WaitForChassisAgentDeleteEvent()
+        self.mech_driver.sb_ovn.idl.notify_handler.watch_event(row_event)
+        # Send the SB_Global event to delete an agent from the local caches.
+        self.sb_api.db_set(
+            'SB_Global', '.',
+            ('external_ids', {'delete_agent': agent_id})).execute(
+            check_error=True)
+        self.sb_api.db_remove(
+            'SB_Global', '.', 'external_ids', delete_agent=agent_id,
+            if_exists=True).execute(check_error=True)
+
+        self.assertTrue(row_event.wait())
+        self.assertEqual([],
+                         neutron_agent.AgentCache().get_agents())
+
+
+class TestOvnIdlProbeInterval(base.TestOVNFunctionalBase):
+    def setUp(self):
+        # We need an OvsdbServer that uses TCP because probe_interval is always
+        # zero for unix socket connections, which is what the parent uses
+        temp_dir = self.useFixture(og_fixtures.TempDir()).path
+        install_share_path = self._get_install_share_path()
+        mgr = self.useFixture(
+            process.OvsdbServer(temp_dir, install_share_path,
+                                ovn_nb_db=True, ovn_sb_db=True,
+                                protocol='tcp'))
+        connection = mgr.get_ovsdb_connection_path
+        self.connections = {'OVN_Northbound': connection(),
+                            'OVN_Southbound': connection(db_type='sb')}
+        super().setUp()
+
+    def test_ovsdb_probe_interval(self):
+        klasses = {
+            ovsdb_monitor.BaseOvnIdl: ('OVN_Northbound', {}),
+            ovsdb_monitor.OvnNbIdl: ('OVN_Northbound',
+                                     {'driver': self.mech_driver}),
+            ovsdb_monitor.OvnSbIdl: ('OVN_Southbound',
+                                     {'driver': self.mech_driver})}
+        idls = [
+            kls.from_server(
+                self.connections[schema],
+                idlutils.get_schema_helper(self.connections[schema], schema),
+                **kwargs) for kls, (schema, kwargs) in klasses.items()]
+        interval = ovn_conf.get_ovn_ovsdb_probe_interval()
+        for idl in idls:
+            self.assertEqual(interval, idl._session.reconnect.probe_interval)
+
+
+class TestOvnIdlConnections(base.TestOVNFunctionalBase):
+    def setUp(self):
+        temp_dir = self.useFixture(og_fixtures.TempDir()).path
+        install_share_path = self._get_install_share_path()
+        mgr = self.useFixture(
+            process.OvsdbServer(temp_dir, install_share_path,
+                                ovn_nb_db=True, ovn_sb_db=True,
+                                protocol='tcp'))
+        connection = mgr.get_ovsdb_connection_path
+
+        nb_conns = connection()
+        sb_conns = connection(db_type='sb')
+        # add fake address, idl support multiple addresses, as long as there
+        # is an available address, it will run successfully.
+        nb_conns += ',tcp:192.168.0.1:6641'
+        sb_conns += ',tcp:192.168.0.1:6642'
+        self.connections = {'OVN_Northbound': nb_conns,
+                            'OVN_Southbound': sb_conns}
+        super().setUp()
+
+    def test_ovsdb_connections(self):
+        klasses = {
+            ovsdb_monitor.OvnNbIdl: ('OVN_Northbound',
+                                     {'driver': self.mech_driver}),
+            ovsdb_monitor.OvnSbIdl: ('OVN_Southbound',
+                                     {'driver': self.mech_driver})}
+        for kls, (schema, kwargs) in klasses.items():
+            conns = self.connections[schema]
+            idl = kls.from_server(
+                conns,
+                idlutils.get_schema_helper(conns, schema),
+                **kwargs)
+            self.assertEqual(set(idlutils.parse_connection(conns)),
+                             set(idl._session.remotes))
+
+
+class TestPortBindingChassisEvent(base.TestOVNFunctionalBase,
+                                  test_l3.L3NatTestCaseMixin):
+
+    def setUp(self, **kwargs):
+        super().setUp(**kwargs)
+        self.chassis = self.add_fake_chassis('ovs-host1')
+        self.l3_plugin = directory.get_plugin(plugin_constants.L3)
+        kwargs = {'arg_list': (external_net.EXTERNAL,),
+                  external_net.EXTERNAL: True}
+        self.net = self._make_network(
+            self.fmt, 'ext_net', True, as_admin=True, **kwargs)
+        self._make_subnet(self.fmt, self.net, '20.0.10.1', '20.0.10.0/24')
+
+        pb_event = WaitForPortBindingCreateEvent(
+            ovn_utils.ovn_name(self.net['network']['id']))
+        self.mech_driver.sb_ovn.idl.notify_handler.watch_event(pb_event)
+        port_res = self._create_port(self.fmt, self.net['network']['id'])
+        self.port = self.deserialize(self.fmt, port_res)['port']
+        self.assertTrue(pb_event.wait())
+
+        self.ext_api = test_extensions.setup_extensions_middleware(
+            test_l3.L3TestExtensionManager())
+        self.pb_event_match = mock.patch.object(
+            self.sb_api.idl._portbinding_event, 'match_fn').start()
+
+    def _check_pb_type(self, _type):
+        def check_pb_type(_type):
+            if len(self.pb_event_match.call_args_list) < 1:
+                return False
+
+            pb_row = self.pb_event_match.call_args_list[0].args[1]
+            return _type == pb_row.type
+
+        n_utils.wait_until_true(lambda: check_pb_type(_type), timeout=5)
+
+    def test_pb_type_patch(self):
+        router = self._make_router(self.fmt, self._project_id)
+        self._add_external_gateway_to_router(router['router']['id'],
+                                             self.net['network']['id'])
+        self._check_pb_type('patch')
+
+    def test_pb_type_empty(self):
+        self.sb_api.lsp_bind(self.port['id'], self.chassis,
+                             may_exist=True).execute(check_error=True)
+        self._check_pb_type('')
+
+
+class TestLogicalSwitchPortUpdateLogicalRouterPortEvent(
+        base.TestOVNFunctionalBase,
+        test_l3.L3NatTestCaseMixin):
+
+    def setUp(self, **kwargs):
+        super().setUp(**kwargs)
+        self.chassis = self.add_fake_chassis('ovs-host1')
+        self.l3_plugin = directory.get_plugin(plugin_constants.L3)
+        self.net = self._make_network(
+            self.fmt, 'ext_net', True, as_admin=True, **kwargs)
+        self.subnet = self._make_subnet(self.fmt, self.net, '20.0.10.1',
+                                        '20.0.10.0/24')
+        self.ext_api = test_extensions.setup_extensions_middleware(
+            test_l3.L3TestExtensionManager())
+
+    def _set_logical_port_events_add_subnet_to_router(self):
+        lsp_event = WaitForLogicalSwitchPortUpdateEvent()
+        lrp_event = WaitForLogicalRouterPortCreateEvent()
+        self.mech_driver.nb_ovn.idl.notify_handler.watch_events(
+            (lsp_event, lrp_event))
+        router = self._make_router(self.fmt, self._project_id)
+        self._router_interface_action('add', router['router']['id'],
+                                      self.subnet['subnet']['id'], None)
+        self.assertTrue(lsp_event.wait())
+        self.assertTrue(lrp_event.wait())
+
+    def test_create_router_port(self):
+        with mock.patch.object(self.l3_plugin._ovn_client,
+                               'update_router_port') as mock_update_rp:
+            self._set_logical_port_events_add_subnet_to_router()
+            n_utils.wait_until_true(
+                    lambda: mock_update_rp.called,
+                    timeout=10,
+                    exception=Exception(
+                        'LogicalSwitchPortUpdateLogicalRouterPortEvent.run '
+                        'was not called'))
+
+    def test_create_router_port_port_deleted_concurrently(self):
+        with mock.patch.object(self.l3_plugin._ovn_client,
+                               'update_router_port') as mock_update_rp, \
+                mock.patch.object(self.plugin, 'get_ports',
+                                  return_value=[]) as mock_get_ports:
+            self._set_logical_port_events_add_subnet_to_router()
+            n_utils.wait_until_true(
+                    lambda: mock_get_ports.called,
+                    timeout=10,
+                    exception=Exception(
+                        'LogicalSwitchPortUpdateLogicalRouterPortEvent.run '
+                        'was not called'))
+            mock_update_rp.assert_not_called()
+
+    def test_create_non_router_port(self):
+        with mock.patch.object(self.l3_plugin._ovn_client,
+                               'update_router_port') as mock_update_rp:
+            row_event = WaitForLogicalSwitchPortUpdateEvent()
+            self.mech_driver.nb_ovn.idl.notify_handler.watch_event(row_event)
+            self._create_port(self.fmt, self.net['network']['id'])
+            # The LogicalSwitchPort event is called but not the router port
+            # update method because this is not a router port.
+            self.assertTrue(row_event.wait())
+            mock_update_rp.assert_not_called()
+
+
+class TestBumpNbCfgCommand(base.TestOVNFunctionalBase):
+
+    def _get_nb_cfg(self):
+        return self.nb_api.db_get(
+            'NB_Global', '.', 'nb_cfg').execute(check_error=True)
+
+    def _get_nb_external_ids(self):
+        return self.nb_api.db_get(
+            'NB_Global', '.', 'external_ids').execute(check_error=True)
+
+    def test_bump_increments_nb_cfg(self):
+        before = self._get_nb_cfg()
+        self.nb_api.bump_nb_cfg().execute(check_error=True)
+        after = self._get_nb_cfg()
+        self.assertGreater(after, before)
+
+    def test_bump_sets_external_id_timestamp(self):
+        self.nb_api.bump_nb_cfg().execute(check_error=True)
+        ext_ids = self._get_nb_external_ids()
+        self.assertIn(ovn_const.OVN_NB_CFG_BUMP_EXT_ID_KEY, ext_ids)
+
+    def test_bump_multiple_times(self):
+        values = [self._get_nb_cfg()]
+        for _ in range(3):
+            self.nb_api.bump_nb_cfg().execute(check_error=True)
+            values.append(self._get_nb_cfg())
+        self.assertEqual(values, sorted(values))
+        self.assertEqual(len(set(values)), 4)
+
+
+class TestPortBindingLiveMigrationFlow(base.TestOVNFunctionalBase,
+                                       test_l3.L3NatTestCaseMixin):
+    """Functional tests for the PortBindingChassisUpdateEvent live migration.
+
+    When additional_chassis is set on a Port_Binding (simulating
+    ovn-controller detecting the TAP device on the destination host),
+    PortBindingChassisUpdateEvent.run should:
+    1. Register a WaitForChassisNbCfgEvent
+    2. Bump NB_Global.nb_cfg
+    3. Only call set_port_status_up when the destination chassis's
+       Chassis_Private.nb_cfg reaches the bumped value
+    """
+
+    def setUp(self, **kwargs):
+        super().setUp(**kwargs)
+        self.src_chassis = self.add_fake_chassis('src-host', azs=[])
+        self.dst_chassis = self.add_fake_chassis(
+            'dst-host', azs=[],
+            other_config={'datapath-type': 'system'})
+        self.l3_plugin = directory.get_plugin(plugin_constants.L3)
+        kwargs = {'arg_list': (external_net.EXTERNAL,),
+                  external_net.EXTERNAL: True}
+        self.net = self._make_network(
+            self.fmt, 'ext_net', True, as_admin=True, **kwargs)
+        self._make_subnet(self.fmt, self.net, '20.0.10.1', '20.0.10.0/24')
+
+        pb_event = WaitForPortBindingCreateEvent(
+            ovn_utils.ovn_name(self.net['network']['id']))
+        self.mech_driver.sb_ovn.idl.notify_handler.watch_event(pb_event)
+        port_res = self._create_port(self.fmt, self.net['network']['id'])
+        self.port = self.deserialize(self.fmt, port_res)['port']
+        self.assertTrue(pb_event.wait())
+
+        self._port_binding_chassis_bind_event = (
+            WaitForPortBindingChassisBindEvent(
+                self.port['id'], self.src_chassis))
+        self.mech_driver.sb_ovn.idl.notify_handler.watch_event(
+            self._port_binding_chassis_bind_event)
+        self.sb_api.lsp_bind(self.port['id'], self.src_chassis,
+                             may_exist=True).execute(check_error=True)
+        self._wait_for_single_chassis_lsp_bind()
+        self.nb_cfg_before = self._get_nb_global_nb_cfg()
+
+    def _wait_for_single_chassis_lsp_bind(self):
+        """Wait for setUp lsp_bind to finish on SB and in the IDL notifier."""
+        self.assertTrue(
+            self._port_binding_chassis_bind_event.wait(),
+            'Port_Binding chassis bind to %s did not complete' %
+            self.src_chassis)
+        chassis = self.sb_api.lookup('Chassis', self.src_chassis)
+
+        def port_bound_to_src():
+            rows = self.sb_api.db_find_rows(
+                'Port_Binding',
+                ('logical_port', '=', self.port['id'])).execute(
+                    check_error=True)
+            if not rows:
+                return False
+            binding = rows[0]
+            if not binding.chassis:
+                return False
+            return (binding.chassis[0].uuid == chassis.uuid and
+                    binding.up == [True])
+
+        n_utils.wait_until_true(
+            port_bound_to_src,
+            timeout=10,
+            exception=Exception(
+                'Port %s is not bound to chassis %s in SB' %
+                (self.port['id'], self.src_chassis)))
+
+        # Also wait for the NB Logical_Switch_Port.up to be propagated
+        # by northd. The PortBindingChassisUpdateEvent.match_fn checks
+        # the NB LSP status, so if the test sets additional_chassis
+        # before northd propagates Port_Binding.up to LSP.up, the
+        # event will not match and nb_cfg will never be bumped.
+        def lsp_is_up():
+            try:
+                lsp = self.nb_api.lookup(
+                    'Logical_Switch_Port', self.port['id'])
+            except idlutils.RowNotFound:
+                return False
+            return lsp.up == [True]
+
+        n_utils.wait_until_true(
+            lsp_is_up,
+            timeout=10,
+            exception=Exception(
+                'Logical_Switch_Port %s is not UP in NB' %
+                self.port['id']))
+
+    def _get_nb_global_nb_cfg(self):
+        return self.nb_api.db_get(
+            'NB_Global', '.', 'nb_cfg').execute(check_error=True)
+
+    def _set_chassis_private_nb_cfg(self, chassis_name, nb_cfg):
+        self.sb_api.db_set(
+            'Chassis_Private', chassis_name, ('nb_cfg', nb_cfg)
+        ).execute(check_error=True)
+
+    def _set_additional_chassis(self, port_id, chassis_name):
+        chassis = self.sb_api.lookup('Chassis', chassis_name)
+        self.sb_api.db_set(
+            'Port_Binding', port_id,
+            ('additional_chassis', [chassis.uuid])
+        ).execute(check_error=True)
+
+    def test_live_migration_waits_for_nb_cfg(self):
+        """Verify set_port_status_up is deferred until nb_cfg is reached.
+
+        Full live migration flow: additional_chassis triggers nb_cfg
+        bump and set_port_status_up is deferred until the destination
+        chassis reaches the expected nb_cfg.
+
+        NOTE: the ``PortBindingChassisUpdateEvent.run`` method defers
+        ``set_port_status_up`` only for kernel OVS datapaths during live
+        migration.
+        """
+        with mock.patch.object(
+                self.mech_driver, 'set_port_status_up') as mock_status_up:
+            self._set_additional_chassis(self.port['id'], self.dst_chassis)
+            # Wait until ``NB_Global.nb_cfg`` is bumped, called from
+            # ``PortBindingChassisUpdateEvent.run``.
+            n_utils.wait_until_true(
+                lambda: self._get_nb_global_nb_cfg() > self.nb_cfg_before,
+                timeout=5,
+                exception=Exception('NB_Global.nb_cfg has not been bumped'))
+            # In the functional tests framework, the ovn-controller is not
+            # running. The NB_Global.nb_cfg value must be set manually into the
+            # Chassis_Private registers.
+            mock_status_up.reset_mock()
+            self._set_chassis_private_nb_cfg(self.dst_chassis,
+                                             self.nb_cfg_before + 1)
+            n_utils.wait_until_true(
+                lambda: mock_status_up.called,
+                timeout=10,
+                exception=Exception(
+                    'set_port_status_up was not called after '
+                    'Chassis_Private.nb_cfg reached the target'))
+            mock_status_up.assert_has_calls([mock.call(self.port['id'])])
+
+    def test_no_live_migration_chassis_change(self):
+        """Verify regular chassis change calls set_port_status_up directly.
+
+        A regular chassis change (not live migration) should call
+        set_port_status_up directly without waiting for nb_cfg.
+        """
+        dst_chassis2 = self.add_fake_chassis('dst-host2', azs=[])
+        with mock.patch.object(
+                self.mech_driver, 'set_port_status_up') as mock_status_up:
+            # Change the chassis directly via db_set so the
+            # Port_Binding update event carries both old and new
+            # chassis values. ``lsp_bind`` with may_exist is a no-op
+            # when the port is already bound, and lsp_unbind+lsp_bind
+            # produces an empty->new transition that match_fn ignores.
+            chassis = self.sb_api.lookup('Chassis', dst_chassis2)
+            mock_status_up.reset_mock()
+            self.sb_api.db_set(
+                'Port_Binding', self.port['id'],
+                ('chassis', chassis.uuid)
+            ).execute(check_error=True)
+
+            n_utils.wait_until_true(
+                lambda: mock_status_up.called,
+                timeout=10,
+                exception=Exception(
+                    'set_port_status_up was not called for regular '
+                    'chassis change'))
+            mock_status_up.assert_has_calls([mock.call(self.port['id'])])
+
+    def test_chassis_change_does_not_block_sb_reads(self):
+        # Event matching runs with the SB connection lock held. A gateway
+        # scheduling transaction can hold the NB lock while reading SB, so
+        # matching must not acquire the NB lock in the opposite order.
+        pb_event = ovsdb_monitor.PortBindingChassisUpdateEvent
+        match_started = threading.Event()
+        match_finished = threading.Event()
+        match_fn = pb_event.match_fn
+
+        def match(event_self, event, row, old=None):
+            if (row.logical_port != self.port['id'] or
+                    not getattr(old, 'chassis', None) or not row.chassis or
+                    row.chassis[0].uuid != chassis.uuid):
+                return match_fn(event_self, event, row, old)
+            match_started.set()
+            try:
+                return match_fn(event_self, event, row, old)
+            finally:
+                match_finished.set()
+
+        nb_lock = self.mech_driver.nb_ovn.ovsdb_connection.lock
+        sb_lock = self.mech_driver.sb_ovn.ovsdb_connection.lock
+        sb_connection = self.ovsdb_server_mgr.get_ovsdb_connection_path('sb')
+        chassis = self.sb_api.lookup('Chassis', self.dst_chassis)
+
+        # setUp waits for the source-chassis bind event. Do not drain the
+        # entire notification queue: failed callbacks may leave tasks
+        # unacknowledged even though the notification loop keeps running.
+        with mock.patch.object(pb_event, 'match_fn', autospec=True,
+                               side_effect=match), \
+                mock.patch.object(self.mech_driver,
+                                  'set_port_status_up') as status_up:
+            try:
+                with nb_lock:
+                    # Use a separate writer: the monitored SB connection may
+                    # be blocked in matching before it can return a result.
+                    processutils.execute(
+                        'ovn-sbctl', '--timeout=10', '--db=' + sb_connection,
+                        'set', 'Port_Binding', self.port['id'],
+                        'chassis=' + str(chassis.uuid))
+                    self.assertTrue(match_started.wait(10))
+                    acquired = sb_lock.acquire(timeout=10)
+                    try:
+                        self.assertTrue(
+                            acquired, 'Chassis event blocked SB reads '
+                            'while the NB connection lock was held')
+                        self.mech_driver.sb_ovn.chassis_list().execute(
+                            check_error=True)
+                    finally:
+                        if acquired:
+                            sb_lock.release()
+            finally:
+                # Release NB before waiting, also on the unfixed code, so
+                # failure never leaves either IDL thread deadlocked.
+                match_finished.wait(10)
+            n_utils.wait_until_true(lambda: status_up.called, timeout=10)
+            status_up.assert_has_calls([mock.call(self.port['id'])])

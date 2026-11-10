@@ -12,9 +12,8 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import testscenarios
-
-from neutron.tests import base as tests_base
+from neutron.privileged.agent.linux import svd as privileged_svd
+from neutron.tests.common.exclusive_resources import ip_address
 from neutron.tests.functional import base
 
 
@@ -26,19 +25,22 @@ MARKED_BLOCK_RULE = '-m mark --mark %s -j DROP' % MARK_VALUE
 ICMP_BLOCK_RULE = '-p icmp -j DROP'
 
 
-#TODO(jschwarz): Move these two functions to neutron/tests/common/
-get_rand_name = tests_base.get_rand_name
+class BaseOVSLinuxTestCase(base.BaseSudoTestCase):
+
+    def get_test_net_address(self, block):
+        """Return exclusive address based on RFC 5737.
+
+        :param block: One of constants 1, 2 or 3
+        """
+        return str(self.useFixture(
+            ip_address.get_test_net_address_fixture(block)).address)
 
 
-# Regarding MRO, it goes BaseOVSLinuxTestCase, WithScenarios,
-# BaseSudoTestCase, ..., UnitTest, object. setUp is not dfined in
-# WithScenarios, so it will correctly be found in BaseSudoTestCase.
-class BaseOVSLinuxTestCase(testscenarios.WithScenarios, base.BaseSudoTestCase):
-    scenarios = [
-        ('vsctl', dict(ovsdb_interface='vsctl')),
-        ('native', dict(ovsdb_interface='native')),
-    ]
-
+class BaseNetlinkTestCase(base.BaseSudoTestCase):
     def setUp(self):
-        super(BaseOVSLinuxTestCase, self).setUp()
-        self.config(group='OVS', ovsdb_interface=self.ovsdb_interface)
+        super().setUp()
+        self.register_vxlan_vnifilter()
+
+    def register_vxlan_vnifilter(self):
+        privileged_svd.reset_vxlan_vnifilter_nla()
+        privileged_svd.register_vxlan_vnifilter()

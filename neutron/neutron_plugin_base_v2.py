@@ -21,11 +21,11 @@ methods that needs to be implemented by a v2 Neutron Plug-in.
 """
 
 import abc
-import six
+
+from neutron_lib.services import base as base_services
 
 
-@six.add_metaclass(abc.ABCMeta)
-class NeutronPluginBaseV2(object):
+class NeutronPluginBaseV2(base_services.WorkerBase, metaclass=abc.ABCMeta):
 
     @abc.abstractmethod
     def create_subnet(self, context, subnet):
@@ -40,7 +40,6 @@ class NeutronPluginBaseV2(object):
                        in :file:`neutron/api/v2/attributes.py`.  All keys will
                        be populated.
         """
-        pass
 
     @abc.abstractmethod
     def update_subnet(self, context, id, subnet):
@@ -54,7 +53,6 @@ class NeutronPluginBaseV2(object):
                        :obj:`RESOURCE_ATTRIBUTE_MAP` object in
                        :file:`neutron/api/v2/attributes.py`.
         """
-        pass
 
     @abc.abstractmethod
     def get_subnet(self, context, id, fields=None):
@@ -68,7 +66,6 @@ class NeutronPluginBaseV2(object):
                        :file:`neutron/api/v2/attributes.py`. Only these fields
                        will be returned.
         """
-        pass
 
     @abc.abstractmethod
     def get_subnets(self, context, filters=None, fields=None,
@@ -83,7 +80,7 @@ class NeutronPluginBaseV2(object):
         :param filters: a dictionary with keys that are valid keys for
                         a subnet as listed in the :obj:`RESOURCE_ATTRIBUTE_MAP`
                         object in :file:`neutron/api/v2/attributes.py`.
-                        Values in this dictiontary are an iterable containing
+                        Values in this dictionary are an iterable containing
                         values that will be used for an exact match comparison
                         for that value.  Each result returned by this
                         function will have matched one of the values for each
@@ -94,7 +91,6 @@ class NeutronPluginBaseV2(object):
                        :file:`neutron/api/v2/attributes.py`. Only these fields
                        will be returned.
         """
-        pass
 
     def get_subnets_count(self, context, filters=None):
         """Return the number of subnets.
@@ -108,7 +104,7 @@ class NeutronPluginBaseV2(object):
                         a network as listed in the
                         :obj:`RESOURCE_ATTRIBUTE_MAP` object in
                         :file:`neutron/api/v2/attributes.py`.  Values in this
-                        dictiontary are an iterable containing values that
+                        dictionary are an iterable containing values that
                         will be used for an exact match comparison for that
                         value.  Each result returned by this function will
                         have matched one of the values for each key in filters.
@@ -125,7 +121,6 @@ class NeutronPluginBaseV2(object):
         :param context: neutron api request context
         :param id: UUID representing the subnet to delete.
         """
-        pass
 
     def create_subnetpool(self, context, subnetpool):
         """Create a subnet pool.
@@ -180,7 +175,6 @@ class NeutronPluginBaseV2(object):
                         be populated.
 
         """
-        pass
 
     @abc.abstractmethod
     def update_network(self, context, id, network):
@@ -194,7 +188,6 @@ class NeutronPluginBaseV2(object):
                         :obj:`RESOURCE_ATTRIBUTE_MAP` object in
                         :file:`neutron/api/v2/attributes.py`.
         """
-        pass
 
     @abc.abstractmethod
     def get_network(self, context, id, fields=None):
@@ -208,7 +201,6 @@ class NeutronPluginBaseV2(object):
                        :file:`neutron/api/v2/attributes.py`. Only these fields
                        will be returned.
         """
-        pass
 
     @abc.abstractmethod
     def get_networks(self, context, filters=None, fields=None,
@@ -224,7 +216,7 @@ class NeutronPluginBaseV2(object):
                         a network as listed in the
                         :obj:`RESOURCE_ATTRIBUTE_MAP` object in
                         :file:`neutron/api/v2/attributes.py`.  Values in this
-                        dictiontary are an iterable containing values that will
+                        dictionary are an iterable containing values that will
                         be used for an exact match comparison for that value.
                         Each result returned by this function will have matched
                         one of the values for each key in filters.
@@ -234,7 +226,6 @@ class NeutronPluginBaseV2(object):
                        :file:`neutron/api/v2/attributes.py`. Only these fields
                        will be returned.
         """
-        pass
 
     def get_networks_count(self, context, filters=None):
         """Return the number of networks.
@@ -248,7 +239,7 @@ class NeutronPluginBaseV2(object):
                         a network as listed in the
                         :obj:`RESOURCE_ATTRIBUTE_MAP` object
                         in :file:`neutron/api/v2/attributes.py`. Values in
-                        this dictiontary are an iterable containing values that
+                        this dictionary are an iterable containing values that
                         will be used for an exact match comparison for that
                         value.  Each result returned by this function will have
                         matched one of the values for each key in filters.
@@ -265,7 +256,6 @@ class NeutronPluginBaseV2(object):
         :param context: neutron api request context
         :param id: UUID representing the network to delete.
         """
-        pass
 
     @abc.abstractmethod
     def create_port(self, context, port):
@@ -280,7 +270,6 @@ class NeutronPluginBaseV2(object):
                      :file:`neutron/api/v2/attributes.py`.  All keys will be
                      populated.
         """
-        pass
 
     @abc.abstractmethod
     def update_port(self, context, id, port):
@@ -293,7 +282,6 @@ class NeutronPluginBaseV2(object):
                      'allow_put' as listed in the :obj:`RESOURCE_ATTRIBUTE_MAP`
                      object in :file:`neutron/api/v2/attributes.py`.
         """
-        pass
 
     @abc.abstractmethod
     def get_port(self, context, id, fields=None):
@@ -307,7 +295,6 @@ class NeutronPluginBaseV2(object):
                        :file:`neutron/api/v2/attributes.py`. Only these fields
                        will be returned.
         """
-        pass
 
     @abc.abstractmethod
     def get_ports(self, context, filters=None, fields=None,
@@ -321,7 +308,7 @@ class NeutronPluginBaseV2(object):
         :param filters: a dictionary with keys that are valid keys for
                         a port as listed in the  :obj:`RESOURCE_ATTRIBUTE_MAP`
                         object in :file:`neutron/api/v2/attributes.py`. Values
-                        in this dictiontary are an iterable containing values
+                        in this dictionary are an iterable containing values
                         that will be used for an exact match comparison for
                         that value.  Each result returned by this function will
                         have matched one of the values for each key in filters.
@@ -331,7 +318,6 @@ class NeutronPluginBaseV2(object):
                        :file:`neutron/api/v2/attributes.py`. Only these fields
                        will be returned.
         """
-        pass
 
     def get_ports_count(self, context, filters=None):
         """Return the number of ports.
@@ -344,7 +330,7 @@ class NeutronPluginBaseV2(object):
                         a network as listed in the
                         :obj:`RESOURCE_ATTRIBUTE_MAP` object in
                         :file:`neutron/api/v2/attributes.py`.  Values in this
-                        dictiontary are an iterable containing values that will
+                        dictionary are an iterable containing values that will
                         be used for an exact match comparison for that value.
                         Each result returned by this function will have matched
                         one of the values for each key in filters.
@@ -361,7 +347,6 @@ class NeutronPluginBaseV2(object):
         :param context: neutron api request context
         :param id: UUID representing the port to delete.
         """
-        pass
 
     def start_rpc_listeners(self):
         """Start the RPC listeners.
@@ -369,6 +354,16 @@ class NeutronPluginBaseV2(object):
         Most plugins start RPC listeners implicitly on initialization.  In
         order to support multiple process RPC, the plugin needs to expose
         control over when this is started.
+
+        .. note:: this method is optional, as it was not part of the originally
+                  defined plugin API.
+        """
+        raise NotImplementedError()
+
+    def start_rpc_state_reports_listener(self):
+        """Start the RPC listeners consuming state reports queue.
+
+        This optional method creates rpc consumer for REPORTS queue only.
 
         .. note:: this method is optional, as it was not part of the originally
                   defined plugin API.
@@ -389,3 +384,19 @@ class NeutronPluginBaseV2(object):
         """
         return (self.__class__.start_rpc_listeners !=
                 NeutronPluginBaseV2.start_rpc_listeners)
+
+    def rpc_state_report_workers_supported(self):
+        """Return whether the plugin supports state report RPC workers.
+
+        .. note:: this method is optional, as it was not part of the originally
+                  defined plugin API.
+        """
+        return (self.__class__.start_rpc_state_reports_listener !=
+                NeutronPluginBaseV2.start_rpc_state_reports_listener)
+
+    def has_native_datastore(self):
+        """Return True if the plugin uses Neutron's native datastore.
+
+        .. note:: plugins like ML2 should override this method and return True.
+        """
+        return False

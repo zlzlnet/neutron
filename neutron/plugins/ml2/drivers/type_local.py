@@ -13,18 +13,17 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from neutron_lib import constants as p_const
+from neutron_lib import exceptions as exc
+from neutron_lib.plugins.ml2 import api
 from oslo_log import log
-import six
 
-from neutron.common import exceptions as exc
-from neutron.i18n import _LI
-from neutron.plugins.common import constants as p_const
-from neutron.plugins.ml2 import driver_api as api
+from neutron._i18n import _
 
 LOG = log.getLogger(__name__)
 
 
-class LocalTypeDriver(api.TypeDriver):
+class LocalTypeDriver(api.ML2TypeDriver):
     """Manage state for local networks with ML2.
 
     The LocalTypeDriver implements the 'local' network_type. Local
@@ -35,7 +34,7 @@ class LocalTypeDriver(api.TypeDriver):
     """
 
     def __init__(self):
-        LOG.info(_LI("ML2 LocalTypeDriver initialization complete"))
+        LOG.info("ML2 LocalTypeDriver initialization complete")
 
     def get_type(self):
         return p_const.TYPE_LOCAL
@@ -43,24 +42,33 @@ class LocalTypeDriver(api.TypeDriver):
     def initialize(self):
         pass
 
+    def initialize_network_segment_range_support(self):
+        pass
+
+    def update_network_segment_range_allocations(self):
+        pass
+
+    def get_network_segment_ranges(self):
+        pass
+
     def is_partial_segment(self, segment):
         return False
 
     def validate_provider_segment(self, segment):
-        for key, value in six.iteritems(segment):
+        for key, value in segment.items():
             if value and key != api.NETWORK_TYPE:
                 msg = _("%s prohibited for local provider network") % key
                 raise exc.InvalidInput(error_message=msg)
 
-    def reserve_provider_segment(self, session, segment):
+    def reserve_provider_segment(self, context, segment, filters=None):
         # No resources to reserve
         return segment
 
-    def allocate_tenant_segment(self, session):
+    def allocate_tenant_segment(self, context, filters=None):
         # No resources to allocate
         return {api.NETWORK_TYPE: p_const.TYPE_LOCAL}
 
-    def release_segment(self, session, segment):
+    def release_segment(self, context, segment):
         # No resources to release
         pass
 

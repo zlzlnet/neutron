@@ -1,0 +1,290 @@
+# Copyright 2026 Red Hat, LLC
+# All Rights Reserved.
+#
+#    Licensed under the Apache License, Version 2.0 (the "License"); you may
+#    not use this file except in compliance with the License. You may obtain
+#    a copy of the License at
+#
+#         http://www.apache.org/licenses/LICENSE-2.0
+#
+#    Unless required by applicable law or agreed to in writing, software
+#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+#    License for the specific language governing permissions and limitations
+#    under the License.
+
+from neutron_lib import constants as n_const
+from neutron_lib.db import api as db_api
+from oslo_db import exception as db_exc
+from oslo_log import log as logging
+from oslo_serialization import jsonutils
+
+from neutron.db.models import evpn as evpn_models
+from neutron.db.models import l3_attrs
+from neutron.db import models_v2
+from neutron.db import vni_vlan_allocator
+from neutron.services.evpn import exceptions as evpn_exc
+
+
+LOG = logging.getLogger(__name__)
+
+# The VNI is unique across the whole fabric while the VLAN is only unique
+# on a single physical network, so they are separate pools. EVPN L3 has a
+# single scope for each today, hence the identical physnets.
+_EVPN_VNI_RANGE = vni_vlan_allocator.ScopedRange(
+    min_val=1, max_val=n_const.MAX_VXLAN_VNI, physnet='ovn-evpn')
+_EVPN_VLAN_RANGE = vni_vlan_allocator.ScopedRange(
+    min_val=n_const.MIN_VLAN_TAG, max_val=n_const.MAX_VLAN_TAG,
+    physnet='ovn-evpn')
+
+
+class EVPNDbHelper:
+    """Database helper for EVPN allocation operations.
+
+    This class provides VNI/VLAN allocation/deallocation for routers.
+    It delegates to VNIVLANAllocator for the generic allocation logic
+    and owns the EVPN-specific L3 instance lifecycle.
+    Designed to be used via composition rather than inheritance.
+    """
+
+    def __init__(self):
+        self._allocator = vni_vlan_allocator.VNIVLANAllocator(
+            vni_exhausted_exc=evpn_exc.EVPNNoVniAvailable,
+            vlan_exhausted_exc=evpn_exc.EVPNNoVlanAvailable,
+            vni_in_use_exc=evpn_exc.EVPNVNIInUse,
+        )
+
+    @db_api.retry_if_session_inactive()
+    @db_api.CONTEXT_WRITER
+    def allocate_vni_for_router(self, context, router_id, vni):
+        """Allocate a VNI for a router.
+
+        The ranges and physical networks are the hardcoded
+        _EVPN_VNI_RANGE and _EVPN_VLAN_RANGE constants.
+
+        :param context: Neutron request context (with active session)
+        :param router_id: UUID of the router
+        :param vni: VNI to allocate; 0 means auto-allocate
+        :returns: The allocated VNI (integer)
+        :raises EVPNVNIInUse: If VNI is already allocated
+        """
+        if vni:
+            return self._allocate_specific_vni(context, router_id, vni)
+        return self._allocate_auto_vni(context, router_id)
+
+    def _allocate_specific_vni(self, context, router_id, vni):
+        """Allocate a specific VNI and a VLAN for a router.
+
+        :param context: Neutron request context (with active session)
+        :param router_id: UUID of the router
+        :param vni: VNI to allocate
+        :returns: The allocated VNI (integer)
+        :raises EVPNVNIInUse: If VNI is already allocated
+        """
+        mapping_id, vni, _vlan_id = self._allocator.allocate_specific_vni(
+            context, vni, _EVPN_VNI_RANGE.physnet, _EVPN_VLAN_RANGE)
+
+        instance = evpn_models.EVPNL3Instance(
+            router_id=router_id,
+            mapping_id=mapping_id)
+        context.session.add(instance)
+
+        LOG.debug("Allocated EVPN VNI %s for router %s", vni, router_id)
+        return vni
+
+    def _allocate_auto_vni(self, context, router_id):
+        """Auto-allocate a VNI for a router from the configured range.
+
+        :param context: Neutron request context (with active session)
+        :param router_id: UUID of the router
+        :returns: The allocated VNI (integer)
+        :raises EVPNNoVniAvailable: if no VNI remains in the range
+        """
+        mapping_id, vni, _vlan_id = self._allocator.allocate(
+            context, _EVPN_VNI_RANGE, _EVPN_VLAN_RANGE)
+
+        instance = evpn_models.EVPNL3Instance(
+            router_id=router_id,
+            mapping_id=mapping_id)
+        context.session.add(instance)
+
+        LOG.debug("Auto-allocated EVPN VNI %s for router %s", vni, router_id)
+        return vni
+
+    @db_api.retry_if_session_inactive()
+    @db_api.CONTEXT_WRITER
+    def deallocate_vni_for_router(self, context, router_id):
+        """Remove VNI/VLAN allocation for a router.
+
+        Delegates to VNIVLANAllocator.deallocate which deletes the mapping
+        (CASCADE removes evpn_l3_instances) and both allocation rows.
+        Safe to call if no VNI was allocated (e.g. router without EVPN).
+
+        :param context: Neutron request context (with active session)
+        :param router_id: UUID of the router
+        """
+        instance = context.session.query(
+            evpn_models.EVPNL3Instance
+        ).filter_by(router_id=router_id).first()
+        if not instance:
+            return
+
+        mapping_id = instance.mapping_id
+        context.session.delete(instance)
+
+        self._allocator.deallocate(context, mapping_id)
+        LOG.debug("Deallocated EVPN VNI for router %s", router_id)
+
+    @db_api.retry_if_session_inactive()
+    @db_api.CONTEXT_WRITER
+    def remove_evpn_network_by_subnet(self, context, subnet_id):
+        """Remove evpn_networks entry for the network owning a subnet.
+
+        Called when a router interface is detached. Looks up the network_id
+        from the subnet, then deletes the corresponding evpn_networks row.
+        CASCADE will delete any evpn_advertised_ports for that network.
+        Safe to call if no evpn_networks entry exists.
+
+        :param context: Neutron request context
+        :param subnet_id: UUID of the subnet being detached
+        """
+        context.session.query(
+            evpn_models.EVPNNetwork
+        ).filter(
+            evpn_models.EVPNNetwork.network_id == context.session.query(
+                models_v2.Subnet.network_id
+            ).filter(
+                models_v2.Subnet.id == subnet_id
+            ).correlate(None).scalar_subquery()
+        ).delete(synchronize_session=False)
+
+        LOG.debug("Removed EVPN network entry for subnet %s", subnet_id)
+
+    @db_api.retry_if_session_inactive()
+    def advertise_port(self, context, port_id, network_id, router_id):
+        """Enable EVPN advertisement for a port.
+
+        Creates evpn_networks and evpn_advertised_ports entries. If the
+        router has no EVPN L3 instance, the FK constraint on
+        evpn_networks.router_id will cause the insert to fail.
+
+        :param context: Neutron request context
+        :param port_id: UUID of the port to advertise
+        :param network_id: UUID of the port's network
+        :param router_id: UUID of the router
+        """
+
+        # NOTE: DB work lives in _advertise_port so this method can translate
+        # oslo DB errors to API exceptions inside the retried call. If
+        # DBDuplicateEntry escaped to @retry_if_session_inactive, the retry
+        # wrapper would treat it as retriable and consume/retry it instead of
+        # returning a Conflict to the caller.
+        try:
+            self._advertise_port(context, port_id, network_id, router_id)
+        except db_exc.DBReferenceError:
+            raise evpn_exc.EVPNVNINotFound(router_id=router_id)
+        except db_exc.DBDuplicateEntry:
+            raise evpn_exc.EVPNAdvertisedSubnetConflict(
+                router_id=router_id,
+                network_id=network_id)
+
+    @db_api.CONTEXT_WRITER
+    def _advertise_port(self, context, port_id, network_id, router_id):
+        context.session.add(evpn_models.EVPNNetwork(
+            network_id=network_id,
+            router_id=router_id))
+        context.session.flush()
+
+        context.session.add(evpn_models.EVPNAdvertisedPort(
+            port_id=port_id,
+            network_id=network_id))
+
+        LOG.debug("EVPN advertise port %s on network %s for router %s",
+                  port_id, network_id, router_id)
+
+    @db_api.retry_if_session_inactive()
+    @db_api.CONTEXT_READER
+    def get_all_evpn_l3_instances(self, context):
+        """Get all EVPN L3 instances with their VNI and VLAN allocations.
+
+        :param context: Neutron request context
+        :returns: list of dicts with router_id, vni, vlan,
+                  availability_zone_hints keys
+        """
+        rows = (
+            context.session.query(
+                evpn_models.EVPNL3Instance,
+                l3_attrs.RouterExtraAttributes.availability_zone_hints,
+            ).outerjoin(
+                l3_attrs.RouterExtraAttributes,
+                evpn_models.EVPNL3Instance.router_id ==
+                l3_attrs.RouterExtraAttributes.router_id,
+            ).all()
+        )
+        return [{
+            'router_id': inst.router_id,
+            'vni': inst.mapping.vni_allocation.vni,
+            'vlan': inst.mapping.vlan_allocation.vlan_id,
+            'availability_zone_hints': jsonutils.loads(az_string or '[]'),
+        } for inst, az_string in rows]
+
+    @db_api.retry_if_session_inactive()
+    @db_api.CONTEXT_READER
+    def get_all_evpn_advertised_ports(self, context):
+        """Get all port IDs marked for EVPN advertisement.
+
+        :param context: Neutron request context
+        :returns: list of port_id strings
+        """
+        ports = context.session.query(
+            evpn_models.EVPNAdvertisedPort
+        ).all()
+        return [p.port_id for p in ports]
+
+    @db_api.retry_if_session_inactive()
+    @db_api.CONTEXT_READER
+    def get_evpn_network(self, context, network_id):
+        """Return the evpn_networks row for this Neutron network,
+        or return None if not found.
+
+        evpn_networks is written in advertise_port() when a router
+        interface is added with advertise_host. The upcoming PORT
+        callback uses this: if the row is missing,
+        the network is not in EVPN and we must not stamp the metadata LSP.
+        """
+        return context.session.query(
+            evpn_models.EVPNNetwork
+        ).filter_by(network_id=network_id).one_or_none()
+
+    @db_api.retry_if_session_inactive()
+    @db_api.CONTEXT_READER
+    def get_vni_for_router(self, context, router_id):
+        """Get the VNI allocated to a router, or None if not allocated.
+
+        :param context: Neutron request context
+        :param router_id: UUID of the router
+        :returns: VNI (integer) or None
+        """
+        instance = context.session.query(
+            evpn_models.EVPNL3Instance
+        ).filter_by(router_id=router_id).first()
+        if not instance:
+            return None
+        return instance.mapping.vni_allocation.vni
+
+    @db_api.retry_if_session_inactive()
+    @db_api.CONTEXT_READER
+    def get_vlan_for_router(self, context, router_id):
+        """Get the VLAN ID allocated to a router.
+
+        :param context: Neutron request context
+        :param router_id: UUID of the router
+        :returns: VLAN ID (integer)
+        :raises EVPNVNINotFound: if no EVPN instance exists for the router
+        """
+        instance = context.session.query(
+            evpn_models.EVPNL3Instance
+        ).filter_by(router_id=router_id).first()
+        if not instance:
+            raise evpn_exc.EVPNVNINotFound(router_id=router_id)
+        return instance.mapping.vlan_allocation.vlan_id

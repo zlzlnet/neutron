@@ -15,25 +15,25 @@
 
 import abc
 
+from neutron_lib.api import extensions as api_extensions
+from neutron_lib.api import faults
+from neutron_lib import constants
+from neutron_lib import exceptions
+from neutron_lib.exceptions import agent as agent_exc
+from neutron_lib.plugins import constants as plugin_constants
+from neutron_lib.plugins import directory
+from neutron_lib import rpc as n_rpc
 from oslo_log import log as logging
 import webob.exc
 
+from neutron._i18n import _
 from neutron.api import extensions
-from neutron.api.v2 import base
 from neutron.api.v2 import resource
-from neutron.common import constants
-from neutron.common import exceptions
-from neutron.common import rpc as n_rpc
-from neutron.extensions import agent
-from neutron.i18n import _LE
-from neutron import manager
-from neutron.plugins.common import constants as service_constants
+from neutron.api import wsgi
+from neutron.common.ovn import constants as ovn_const
 from neutron import policy
-from neutron import wsgi
-
 
 LOG = logging.getLogger(__name__)
-
 
 L3_ROUTER = 'l3-router'
 L3_ROUTERS = L3_ROUTER + 's'
@@ -43,11 +43,10 @@ L3_AGENTS = L3_AGENT + 's'
 
 class RouterSchedulerController(wsgi.Controller):
     def get_plugin(self):
-        plugin = manager.NeutronManager.get_service_plugins().get(
-            service_constants.L3_ROUTER_NAT)
+        plugin = directory.get_plugin(plugin_constants.L3)
         if not plugin:
-            LOG.error(_LE('No plugin for L3 routing registered to handle '
-                          'router scheduling'))
+            LOG.error('No plugin for L3 routing registered to handle '
+                      'router scheduling')
             msg = _('The resource could not be found.')
             raise webob.exc.HTTPNotFound(msg)
         return plugin
@@ -67,9 +66,24 @@ class RouterSchedulerController(wsgi.Controller):
                        {})
         agent_id = kwargs['agent_id']
         router_id = body['router_id']
-        result = plugin.add_router_to_l3_agent(request.context, agent_id,
-                                               router_id)
+        ha_chassis_priority = body.get('ha_chassis_priority')
+        result = plugin.add_router_to_l3_agent(
+            request.context, agent_id, router_id,
+            ha_chassis_priority=ha_chassis_priority)
         notify(request.context, 'l3_agent.router.add', router_id, agent_id)
+        return result
+
+    def update(self, request, id, body, **kwargs):
+        plugin = self.get_plugin()
+        policy.enforce(request.context,
+                       "update_%s" % L3_ROUTER,
+                       {})
+        agent_id = kwargs['agent_id']
+        ha_chassis_priority = body.get('ha_chassis_priority')
+        result = plugin.update_router_in_l3_agent(
+            request.context, agent_id, id,
+            ha_chassis_priority=ha_chassis_priority)
+        notify(request.context, 'l3_agent.router.update', id, agent_id)
         return result
 
     def delete(self, request, id, **kwargs):
@@ -86,11 +100,10 @@ class RouterSchedulerController(wsgi.Controller):
 
 class L3AgentsHostingRouterController(wsgi.Controller):
     def get_plugin(self):
-        plugin = manager.NeutronManager.get_service_plugins().get(
-            service_constants.L3_ROUTER_NAT)
+        plugin = directory.get_plugin(plugin_constants.L3)
         if not plugin:
-            LOG.error(_LE('No plugin for L3 routing registered to handle '
-                          'router scheduling'))
+            LOG.error('No plugin for L3 routing registered to handle '
+                      'router scheduling')
             msg = _('The resource could not be found.')
             raise webob.exc.HTTPNotFound(msg)
         return plugin
@@ -104,7 +117,7 @@ class L3AgentsHostingRouterController(wsgi.Controller):
             request.context, kwargs['router_id'])
 
 
-class L3agentscheduler(extensions.ExtensionDescriptor):
+class L3agentscheduler(api_extensions.ExtensionDescriptor):
     """Extension class supporting l3 agent scheduler.
     """
 
@@ -128,19 +141,17 @@ class L3agentscheduler(extensions.ExtensionDescriptor):
     def get_resources(cls):
         """Returns Ext Resources."""
         exts = []
-        parent = dict(member_name="agent",
-                      collection_name="agents")
+        parent = {'member_name': "agent", 'collection_name': "agents"}
 
         controller = resource.Resource(RouterSchedulerController(),
-                                       base.FAULT_MAP)
+                                       faults.FAULT_MAP)
         exts.append(extensions.ResourceExtension(
             L3_ROUTERS, controller, parent))
 
-        parent = dict(member_name="router",
-                      collection_name="routers")
+        parent = {'member_name': "router", 'collection_name': "routers"}
 
         controller = resource.Resource(L3AgentsHostingRouterController(),
-                                       base.FAULT_MAP)
+                                       faults.FAULT_MAP)
         exts.append(extensions.ResourceExtension(
             L3_AGENTS, controller, parent))
         return exts
@@ -149,18 +160,23 @@ class L3agentscheduler(extensions.ExtensionDescriptor):
         return {}
 
 
-class InvalidL3Agent(agent.AgentNotFound):
+class InvalidL3Agent(agent_exc.AgentNotFound):
     message = _("Agent %(id)s is not a L3 Agent or has been disabled")
 
 
 class RouterHostedByL3Agent(exceptions.Conflict):
-    message = _("The router %(router_id)s has been already hosted"
-                " by the L3 Agent %(agent_id)s.")
+    message = _("The router %(router_id)s has been already hosted "
+                "by the L3 Agent %(agent_id)s.")
+
+
+class RouterNotHostedByL3Agent(exceptions.Conflict):
+    message = _("The router %(router_id)s is not hosted by the L3 Agent "
+                "%(agent_id)s.")
 
 
 class RouterSchedulingFailed(exceptions.Conflict):
-    message = _("Failed scheduling router %(router_id)s to"
-                " the L3 Agent %(agent_id)s.")
+    message = _("Failed scheduling router %(router_id)s to "
+                "the L3 Agent %(agent_id)s.")
 
 
 class RouterReschedulingFailed(exceptions.Conflict):
@@ -169,28 +185,54 @@ class RouterReschedulingFailed(exceptions.Conflict):
 
 
 class RouterL3AgentMismatch(exceptions.Conflict):
-    message = _("Cannot host %(router_type)s router %(router_id)s "
-                "on %(agent_mode)s L3 agent %(agent_id)s.")
+    message = _("Cannot host distributed router %(router_id)s "
+                "on legacy L3 agent %(agent_id)s.")
 
 
 class DVRL3CannotAssignToDvrAgent(exceptions.Conflict):
-    message = _("Not allowed to manually assign a %(router_type)s "
-                "router %(router_id)s from an existing DVR node "
-                "to another L3 agent %(agent_id)s.")
+    message = _("Not allowed to manually assign a router to an "
+                "agent in 'dvr' mode.")
 
 
-class L3AgentSchedulerPluginBase(object):
+class DVRL3CannotRemoveFromDvrAgent(exceptions.Conflict):
+    message = _("Not allowed to manually remove a router from "
+                "an agent in 'dvr' mode.")
+
+
+class RouterDoesntSupportScheduling(exceptions.Conflict):
+    message = _("Router %(router_id)s does not support agent scheduling.")
+
+
+class InvalidHAChassisPriority(exceptions.BadRequest):
+    message = (_('HA Chassis priority must be between %(low)s and '
+                '%(high)s') %
+               {'low': ovn_const.HA_CHASSIS_GROUP_LOWEST_PRIORITY,
+                'high': ovn_const.HA_CHASSIS_GROUP_HIGHEST_PRIORITY})
+
+
+class HAChassisPriorityAlreadyAssigned(exceptions.Conflict):
+    message = _('HA Chassis priority %(ha_chassis_priority)s is already '
+                'assigned')
+
+
+class L3AgentSchedulerPluginBase(metaclass=abc.ABCMeta):
     """REST API to operate the l3 agent scheduler.
 
     All of method must be in an admin context.
     """
 
     @abc.abstractmethod
-    def add_router_to_l3_agent(self, context, id, router_id):
+    def add_router_to_l3_agent(self, context, id, router_id,
+                               ha_chassis_priority=None):
         pass
 
     @abc.abstractmethod
     def remove_router_from_l3_agent(self, context, id, router_id):
+        pass
+
+    @abc.abstractmethod
+    def update_router_in_l3_agent(self, context, id, router_id,
+                                  ha_chassis_priority=None):
         pass
 
     @abc.abstractmethod
@@ -200,6 +242,10 @@ class L3AgentSchedulerPluginBase(object):
     @abc.abstractmethod
     def list_l3_agents_hosting_router(self, context, router_id):
         pass
+
+    def router_supports_scheduling(self, context, router_id):
+        """Override this method to conditionally schedule routers."""
+        return True
 
 
 def notify(context, action, router_id, agent_id):

@@ -1,4 +1,4 @@
-# Copyright (c) 2014 Openstack Foundation
+# Copyright (c) 2014 OpenStack Foundation
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -14,24 +14,14 @@
 
 import weakref
 
-from oslo_log import log as logging
-
 from neutron.agent.l3 import dvr_fip_ns
-from neutron.agent.l3 import dvr_snat_ns
-from neutron.agent.l3 import namespaces
-
-LOG = logging.getLogger(__name__)
-
-# TODO(Carl) Following constants retained to increase SNR during refactoring
-SNAT_INT_DEV_PREFIX = dvr_snat_ns.SNAT_INT_DEV_PREFIX
-SNAT_NS_PREFIX = dvr_snat_ns.SNAT_NS_PREFIX
 
 
-class AgentMixin(object):
+class AgentMixin:
     def __init__(self, host):
         # dvr data
         self._fip_namespaces = weakref.WeakValueDictionary()
-        super(AgentMixin, self).__init__(host)
+        super().__init__(host)
 
     def get_fip_ns(self, ext_net_id):
         # TODO(Carl) is this necessary?  Code that this replaced was careful to
@@ -50,16 +40,10 @@ class AgentMixin(object):
 
         return fip_ns
 
-    def _destroy_fip_namespace(self, ns):
-        ex_net_id = namespaces.get_id_from_ns_name(ns)
-        fip_ns = self.get_fip_ns(ex_net_id)
-        fip_ns.delete()
-
     def get_ports_by_subnet(self, subnet_id):
         return self.plugin_rpc.get_ports_by_subnet(self.context, subnet_id)
 
-    def add_arp_entry(self, context, payload):
-        """Add arp entry into router namespace.  Called from RPC."""
+    def _update_arp_entry(self, context, payload, action):
         router_id = payload['router_id']
         ri = self.router_info.get(router_id)
         if not ri:
@@ -69,17 +53,22 @@ class AgentMixin(object):
         ip = arp_table['ip_address']
         mac = arp_table['mac_address']
         subnet_id = arp_table['subnet_id']
-        ri._update_arp_entry(ip, mac, subnet_id, 'add')
+        device, device_exists = ri.get_arp_related_dev(subnet_id)
+        ri._update_arp_entry(ip, mac, subnet_id, action,
+                             device,
+                             device_exists=device_exists)
+
+    def add_arp_entry(self, context, payload):
+        """Add arp entry into router namespace.  Called from RPC."""
+        self._update_arp_entry(context, payload, 'add')
 
     def del_arp_entry(self, context, payload):
         """Delete arp entry from router namespace.  Called from RPC."""
-        router_id = payload['router_id']
-        ri = self.router_info.get(router_id)
-        if not ri:
-            return
+        self._update_arp_entry(context, payload, 'delete')
 
-        arp_table = payload['arp_table']
-        ip = arp_table['ip_address']
-        mac = arp_table['mac_address']
-        subnet_id = arp_table['subnet_id']
-        ri._update_arp_entry(ip, mac, subnet_id, 'delete')
+    def fipnamespace_delete_on_ext_net(self, context, ext_net_id):
+        """Delete fip namespace after external network removed."""
+        fip_ns = self.get_fip_ns(ext_net_id)
+        if fip_ns.agent_gateway_port and not fip_ns.destroyed:
+            fip_ns.unsubscribe(ext_net_id)
+            fip_ns.delete()

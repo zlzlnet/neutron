@@ -14,24 +14,28 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import copy
 import math
-import mock
+from unittest import mock
 
-from neutron.common import constants as const
-from neutron import context
+from neutron_lib.callbacks import events
+from neutron_lib.callbacks import registry
+from neutron_lib.callbacks import resources
+from neutron_lib import constants as const
+from neutron_lib import context
+from neutron_lib.db import api as db_api
+from neutron_lib import fixture
+from neutron_lib.plugins import directory
+
 from neutron.extensions import securitygroup as ext_sg
-from neutron import manager
-from neutron.tests import tools
 from neutron.tests.unit.agent import test_securitygroups_rpc as test_sg_rpc
 from neutron.tests.unit.api.v2 import test_base
 from neutron.tests.unit.extensions import test_securitygroup as test_sg
 
-PLUGIN_NAME = 'neutron.plugins.ml2.plugin.Ml2Plugin'
 NOTIFIER = 'neutron.plugins.ml2.rpc.AgentNotifierApi'
 
 
 class Ml2SecurityGroupsTestCase(test_sg.SecurityGroupDBTestCase):
-    _plugin_name = PLUGIN_NAME
 
     def setUp(self, plugin=None):
         test_sg_rpc.set_firewall_driver(test_sg_rpc.FIREWALL_HYBRID_DRIVER)
@@ -39,20 +43,22 @@ class Ml2SecurityGroupsTestCase(test_sg.SecurityGroupDBTestCase):
         notifier_cls = notifier_p.start()
         self.notifier = mock.Mock()
         notifier_cls.return_value = self.notifier
-        self.useFixture(tools.AttributeMapMemento())
-        super(Ml2SecurityGroupsTestCase, self).setUp(PLUGIN_NAME)
-
-    def tearDown(self):
-        super(Ml2SecurityGroupsTestCase, self).tearDown()
+        self.useFixture(fixture.APIDefinitionFixture())
+        super().setUp('ml2')
+        plugin = directory.get_plugin()
+        mock.patch.object(
+            plugin, 'get_default_security_group_rules',
+            return_value=copy.deepcopy(
+                test_sg.RULES_TEMPLATE_FOR_CUSTOM_SG)).start()
 
 
 class TestMl2SecurityGroups(Ml2SecurityGroupsTestCase,
                             test_sg.TestSecurityGroups,
                             test_sg_rpc.SGNotificationTestMixin):
     def setUp(self):
-        super(TestMl2SecurityGroups, self).setUp()
+        super().setUp()
         self.ctx = context.get_admin_context()
-        plugin = manager.NeutronManager.get_plugin()
+        plugin = directory.get_plugin()
         plugin.start_rpc_listeners()
 
     def _make_port_with_new_sec_group(self, net_id):
@@ -74,9 +80,10 @@ class TestMl2SecurityGroups(Ml2SecurityGroupsTestCase,
                     self._make_port_with_new_sec_group(n['network']['id']),
                     self._make_port_without_sec_group(n['network']['id'])
                 ]
-                plugin = manager.NeutronManager.get_plugin()
+                plugin = directory.get_plugin()
                 # should match full ID and starting chars
-                ports = plugin.get_ports_from_devices(self.ctx,
+                ports = plugin.get_ports_from_devices(
+                    self.ctx,
                     [orig_ports[0]['id'], orig_ports[1]['id'][0:8],
                      orig_ports[2]['id']])
                 self.assertEqual(len(orig_ports), len(ports))
@@ -91,13 +98,35 @@ class TestMl2SecurityGroups(Ml2SecurityGroupsTestCase,
                                      port_dict['fixed_ips'])
                     self._delete('ports', p['id'])
 
+    def test_default_security_group_rules(self):
+        plugin = directory.get_plugin()
+        with mock.patch.object(
+                plugin, 'get_default_security_group_rules',
+                return_value=copy.deepcopy(
+                    test_sg.RULES_TEMPLATE_FOR_DEFAULT_SG)):
+            super().test_default_security_group_rules()
+
+    def test_get_security_group(self):
+        plugin = directory.get_plugin()
+        with mock.patch.object(
+                plugin, 'get_default_security_group_rules',
+                return_value=[]):
+            super().test_get_security_group()
+
+    def test_create_security_group_rules_admin_project(self):
+        plugin = directory.get_plugin()
+        with mock.patch.object(
+                plugin, 'get_default_security_group_rules',
+                return_value=[]):
+            super().test_create_security_group_rules_admin_project()
+
     def test_security_group_get_ports_from_devices_with_bad_id(self):
-        plugin = manager.NeutronManager.get_plugin()
+        plugin = directory.get_plugin()
         ports = plugin.get_ports_from_devices(self.ctx, ['bad_device_id'])
         self.assertFalse(ports)
 
     def test_security_group_no_db_calls_with_no_ports(self):
-        plugin = manager.NeutronManager.get_plugin()
+        plugin = directory.get_plugin()
         with mock.patch(
             'neutron.plugins.ml2.db.get_sg_ids_grouped_by_port'
         ) as get_mock:
@@ -105,7 +134,7 @@ class TestMl2SecurityGroups(Ml2SecurityGroupsTestCase,
             self.assertFalse(get_mock.called)
 
     def test_large_port_count_broken_into_parts(self):
-        plugin = manager.NeutronManager.get_plugin()
+        plugin = directory.get_plugin()
         max_ports_per_query = 5
         ports_to_query = 73
         for max_ports_per_query in (1, 2, 5, 7, 9, 31):
@@ -114,10 +143,11 @@ class TestMl2SecurityGroups(Ml2SecurityGroupsTestCase,
                     mock.patch(
                         'neutron.plugins.ml2.db.get_sg_ids_grouped_by_port',
                         return_value={}) as get_mock:
-                plugin.get_ports_from_devices(self.ctx,
-                    ['%s%s' % (const.TAP_DEVICE_PREFIX, i)
+                plugin.get_ports_from_devices(
+                    self.ctx,
+                    [f'{const.TAP_DEVICE_PREFIX}{i}'
                      for i in range(ports_to_query)])
-                all_call_args = map(lambda x: x[1][1], get_mock.mock_calls)
+                all_call_args = [x[1][1] for x in get_mock.mock_calls]
                 last_call_args = all_call_args.pop()
                 # all but last should be getting MAX_PORTS_PER_QUERY ports
                 self.assertTrue(
@@ -134,9 +164,9 @@ class TestMl2SecurityGroups(Ml2SecurityGroupsTestCase,
                 )
 
     def test_full_uuids_skip_port_id_lookup(self):
-        plugin = manager.NeutronManager.get_plugin()
+        plugin = directory.get_plugin()
         # when full UUIDs are provided, the _or statement should only
-        # have one matching 'IN' critiera for all of the IDs
+        # have one matching 'IN' criteria for all of the IDs
         with mock.patch('neutron.plugins.ml2.db.or_') as or_mock,\
                 mock.patch('sqlalchemy.orm.Session.query') as qmock:
             fmock = qmock.return_value.outerjoin.return_value.filter
@@ -149,8 +179,22 @@ class TestMl2SecurityGroups(Ml2SecurityGroupsTestCase,
             # the or_ function should only have one argument
             or_mock.assert_called_once_with(mock.ANY)
 
+    def test_security_groups_created_outside_transaction(self):
+        def record_after_state(r, e, t, payload=None):
+            self.was_active = db_api.is_session_active(payload.context.session)
 
-class TestMl2SGServerRpcCallBack(
-    Ml2SecurityGroupsTestCase,
-    test_sg_rpc.SGServerRpcCallBackTestCase):
+        registry.subscribe(record_after_state, resources.SECURITY_GROUP,
+                           events.AFTER_CREATE)
+        with self.subnet() as s:
+            self.assertFalse(self.was_active)
+            self._delete(
+                'security-groups',
+                self._list('security-groups')['security_groups'][0]['id'],
+                as_admin=True)
+            with self.port(subnet=s):
+                self.assertFalse(self.was_active)
+
+
+class TestMl2SGServerRpcCallBack(Ml2SecurityGroupsTestCase,
+                                 test_sg_rpc.SGServerRpcCallBackTestCase):
     pass

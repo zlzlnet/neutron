@@ -13,12 +13,81 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import os
+import contextlib
+import time
+
+from neutron_lib.plugins.ml2 import ovs_constants as ovs_const
+from oslo_config import cfg
+from oslo_log import log as logging
+
+from neutron.agent.common import async_process
+from neutron.agent.common import base_polling
+from neutron.agent.common import ovsdb_monitor
+
+LOG = logging.getLogger(__name__)
 
 
-if os.name == 'nt':
-    from neutron.agent.windows import polling
-else:
-    from neutron.agent.linux import polling
+@contextlib.contextmanager
+def get_polling_manager(minimize_polling=False,
+                        ovsdb_monitor_respawn_interval=(
+                            ovs_const.DEFAULT_OVSDBMON_RESPAWN),
+                        bridge_names=None, ovs=None):
+    if minimize_polling:
+        pm = InterfacePollingMinimizer(
+            ovsdb_monitor_respawn_interval=ovsdb_monitor_respawn_interval,
+            bridge_names=bridge_names, ovs=ovs)
+        pm.start()
+    else:
+        pm = base_polling.AlwaysPoll()
+    try:
+        yield pm
+    finally:
+        if minimize_polling:
+            pm.stop()
 
-get_polling_manager = polling.get_polling_manager
+
+class InterfacePollingMinimizer(base_polling.BasePollingManager):
+    """Monitors ovsdb to determine when polling is required."""
+
+    def __init__(
+            self,
+            ovsdb_monitor_respawn_interval=ovs_const.DEFAULT_OVSDBMON_RESPAWN,
+            bridge_names=None, ovs=None):
+
+        super().__init__()
+        self._monitor = ovsdb_monitor.SimpleInterfaceMonitor(
+            respawn_interval=ovsdb_monitor_respawn_interval,
+            ovsdb_connection=cfg.CONF.OVS.ovsdb_connection,
+            bridge_names=bridge_names, ovs=ovs)
+
+    def start(self):
+        self._monitor.start(block=True)
+
+    def stop(self):
+        try:
+            self._monitor.stop()
+        except async_process.AsyncProcessException:
+            LOG.debug("InterfacePollingMinimizer was not running when stopped")
+
+    def _is_polling_required(self):
+        # Maximize the chances of update detection having a chance to
+        # collect output.  TODO(sahid): We can remove this line once
+        # eventlet monkey patching removed.
+        time.sleep(0)
+        return self._monitor.has_updates
+
+    def get_events(self):
+        return self._monitor.get_events()
+
+
+def filter_bridge_names(br_names):
+    """Bridge names to filter events received in the Interface monitor
+
+    When several OVS agents are executed on the same host and share the
+    same OVS switch, this filtering removes events of other agents; the
+    Interface monitor will only return events of Interfaces attached to
+    Ports that belong to bridges "br_names".
+
+    If the list is empty, no filtering is done.
+    """
+    return []

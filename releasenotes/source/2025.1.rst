@@ -1,0 +1,6 @@
+===========================
+2025.1 Series Release Notes
+===========================
+
+.. release-notes::
+   :branch: unmaintained/2025.1

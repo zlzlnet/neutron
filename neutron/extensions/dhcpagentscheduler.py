@@ -15,36 +15,37 @@
 
 import abc
 
-from neutron.api import extensions
-from neutron.api.v2 import base
-from neutron.api.v2 import resource
-from neutron.common import constants
-from neutron.common import exceptions
-from neutron.common import rpc as n_rpc
-from neutron.extensions import agent
-from neutron import manager
-from neutron import policy
-from neutron import wsgi
+from neutron_lib.api.definitions import agent as agent_apidef
+from neutron_lib.api.definitions import dhcpagentscheduler as apidef
+from neutron_lib.api.definitions import network as net_apidef
+from neutron_lib.api import extensions as api_extensions
+from neutron_lib.api import faults
+from neutron_lib.plugins import directory
+from neutron_lib import rpc as n_rpc
+from oslo_config import cfg
+from oslo_log import log as logging
 
-DHCP_NET = 'dhcp-network'
-DHCP_NETS = DHCP_NET + 's'
-DHCP_AGENT = 'dhcp-agent'
-DHCP_AGENTS = DHCP_AGENT + 's'
+from neutron.api import extensions
+from neutron.api.v2 import resource
+from neutron.api import wsgi
+from neutron import policy
+
+LOG = logging.getLogger(__name__)
 
 
 class NetworkSchedulerController(wsgi.Controller):
     def index(self, request, **kwargs):
-        plugin = manager.NeutronManager.get_plugin()
+        plugin = directory.get_plugin()
         policy.enforce(request.context,
-                       "get_%s" % DHCP_NETS,
+                       "get_%s" % apidef.DHCP_NETS,
                        {})
         return plugin.list_networks_on_dhcp_agent(
             request.context, kwargs['agent_id'])
 
     def create(self, request, body, **kwargs):
-        plugin = manager.NeutronManager.get_plugin()
+        plugin = directory.get_plugin()
         policy.enforce(request.context,
-                       "create_%s" % DHCP_NET,
+                       "create_%s" % apidef.DHCP_NET,
                        {})
         agent_id = kwargs['agent_id']
         network_id = body['network_id']
@@ -54,9 +55,9 @@ class NetworkSchedulerController(wsgi.Controller):
         return result
 
     def delete(self, request, id, **kwargs):
-        plugin = manager.NeutronManager.get_plugin()
+        plugin = directory.get_plugin()
         policy.enforce(request.context,
-                       "delete_%s" % DHCP_NET,
+                       "delete_%s" % apidef.DHCP_NET,
                        {})
         agent_id = kwargs['agent_id']
         result = plugin.remove_network_from_dhcp_agent(request.context,
@@ -67,73 +68,42 @@ class NetworkSchedulerController(wsgi.Controller):
 
 class DhcpAgentsHostingNetworkController(wsgi.Controller):
     def index(self, request, **kwargs):
-        plugin = manager.NeutronManager.get_plugin()
+        plugin = directory.get_plugin()
         policy.enforce(request.context,
-                       "get_%s" % DHCP_AGENTS,
+                       "get_%s" % apidef.DHCP_AGENTS,
                        {})
         return plugin.list_dhcp_agents_hosting_network(
             request.context, kwargs['network_id'])
 
 
-class Dhcpagentscheduler(extensions.ExtensionDescriptor):
+class Dhcpagentscheduler(api_extensions.APIExtensionDescriptor):
     """Extension class supporting dhcp agent scheduler.
     """
 
-    @classmethod
-    def get_name(cls):
-        return "DHCP Agent Scheduler"
-
-    @classmethod
-    def get_alias(cls):
-        return constants.DHCP_AGENT_SCHEDULER_EXT_ALIAS
-
-    @classmethod
-    def get_description(cls):
-        return "Schedule networks among dhcp agents"
-
-    @classmethod
-    def get_updated(cls):
-        return "2013-02-07T10:00:00-00:00"
+    api_definition = apidef
 
     @classmethod
     def get_resources(cls):
         """Returns Ext Resources."""
         exts = []
-        parent = dict(member_name="agent",
-                      collection_name="agents")
+        parent = {'member_name': agent_apidef.RESOURCE_NAME,
+                  'collection_name': agent_apidef.COLLECTION_NAME}
         controller = resource.Resource(NetworkSchedulerController(),
-                                       base.FAULT_MAP)
+                                       faults.FAULT_MAP)
         exts.append(extensions.ResourceExtension(
-            DHCP_NETS, controller, parent))
+            apidef.DHCP_NETS, controller, parent))
 
-        parent = dict(member_name="network",
-                      collection_name="networks")
+        parent = {'member_name': net_apidef.RESOURCE_NAME,
+                  'collection_name': net_apidef.COLLECTION_NAME}
 
         controller = resource.Resource(DhcpAgentsHostingNetworkController(),
-                                       base.FAULT_MAP)
+                                       faults.FAULT_MAP)
         exts.append(extensions.ResourceExtension(
-            DHCP_AGENTS, controller, parent))
+            apidef.DHCP_AGENTS, controller, parent))
         return exts
 
-    def get_extended_resources(self, version):
-        return {}
 
-
-class InvalidDHCPAgent(agent.AgentNotFound):
-    message = _("Agent %(id)s is not a valid DHCP Agent or has been disabled")
-
-
-class NetworkHostedByDHCPAgent(exceptions.Conflict):
-    message = _("The network %(network_id)s has been already hosted"
-                " by the DHCP Agent %(agent_id)s.")
-
-
-class NetworkNotHostedByDhcpAgent(exceptions.Conflict):
-    message = _("The network %(network_id)s is not hosted"
-                " by the DHCP agent %(agent_id)s.")
-
-
-class DhcpAgentSchedulerPluginBase(object):
+class DhcpAgentSchedulerPluginBase(metaclass=abc.ABCMeta):
     """REST API to operate the DHCP agent scheduler.
 
     All of method must be in an admin context.
@@ -160,3 +130,10 @@ def notify(context, action, network_id, agent_id):
     info = {'id': agent_id, 'network_id': network_id}
     notifier = n_rpc.get_notifier('network')
     notifier.info(context, action, {'agent': info})
+
+
+def disable_extension_by_config(aliases):
+    if not cfg.CONF.enable_traditional_dhcp:
+        if 'dhcp_agent_scheduler' in aliases:
+            aliases.remove('dhcp_agent_scheduler')
+        LOG.info('Disabled dhcp_agent_scheduler extension.')

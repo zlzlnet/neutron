@@ -1,0 +1,20 @@
+- hosts: all
+  roles:
+    - role: ensure-python
+      vars:
+        python_version: "{{ PYTHON3_VERSION }}"
+      when:
+        - enable_fips is defined and enable_fips|bool
+        - PYTHON3_VERSION is defined
+    - ensure-tox
+    # TODO(slaweq): remove it when nftables will support syntax for src and
+    # destination IP addresses in arp tables:
+    - legacy_ebtables
+    - setup_logdir
+    - role: persistent-firewall
+      when: enable_fips is defined and enable_fips|bool
+    - role: enable-fips
+      when: enable_fips is defined and enable_fips|bool
+    - role: disable_selinux
+      when: enable_fips is defined and enable_fips|bool
+    - configure_functional_tests

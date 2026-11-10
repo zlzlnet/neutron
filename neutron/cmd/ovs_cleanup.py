@@ -16,16 +16,19 @@
 from oslo_config import cfg
 from oslo_log import log as logging
 
-from neutron.agent.common import config as agent_config
 from neutron.agent.common import ovs_lib
-from neutron.agent.l3 import config as l3_config
-from neutron.agent.linux import interface
-from neutron.agent.linux import ip_lib
 from neutron.common import config
-from neutron.i18n import _LI
-
+from neutron.conf.agent import cmd
+from neutron.conf.agent import common as agent_config
+from neutron.conf.agent.l3 import config as l3_config
+from neutron.conf.plugins.ml2.drivers import ovs_conf
+from neutron.conf import service as service_config
 
 LOG = logging.getLogger(__name__)
+
+# Default ovsdb_timeout value for this script.
+# It allows to clean bridges with even thousands of ports.
+CLEANUP_OVSDB_TIMEOUT = 600
 
 
 def setup_conf():
@@ -34,43 +37,17 @@ def setup_conf():
     Use separate setup_conf for the utility because there are many options
     from the main config that do not apply during clean-up.
     """
-    opts = [
-        cfg.BoolOpt('ovs_all_ports',
-                    default=False,
-                    help=_('True to delete all ports on all the OpenvSwitch '
-                           'bridges. False to delete ports created by '
-                           'Neutron on integration and external network '
-                           'bridges.'))
-    ]
 
     conf = cfg.CONF
-    conf.register_cli_opts(opts)
-    conf.register_opts(l3_config.OPTS)
-    conf.register_opts(interface.OPTS)
+    config.register_common_config_options()
+    cmd.register_cmd_opts(cmd.ovs_opts, conf)
+    l3_config.register_l3_agent_config_opts(l3_config.OPTS, conf)
     agent_config.register_interface_driver_opts_helper(conf)
-    agent_config.register_use_namespaces_opts_helper(conf)
+    agent_config.register_interface_opts()
+    service_config.register_service_opts(service_config.RPC_EXTRA_OPTS, conf)
+    ovs_conf.register_ovs_agent_opts(conf)
+    conf.set_default("ovsdb_timeout", CLEANUP_OVSDB_TIMEOUT, "OVS")
     return conf
-
-
-def collect_neutron_ports(bridges):
-    """Collect ports created by Neutron from OVS."""
-    ports = []
-    for bridge in bridges:
-        ovs = ovs_lib.OVSBridge(bridge)
-        ports += [port.port_name for port in ovs.get_vif_ports()]
-    return ports
-
-
-def delete_neutron_ports(ports):
-    """Delete non-internal ports created by Neutron
-
-    Non-internal OVS ports need to be removed manually.
-    """
-    for port in ports:
-        if ip_lib.device_exists(port):
-            device = ip_lib.IPDevice(port)
-            device.link.delete()
-            LOG.info(_LI("Deleting port: %s"), port)
 
 
 def main():
@@ -82,9 +59,12 @@ def main():
     conf = setup_conf()
     conf()
     config.setup_logging()
+    agent_config.setup_privsep()
+    do_main(conf)
 
-    configuration_bridges = set([conf.ovs_integration_bridge,
-                                 conf.external_network_bridge])
+
+def do_main(conf):
+    configuration_bridges = {conf.OVS.integration_bridge}
     ovs = ovs_lib.BaseOVS()
     ovs_bridges = set(ovs.get_bridges())
     available_configuration_bridges = configuration_bridges & ovs_bridges
@@ -94,17 +74,9 @@ def main():
     else:
         bridges = available_configuration_bridges
 
-    # Collect existing ports created by Neutron on configuration bridges.
-    # After deleting ports from OVS bridges, we cannot determine which
-    # ports were created by Neutron, so port information is collected now.
-    ports = collect_neutron_ports(available_configuration_bridges)
-
     for bridge in bridges:
-        LOG.info(_LI("Cleaning bridge: %s"), bridge)
-        ovs = ovs_lib.OVSBridge(bridge)
-        ovs.delete_ports(all_ports=conf.ovs_all_ports)
+        LOG.info("Cleaning bridge: %s", bridge)
+        ovs.ovsdb.ovs_cleanup(bridge,
+                              conf.ovs_all_ports).execute(check_error=True)
 
-    # Remove remaining ports created by Neutron (usually veth pair)
-    delete_neutron_ports(ports)
-
-    LOG.info(_LI("OVS cleanup completed successfully"))
+    LOG.info("OVS cleanup completed successfully")

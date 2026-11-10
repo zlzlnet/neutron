@@ -13,13 +13,16 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import mock
+from unittest import mock
+
+from oslo_config import cfg
 from oslo_utils import uuidutils
 
 from neutron.agent.l3 import dvr_snat_ns
 from neutron.agent.l3 import namespace_manager
 from neutron.agent.l3 import namespaces
 from neutron.agent.linux import ip_lib
+from neutron.conf.agent.l3 import config as l3_config
 from neutron.tests.functional import base
 
 _uuid = uuidutils.generate_uuid
@@ -28,12 +31,12 @@ _uuid = uuidutils.generate_uuid
 class NamespaceManagerTestFramework(base.BaseSudoTestCase):
 
     def setUp(self):
-        super(NamespaceManagerTestFramework, self).setUp()
-        self.agent_conf = mock.MagicMock()
-        self.agent_conf.router_delete_namespaces = True
+        super().setUp()
+        l3_config.register_l3_agent_config_opts(l3_config.OPTS, cfg.CONF)
+        self.agent_conf = cfg.CONF
         self.metadata_driver_mock = mock.Mock()
         self.namespace_manager = namespace_manager.NamespaceManager(
-            self.agent_conf, driver=None, clean_stale=True,
+            self.agent_conf, driver=None,
             metadata_driver=self.metadata_driver_mock)
 
     def _create_namespace(self, router_id, ns_class):
@@ -53,8 +56,7 @@ class NamespaceManagerTestFramework(base.BaseSudoTestCase):
                 raise e
 
     def _namespace_exists(self, namespace):
-        ip = ip_lib.IPWrapper(namespace=namespace)
-        return ip.netns.exists(namespace)
+        return ip_lib.network_namespace_exists(namespace)
 
 
 class NamespaceManagerTestCase(NamespaceManagerTestFramework):
@@ -86,5 +88,6 @@ class NamespaceManagerTestCase(NamespaceManagerTestFramework):
             (self.metadata_driver_mock.destroy_monitored_metadata_proxy.
              assert_called_once_with(mock.ANY,
                                      router_id_to_delete,
-                                     self.agent_conf))
+                                     self.agent_conf,
+                                     ns_name))
             self.assertFalse(self._namespace_exists(ns_name))

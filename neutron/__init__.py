@@ -13,11 +13,29 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import gettext
-import six
+import warnings
+
+# NOTE(ralonsoh): remove once the default backend is ``BackendType.THREADING``
+from oslo_service import backend as oslo_service_backend
+try:
+    oslo_service_backend.init_backend(
+        oslo_service_backend.BackendType.THREADING)
+except oslo_service_backend.exceptions.BackendAlreadySelected:
+    # NOTE(ralonsoh): this code could be called by other services, like
+    # ``oslo-config-generator``, still not migrated.
+    warnings.warn('The selected oslo_service backend is "eventlet"')
 
 
-if six.PY2:
-    gettext.install('neutron', unicode=1)
-else:
-    gettext.install('neutron')
+# pylint: disable=wrong-import-position
+import builtins  # noqa: E402,I100
+import gettext  # noqa: E402
+
+from neutron._i18n import _ as n_under  # noqa: E402
+
+
+gettext.install('neutron')
+
+
+# gettext will install its own translation function, override it to be
+# the one from neutron
+builtins.__dict__['_'] = n_under

@@ -10,15 +10,19 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import eventlet
+import queue
+import threading
+import time
+
+from neutron.common import utils
 
 
-class BatchNotifier(object):
+class BatchNotifier:
     def __init__(self, batch_interval, callback):
-        self.pending_events = []
-        self._waiting_to_send = False
+        self._pending_events = queue.Queue()
         self.callback = callback
         self.batch_interval = batch_interval
+        self._mutex = threading.Lock()
 
     def queue_event(self, event):
         """Called to queue sending an event with the next batch of events.
@@ -30,37 +34,36 @@ class BatchNotifier(object):
         problematic.
 
         This replaces the loopingcall with a mechanism that creates a
-        short-lived thread on demand when the first event is queued.  That
-        thread will sleep once for the same batch_duration to allow other
-        events to queue up in pending_events and then will send them when it
-        wakes.
+        short-lived thread on demand whenever an event is queued. That thread
+        will check if the lock is released, send all queued events and then
+        sleep for 'batch_interval' seconds. If at the end of this sleep time,
+        other threads have added new events to the event queue, the same thread
+        will process them.
 
-        If a thread is already alive and waiting, this call will simply queue
-        the event and return leaving it up to the thread to send it.
+        At the same time, other threads will be able to add new events to the
+        queue and will spawn new "synced_send" threads to process them. But if
+        the mutex is locked, the spawned thread will end immediately.
 
         :param event: the event that occurred.
         """
         if not event:
             return
 
-        self.pending_events.append(event)
+        self._pending_events.put(event)
 
-        if self._waiting_to_send:
-            return
+        def synced_send():
+            if not self._mutex.locked():
+                with self._mutex:
+                    while not self._pending_events.empty():
+                        self._notify()
+                        # sleeping after send while holding the lock allows
+                        # subsequent events to batch up
+                        time.sleep(self.batch_interval)
 
-        self._waiting_to_send = True
-
-        def last_out_sends():
-            eventlet.sleep(self.batch_interval)
-            self._waiting_to_send = False
-            self._notify()
-
-        eventlet.spawn_n(last_out_sends)
+        utils.spawn_n(synced_send)
 
     def _notify(self):
-        if not self.pending_events:
-            return
-
-        batched_events = self.pending_events
-        self.pending_events = []
+        batched_events = []
+        while not self._pending_events.empty():
+            batched_events.append(self._pending_events.get())
         self.callback(batched_events)

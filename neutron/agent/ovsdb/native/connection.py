@@ -12,81 +12,120 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import logging
 import os
-from six.moves import queue as Queue
 import threading
-import traceback
 
+from debtcollector import moves
+from oslo_config import cfg
 from ovs.db import idl
-from ovs import poller
+from ovs.stream import Stream
+from ovsdbapp.backend.ovs_idl import connection as _connection
+from ovsdbapp.backend.ovs_idl import event as idl_event
+from ovsdbapp.backend.ovs_idl import idlutils
+from ovsdbapp import event as ovsdb_event
+import tenacity
 
-from neutron.agent.ovsdb.native import idlutils
+from neutron.agent.ovsdb.native import exceptions as ovsdb_exc
+from neutron.agent.ovsdb.native import helpers
+from neutron.conf.agent import ovsdb_api
+
+TransactionQueue = moves.moved_class(_connection.TransactionQueue,
+                                     'TransactionQueue', __name__)
+Connection = moves.moved_class(_connection.Connection, 'Connection', __name__)
+LOG = logging.getLogger(__name__)
 
 
-class TransactionQueue(Queue.Queue, object):
-    def __init__(self, *args, **kwargs):
-        super(TransactionQueue, self).__init__(*args, **kwargs)
-        alertpipe = os.pipe()
-        self.alertin = os.fdopen(alertpipe[0], 'r', 0)
-        self.alertout = os.fdopen(alertpipe[1], 'w', 0)
+ovsdb_api.register_ovsdb_api_opts()
 
-    def get_nowait(self, *args, **kwargs):
+
+def configure_ssl_conn():
+    """Configures required settings for an SSL based OVSDB client connection
+
+    :return: None
+    """
+
+    req_ssl_opts = {'ssl_key_file': cfg.CONF.OVS.ssl_key_file,
+                    'ssl_cert_file': cfg.CONF.OVS.ssl_cert_file,
+                    'ssl_ca_cert_file': cfg.CONF.OVS.ssl_ca_cert_file}
+    for ssl_opt, ssl_file in req_ssl_opts.items():
+        if not ssl_file:
+            raise ovsdb_exc.OvsdbSslRequiredOptError(ssl_opt=ssl_opt)
+        if not os.path.exists(ssl_file):
+            raise ovsdb_exc.OvsdbSslConfigNotFound(ssl_file=ssl_file)
+    # TODO(ihrachys): move to ovsdbapp
+    Stream.ssl_set_private_key_file(req_ssl_opts['ssl_key_file'])
+    Stream.ssl_set_certificate_file(req_ssl_opts['ssl_cert_file'])
+    Stream.ssl_set_ca_cert_file(req_ssl_opts['ssl_ca_cert_file'])
+
+
+class BridgeCreateEvent(idl_event.RowEvent):
+
+    def __init__(self, agent):
+        self.agent = agent
+        table = 'Bridge'
+        super().__init__((self.ROW_CREATE, ),
+                         table, None)
+        self.event_name = 'BridgeCreateEvent'
+
+    def run(self, event, row, old):
+        LOG.debug('%s, bridge name: %s', self.event_name, row.name)
+        self.agent.add_bridge(str(row.name))
+
+
+class OvsIdl(idl.Idl):
+
+    SCHEMA = 'Open_vSwitch'
+
+    def __init__(self):
+        self._ovsdb_connection = cfg.CONF.OVS.ovsdb_connection
+        if self._ovsdb_connection.startswith('ssl:'):
+            configure_ssl_conn()
+        helper = self._get_ovsdb_helper(self._ovsdb_connection)
+        helper.register_all()
+        super().__init__(self._ovsdb_connection, helper)
+        self.notify_handler = ovsdb_event.RowEventHandler()
+
+    @tenacity.retry(wait=tenacity.wait_exponential(multiplier=0.02),
+                    stop=tenacity.stop_after_delay(1),
+                    reraise=True)
+    def _do_get_schema_helper(self, connection):
+        return idlutils.get_schema_helper(connection, self.SCHEMA)
+
+    def _get_ovsdb_helper(self, connection):
         try:
-            result = super(TransactionQueue, self).get_nowait(*args, **kwargs)
-        except Queue.Empty:
-            return None
-        self.alertin.read(1)
-        return result
+            return idlutils.get_schema_helper(connection, self.SCHEMA)
+        except Exception:
+            helpers.enable_connection_uri(connection)
+            return self._do_get_schema_helper(connection)
 
-    def put(self, *args, **kwargs):
-        super(TransactionQueue, self).put(*args, **kwargs)
-        self.alertout.write('X')
-        self.alertout.flush()
+    def notify(self, event, row, updates=None):
+        self.notify_handler.notify(event, row, updates)
+
+
+class OvsIdlMonitor(OvsIdl):
+
+    def __init__(self):
+        super().__init__()
+        self._lock = threading.Lock()
+        self._bridges_to_monitor = []
+        self._bridges_added_list = []
+
+    def start_bridge_monitor(self, bridge_names):
+        if not bridge_names:
+            return
+        self._bridges_to_monitor = bridge_names
+        event = BridgeCreateEvent(self)
+        self.notify_handler.watch_event(event)
+
+    def add_bridge(self, bridge_name):
+        with self._lock:
+            if bridge_name in self._bridges_to_monitor:
+                self._bridges_added_list.append(bridge_name)
 
     @property
-    def alert_fileno(self):
-        return self.alertin.fileno()
-
-
-class Connection(object):
-    def __init__(self, connection, timeout, schema_name):
-        self.idl = None
-        self.connection = connection
-        self.timeout = timeout
-        self.txns = TransactionQueue(1)
-        self.lock = threading.Lock()
-        self.schema_name = schema_name
-
-    def start(self):
-        with self.lock:
-            if self.idl is not None:
-                return
-
-            helper = idlutils.get_schema_helper(self.connection,
-                                                self.schema_name)
-            helper.register_all()
-            self.idl = idl.Idl(self.connection, helper)
-            idlutils.wait_for_change(self.idl, self.timeout)
-            self.poller = poller.Poller()
-            self.thread = threading.Thread(target=self.run)
-            self.thread.setDaemon(True)
-            self.thread.start()
-
-    def run(self):
-        while True:
-            self.idl.wait(self.poller)
-            self.poller.fd_wait(self.txns.alert_fileno, poller.POLLIN)
-            self.poller.block()
-            self.idl.run()
-            txn = self.txns.get_nowait()
-            if txn is not None:
-                try:
-                    txn.results.put(txn.do_commit())
-                except Exception as ex:
-                    er = idlutils.ExceptionResult(ex=ex,
-                                                  tb=traceback.format_exc())
-                    txn.results.put(er)
-                self.txns.task_done()
-
-    def queue_txn(self, txn):
-        self.txns.put(txn)
+    def bridges_added(self):
+        with self._lock:
+            bridges = self._bridges_added_list
+            self._bridges_added_list = []
+        return bridges

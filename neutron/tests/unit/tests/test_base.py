@@ -16,28 +16,57 @@
 """Tests to test the test framework"""
 
 import sys
+import unittest
 
 from neutron.tests import base
 
 
-class SystemExitTestCase(base.BaseTestCase):
+class BrokenExceptionHandlerTestCase(base.DietTestCase):
+    # Embedded to hide from the regular test discovery
+    class MyTestCase(base.DietTestCase):
+        def setUp(self):
+            super().setUp()
+            self.addOnException(self._diag_collect)
 
-    def setUp(self):
-        def _fail_SystemExit(exc_info):
-            if isinstance(exc_info[1], SystemExit):
-                self.fail("A SystemExit was allowed out")
-        super(SystemExitTestCase, self).setUp()
-        # add the handler last so reaching it means the handler in BaseTestCase
-        # didn't do it's job
-        self.addOnException(_fail_SystemExit)
+        def _diag_collect(self, exc_info):
+            raise ValueError('whoopsie daisy')
 
-    def run(self, *args, **kwargs):
-        exc = self.assertRaises(AssertionError,
-                                super(SystemExitTestCase, self).run,
-                                *args, **kwargs)
-        # this message should be generated when SystemExit is raised by a test
-        self.assertIn('A SystemExit was raised during the test.', str(exc))
+        def runTest(self):
+            raise IndexError("Thou shalt not pass by reference")
 
-    def test_system_exit(self):
-        # this should generate a failure that mentions SystemExit was used
-        sys.exit(1)
+    def test_broken_exception_handler(self):
+        result = self.MyTestCase().run()
+        # ensure both exceptions are logged
+        self.assertIn('Thou shalt', result.errors[0][1])
+        self.assertIn('whoopsie', result.errors[0][1])
+        self.assertFalse(result.wasSuccessful())
+
+
+class SystemExitTestCase(base.DietTestCase):
+    # Embedded to hide from the regular test discovery
+    class MyTestCase(base.DietTestCase):
+        def __init__(self, exitcode):
+            super().__init__()
+            self.exitcode = exitcode
+
+        def runTest(self):
+            if self.exitcode is not None:
+                sys.exit(self.exitcode)
+
+    def test_no_sysexit(self):
+        result = self.MyTestCase(exitcode=None).run()
+        self.assertTrue(result.wasSuccessful())
+
+    def test_sysexit(self):
+        expectedFails = [self.MyTestCase(exitcode) for exitcode in (0, 1)]
+
+        suite = unittest.TestSuite(tests=expectedFails)
+        result = self.defaultTestResult()
+        try:
+            suite.run(result)
+        except SystemExit:
+            self.fail('SystemExit escaped!')
+
+        self.assertEqual([], result.errors)
+        self.assertCountEqual({id(t) for t in expectedFails},
+                              {id(t) for (t, traceback) in result.failures})

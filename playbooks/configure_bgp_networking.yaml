@@ -1,0 +1,321 @@
+- name: Install dependencies on all nodes
+  hosts: leafs,spine
+  tasks:
+    - name: Install openvswitch
+      become: true
+      ansible.builtin.package:
+         name: "openvswitch-switch"
+         state: present
+
+- name: Figure out VXLAN endpoints
+  hosts: controller,compute1,leafs,spine
+  tasks:
+    - name: Set local IP for VXLAN tunnels
+      ansible.builtin.set_fact:
+        vxlan_local_ip: "{{ nodepool.private_ipv4 | ipv4 | default(nodepool.public_ipv4) }} "
+
+- name: Derive BGP interface names for spine
+  hosts: spine
+  tasks:
+    - name: Set spine downlink interfaces
+      ansible.builtin.set_fact:
+        bgp_downlink_interfaces: "{{ bgp_downlink_interfaces | default([]) + ['leaf' ~ idx | string ~ '-port'] }}"
+      loop: "{{ groups['leafs'] }}"
+      loop_control:
+        index_var: idx
+
+- name: Derive BGP interface names for leafs
+  hosts: leafs
+  tasks:
+    - name: Set leaf downlink and uplink interfaces
+      ansible.builtin.set_fact:
+        bgp_downlink_interfaces: "{{ groups['compute'] | map('regex_replace', '$', '-port') | list }}"
+        bgp_uplink_interfaces:
+          - spine-port
+
+- name: Setup SSH keys so compute nodes can start FRR on leaf/spine
+  hosts: compute
+  tasks:
+    - name: Generate SSH key for inter-node communication
+      become: true
+      ansible.builtin.shell:
+        cmd: ssh-keygen -t ed25519 -f /root/.ssh/inter_node_key -N '' -q
+        creates: /root/.ssh/inter_node_key
+
+    - name: Read public key
+      become: true
+      ansible.builtin.slurp:
+        src: /root/.ssh/inter_node_key.pub
+      register: inter_node_pubkey
+
+- name: Authorize compute SSH keys on leaf/spine nodes
+  hosts: leafs,spine
+  tasks:
+    - name: Add compute public keys to authorized_keys
+      ansible.posix.authorized_key:
+        user: zuul
+        key: "{{ hostvars[item].inter_node_pubkey.content | b64decode | trim }}"
+        state: present
+      loop: "{{ groups['compute'] }}"
+
+- name: Create tunnels between compute nodes and the leafs
+  hosts: compute
+  vars:
+    # Devstack runs on the controller first, then on subnodes. The last
+    # compute subnode is the final node to run local.sh, so it is
+    # responsible for starting FRR on the leaf/spine nodes once all
+    # compute-side interfaces exist.
+    last_compute_node: "{{ groups['compute'] | intersect(groups['subnode']) | sort | last | default(groups['compute'] | sort | last) }}"
+    # todo: get this from a variable
+    top_dir: "/opt/stack/devstack"
+    peer_config:
+      controller:
+        vxlan_key_prefix: "1000"
+        vlan_prefix: "100"
+      compute1:
+        vxlan_key_prefix: "1002"
+        vlan_prefix: "300"
+    vxlan_key_prefix: "{{ peer_config[inventory_hostname].vxlan_key_prefix }}"
+    vlan_prefix: "{{ peer_config[inventory_hostname].vlan_prefix }}"
+    # Infrastructure tunnels use a different port than the EVPN overlay
+    # to avoid conflicts with OVN's DEFAULT_VXLAN_PORT used for remote
+    # VTEP discovery.
+    infra_vxlan_port: "{{ evpn_vxlan_port | default(4789) | int + 1 }}"
+  tasks:
+    - name: Create local.sh script to create tunnels
+      become: true
+      copy:
+        dest: "{{ top_dir }}/local.sh"
+        owner: stack
+        group: stack
+        mode: '0755'
+        content: |
+          #!/bin/bash
+
+          set -ex
+
+          function configure_vxlan_endpoint() {
+            local loop_index=$1
+            local remote_ip=$2
+
+            local local_ip={{ vxlan_local_ip }}
+            local tunnel_iface=leaf${loop_index}-tunnel
+            local veth_in=veth${loop_index}-in
+            local veth_bgp=veth${loop_index}-bgp
+            local vlan_tag={{ vlan_prefix }}${loop_index}
+            local bgp_bridge=br-bgp-${loop_index}
+
+            sudo ip link add $veth_in type veth peer name $veth_bgp
+            sudo ip link set dev $veth_in up
+            sudo ip link set dev $veth_bgp up
+
+            # Use a different port for infrastructure tunnels to keep
+            # the EVPN VXLAN port free for the overlay.
+            sudo ovs-vsctl add-port br-infra $tunnel_iface \
+                 -- set Interface $tunnel_iface type=vxlan options:remote_ip=$remote_ip \
+                    options:key={{ vxlan_key_prefix }}${loop_index} options:local_ip=$local_ip \
+                    options:dst_port={{ infra_vxlan_port }} \
+                 -- set Port $tunnel_iface tag=$vlan_tag
+
+            sudo ovs-vsctl add-br $bgp_bridge
+            sudo ovs-vsctl add-port $bgp_bridge $veth_bgp
+
+            sudo ovs-vsctl add-port br-infra $veth_in \
+                 -- set Port $veth_in tag=$vlan_tag
+
+            sudo ip link set dev $bgp_bridge up
+
+            sudo iptables -I FORWARD 1 -i $bgp_bridge -j ACCEPT
+            sudo ip6tables -I INPUT 1 -i $bgp_bridge -j ACCEPT
+            sudo ip6tables -I INPUT 1 -i $veth_in -j ACCEPT
+          }
+
+          sudo ovs-vsctl --may-exist add-br br-infra
+
+          {% for leaf in groups['leafs'] %}
+          configure_vxlan_endpoint {{ loop.index0 }}  {{ hostvars[leaf].vxlan_local_ip }}
+          {% endfor %}
+
+          sudo iptables -I FORWARD 1 -i br-ex -j ACCEPT
+
+          {% if enable_evpn | default(false) %}
+          # EVPN: add loopback IP for VTEP identification.
+          # evpn_loopback_ip is set per-node in the Zuul job definition.
+          sudo ip addr add {{ evpn_loopback_ip }}/32 dev lo
+
+          # EVPN: allow incoming VXLAN traffic on br-bgp interfaces.
+          sudo iptables -I INPUT 1 -i br-bgp-0 -j ACCEPT
+          sudo iptables -I INPUT 1 -i br-bgp-1 -j ACCEPT
+
+          # EVPN: provision-time base BGP so every compute advertises its
+          # VTEP /32 before any LRP is bound. The OVN EVPN agent only adds
+          # VRF/EVPN blocks on LRP bind; without this, leaf peers stay Idle.
+          # Matches neutron.agent.linux.evpn_router.frr.templates BGP_*.
+          {% set evpn_asn = evpn_bgp_as | default(64999) %}
+          {% set evpn_peer = evpn_bgp_local_interface | default('br-bgp-0') %}
+          sudo tee /etc/frr/frr.conf > /dev/null <<'EVPN_FRR_EOF'
+          frr defaults traditional
+          hostname {{ inventory_hostname }}
+          log file /var/log/frr/frr.log informational
+          log timestamp precision 3
+          service integrated-vtysh-config
+          !
+          router bgp {{ evpn_asn }}
+           bgp router-id {{ evpn_loopback_ip }}
+           no bgp ebgp-requires-policy
+           neighbor {{ evpn_peer }} interface remote-as internal
+           no neighbor {{ evpn_peer }} capability link-local
+           !
+           address-family ipv4 unicast
+            neighbor {{ evpn_peer }} activate
+            redistribute connected
+           exit-address-family
+           !
+           address-family ipv6 unicast
+            neighbor {{ evpn_peer }} activate
+            redistribute connected
+           exit-address-family
+           !
+           address-family l2vpn evpn
+            neighbor {{ evpn_peer }} activate
+            advertise-all-vni
+            advertise-svi-ip
+           exit-address-family
+          exit
+          !
+          EVPN_FRR_EOF
+          sudo chmod 644 /etc/frr/frr.conf
+          {% endif %}
+
+          # Ensure the log dir and file are writable by bgpd (runs as frr).
+          sudo install -d -o frr -g frr -m 755 /var/log/frr
+          sudo touch /var/log/frr/frr.log
+          sudo chown frr:frr /var/log/frr/frr.log
+
+          {% if inventory_hostname == last_compute_node %}
+          # Start FRR on spine and leaf nodes. This block only runs on
+          # the last compute subnode, which is the final node to execute
+          # local.sh, ensuring all compute-side interfaces exist.
+          # FRR was not started during pre-run to avoid routing loops
+          # caused by incomplete BGP topology.
+          sudo ssh -i /root/.ssh/inter_node_key -o StrictHostKeyChecking=no zuul@{{ hostvars['spine'].ansible_host }} sudo systemctl restart frr
+          {% for leaf in groups['leafs'] %}
+          sudo ssh -i /root/.ssh/inter_node_key -o StrictHostKeyChecking=no zuul@{{ hostvars[leaf].ansible_host }} sudo systemctl restart frr
+          {% endfor %}
+          {% endif %}
+
+          # Restart FRR on this compute node now that peer interfaces exist
+          sudo systemctl restart frr
+
+    - name: "Create VXLAN tunnel from {{ item.1 }} to {{ inventory_hostname }}"
+      ansible.builtin.shell: |
+        set -e
+
+        tunnel_iface={{ inventory_hostname }}-tunnel
+        port_iface={{ inventory_hostname }}-port
+        local_ip={{ hostvars[item.1].vxlan_local_ip }}
+        remote_ip={{ vxlan_local_ip }}
+        vlan_tag={{ vlan_prefix }}{{ item.0 }}
+
+        ovs-vsctl --may-exist add-br br-infra -- \
+        add-port br-infra $tunnel_iface -- \
+        set Interface $tunnel_iface type=vxlan options:remote_ip=$remote_ip \
+        options:key={{ vxlan_key_prefix }}{{ item.0 }} options:local_ip=$local_ip \
+        options:dst_port={{ infra_vxlan_port }} -- \
+        set Port $tunnel_iface tag=$vlan_tag -- \
+        add-port br-infra $port_iface -- \
+        set Interface $port_iface type=internal -- \
+        set Port $port_iface tag=$vlan_tag
+
+        ip link set dev $port_iface up
+
+        iptables -I FORWARD 1 -i $port_iface -j ACCEPT
+        ip6tables -I INPUT 1 -i $port_iface -j ACCEPT
+      with_indexed_items: "{{ groups['leafs'] }}"
+      delegate_to: "{{ item.1 }}"
+      become: true
+
+- name: Create tunnels between the spine and the leafs
+  hosts: spine
+  become: true
+  vars:
+    infra_vxlan_port: "{{ evpn_vxlan_port | default(4789) | int + 1 }}"
+  tasks:
+    - name: "Create VXLAN tunnels from the spine to {{ item.1 }}"
+      ansible.builtin.shell: |
+        set -e
+
+        tunnel_iface=leaf{{ item.0 }}-tunnel
+        port_iface={{ bgp_downlink_interfaces[item.0] }}
+        local_ip={{ vxlan_local_ip }}
+        remote_ip={{ hostvars[item.1].vxlan_local_ip }}
+        vlan_tag=200{{ item.0 }}
+
+        ovs-vsctl --may-exist add-br br-infra -- \
+        add-port br-infra $tunnel_iface -- \
+        set Interface $tunnel_iface type=vxlan options:remote_ip=$remote_ip \
+        options:key=1001{{ item.0 }} options:local_ip=$local_ip \
+        options:dst_port={{ infra_vxlan_port }} -- \
+        set Port $tunnel_iface tag=$vlan_tag -- \
+        add-port br-infra $port_iface -- \
+        set Interface $port_iface type=internal -- \
+        set Port $port_iface tag=$vlan_tag
+
+        ip link set dev $port_iface up
+
+        iptables -I FORWARD 1 -i $port_iface -j ACCEPT
+        ip6tables -I INPUT 1 -i $port_iface -j ACCEPT
+      with_indexed_items: "{{ groups['leafs'] }}"
+
+    - name: "Create VXLAN tunnel from {{ item.1 }} to the spine"
+      ansible.builtin.shell: |
+        set -e
+
+        tunnel_iface=spine-tunnel
+        port_iface={{ hostvars[item.1].bgp_uplink_interfaces[0] }}
+        local_ip={{ hostvars[item.1].vxlan_local_ip }}
+        remote_ip={{ vxlan_local_ip }}
+        vlan_tag=200{{ item.0 }}
+
+        ovs-vsctl --may-exist add-br br-infra -- \
+        add-port br-infra $tunnel_iface -- \
+        set Interface $tunnel_iface type=vxlan options:remote_ip=$remote_ip \
+        options:key=1001{{ item.0 }} options:local_ip=$local_ip \
+        options:dst_port={{ infra_vxlan_port }} -- \
+        set Port $tunnel_iface tag=$vlan_tag -- \
+        add-port br-infra $port_iface -- \
+        set Interface $port_iface type=internal -- \
+        set Port $port_iface tag=$vlan_tag
+
+        ip link set dev $port_iface up
+
+        iptables -I FORWARD 1 -i $port_iface -j ACCEPT
+        ip6tables -I INPUT 1 -i $port_iface -j ACCEPT
+      with_indexed_items: "{{ groups['leafs'] }}"
+      delegate_to: "{{ item.1 }}"
+
+    - name: "Add loopback IPs for the Spine"
+      ansible.builtin.shell: |
+        ip a a 172.31.1.1/32 dev lo
+        # TODO ipv6
+
+- name: Configure the spine switch
+  hosts: spine
+  roles:
+    - role: spine
+      downlink_interfaces: "{{ bgp_downlink_interfaces }}"
+      datapath_spine_ipv4: 172.31.1.1
+      bgp_address_families: >-
+        {{ ['ipv4 unicast', 'ipv6 unicast'] +
+           (['l2vpn evpn'] if enable_evpn | default(false) else []) }}
+
+- name: Configure the leafs switches
+  hosts: leafs
+  roles:
+    - role: leaf
+      downlink_interfaces: "{{ bgp_downlink_interfaces }}"
+      uplink_interfaces: "{{ bgp_uplink_interfaces }}"
+      bgp_password: "{{ '' if enable_evpn | default(false) else 'f00barZ' }}"
+      bgp_address_families: >-
+        {{ ['ipv4 unicast', 'ipv6 unicast'] +
+           (['l2vpn evpn'] if enable_evpn | default(false) else []) }}

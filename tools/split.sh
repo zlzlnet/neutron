@@ -24,8 +24,8 @@
 set -e
 
 if [ $# -lt 2 ]; then
-  echo "Usage $0 <path to file containing list of files to export> <project name>"
-  exit 1
+    echo "Usage $0 <path to file containing list of files to export> <project name>"
+    exit 1
 fi
 
 set -x
@@ -45,7 +45,7 @@ pruner="git ls-files | grep -v \"$keep_pattern\" | git update-index --force-remo
 
 roots=""
 for file in $files_to_keep; do
-    file_root="$(git rev-list --reverse HEAD -- $file | head -n1)"
+    file_root=$(git rev-list --reverse HEAD -- $file | head -n1)
     fail=0
     for root in $roots; do
         if git merge-base --is-ancestor $root $file_root; then
@@ -99,7 +99,7 @@ git filter-branch \
 echo "Generating new .gitreview file..."
 cat > .gitreview <<EOF
 [gerrit]
-host=review.openstack.org
+host=review.opendev.org
 port=29418
 project=stackforge/${project_name}.git
 EOF

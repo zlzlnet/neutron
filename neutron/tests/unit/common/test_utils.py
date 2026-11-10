@@ -12,459 +12,87 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import eventlet
-import mock
+from concurrent import futures
+import os.path
+import queue
+import random
+import re
+import sys
+import threading
+import time
+from unittest import mock
+
+import ddt
 import netaddr
+from neutron_lib import constants
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_utils import timeutils
+from osprofiler import profiler
 import testtools
 
-from neutron.common import constants
-from neutron.common import exceptions as n_exc
 from neutron.common import utils
-from neutron.plugins.common import constants as p_const
-from neutron.plugins.common import utils as plugin_utils
 from neutron.tests import base
+from neutron.tests.unit import tests
 
-from oslo_log import log as logging
 
+class _PortRange:
+    """A linked list of port ranges."""
 
-class TestParseMappings(base.BaseTestCase):
-    def parse(self, mapping_list, unique_values=True):
-        return utils.parse_mappings(mapping_list, unique_values)
+    def __init__(self, base, prev_ref=None):
+        self.base = base
+        self.mask = 0xffff
+        self.prev_ref = prev_ref
 
-    def test_parse_mappings_fails_for_missing_separator(self):
-        with testtools.ExpectedException(ValueError):
-            self.parse(['key'])
+    @property
+    def possible_mask_base(self):
+        return self.base & (self.mask << 1)
 
-    def test_parse_mappings_fails_for_missing_key(self):
-        with testtools.ExpectedException(ValueError):
-            self.parse([':val'])
+    @property
+    def can_merge(self):
+        return (self.prev_ref and
+                self.possible_mask_base == self.prev_ref.possible_mask_base and
+                self.mask == self.prev_ref.mask)
 
-    def test_parse_mappings_fails_for_missing_value(self):
-        with testtools.ExpectedException(ValueError):
-            self.parse(['key:'])
+    def shake(self):
+        """Try to merge ranges created earlier.
 
-    def test_parse_mappings_fails_for_extra_separator(self):
-        with testtools.ExpectedException(ValueError):
-            self.parse(['key:val:junk'])
+        If previous number in a list can be merged with current item under
+        common mask, it's merged. Then it continues to do the same with the
+        rest of the list.
+        """
+        while self.can_merge:
+            self.mask <<= 1
+            self.base = self.prev_ref.base
+            if self.prev_ref:
+                self.prev_ref = self.prev_ref.prev_ref
 
-    def test_parse_mappings_fails_for_duplicate_key(self):
-        with testtools.ExpectedException(ValueError):
-            self.parse(['key:val1', 'key:val2'])
+    def __str__(self):
+        return _hex_format(self.base, self.mask)
 
-    def test_parse_mappings_fails_for_duplicate_value(self):
-        with testtools.ExpectedException(ValueError):
-            self.parse(['key1:val', 'key2:val'])
+    def get_list(self):
+        if self.prev_ref:
+            return self.prev_ref.get_list() + [str(self)]
+        return [str(self)]
 
-    def test_parse_mappings_succeeds_for_one_mapping(self):
-        self.assertEqual(self.parse(['key:val']), {'key': 'val'})
 
-    def test_parse_mappings_succeeds_for_n_mappings(self):
-        self.assertEqual(self.parse(['key1:val1', 'key2:val2']),
-                         {'key1': 'val1', 'key2': 'val2'})
+def _hex_str(num):
+    return format(num, '#06x')
 
-    def test_parse_mappings_succeeds_for_duplicate_value(self):
-        self.assertEqual(self.parse(['key1:val', 'key2:val'], False),
-                         {'key1': 'val', 'key2': 'val'})
 
-    def test_parse_mappings_succeeds_for_no_mappings(self):
-        self.assertEqual(self.parse(['']), {})
+def _hex_format(port, mask):
+    if mask != 0xffff:
+        return f"{_hex_str(port)}/{_hex_str(0xffff & mask)}"
+    return _hex_str(port)
 
 
-class TestParseTunnelRangesMixin(object):
-    TUN_MIN = None
-    TUN_MAX = None
-    TYPE = None
-    _err_prefix = "Invalid network Tunnel range: '%d:%d' - "
-    _err_suffix = "%s is not a valid %s identifier"
-    _err_range = "End of tunnel range is less than start of tunnel range"
-
-    def _build_invalid_tunnel_range_msg(self, t_range_tuple, n):
-        bad_id = t_range_tuple[n - 1]
-        return (self._err_prefix % t_range_tuple) + (self._err_suffix
-                                                 % (bad_id, self.TYPE))
-
-    def _build_range_reversed_msg(self, t_range_tuple):
-        return (self._err_prefix % t_range_tuple) + self._err_range
-
-    def _verify_range(self, tunnel_range):
-        return plugin_utils.verify_tunnel_range(tunnel_range, self.TYPE)
-
-    def _check_range_valid_ranges(self, tunnel_range):
-        self.assertIsNone(self._verify_range(tunnel_range))
-
-    def _check_range_invalid_ranges(self, bad_range, which):
-        expected_msg = self._build_invalid_tunnel_range_msg(bad_range, which)
-        err = self.assertRaises(n_exc.NetworkTunnelRangeError,
-                                self._verify_range, bad_range)
-        self.assertEqual(expected_msg, str(err))
-
-    def _check_range_reversed(self, bad_range):
-        err = self.assertRaises(n_exc.NetworkTunnelRangeError,
-                                self._verify_range, bad_range)
-        expected_msg = self._build_range_reversed_msg(bad_range)
-        self.assertEqual(expected_msg, str(err))
-
-    def test_range_tunnel_id_valid(self):
-            self._check_range_valid_ranges((self.TUN_MIN, self.TUN_MAX))
-
-    def test_range_tunnel_id_invalid(self):
-            self._check_range_invalid_ranges((-1, self.TUN_MAX), 1)
-            self._check_range_invalid_ranges((self.TUN_MIN,
-                                              self.TUN_MAX + 1), 2)
-            self._check_range_invalid_ranges((self.TUN_MIN - 1,
-                                              self.TUN_MAX + 1), 1)
-
-    def test_range_tunnel_id_reversed(self):
-            self._check_range_reversed((self.TUN_MAX, self.TUN_MIN))
-
-
-class TestGreTunnelRangeVerifyValid(TestParseTunnelRangesMixin,
-                                    base.BaseTestCase):
-    TUN_MIN = p_const.MIN_GRE_ID
-    TUN_MAX = p_const.MAX_GRE_ID
-    TYPE = p_const.TYPE_GRE
-
-
-class TestVxlanTunnelRangeVerifyValid(TestParseTunnelRangesMixin,
-                                      base.BaseTestCase):
-    TUN_MIN = p_const.MIN_VXLAN_VNI
-    TUN_MAX = p_const.MAX_VXLAN_VNI
-    TYPE = p_const.TYPE_VXLAN
-
-
-class UtilTestParseVlanRanges(base.BaseTestCase):
-    _err_prefix = "Invalid network VLAN range: '"
-    _err_too_few = "' - 'need more than 2 values to unpack'"
-    _err_too_many = "' - 'too many values to unpack'"
-    _err_not_int = "' - 'invalid literal for int() with base 10: '%s''"
-    _err_bad_vlan = "' - '%s is not a valid VLAN tag'"
-    _err_range = "' - 'End of VLAN range is less than start of VLAN range'"
-
-    def _range_too_few_err(self, nv_range):
-        return self._err_prefix + nv_range + self._err_too_few
-
-    def _range_too_many_err(self, nv_range):
-        return self._err_prefix + nv_range + self._err_too_many
-
-    def _vlan_not_int_err(self, nv_range, vlan):
-        return self._err_prefix + nv_range + (self._err_not_int % vlan)
-
-    def _nrange_invalid_vlan(self, nv_range, n):
-        vlan = nv_range.split(':')[n]
-        v_range = ':'.join(nv_range.split(':')[1:])
-        return self._err_prefix + v_range + (self._err_bad_vlan % vlan)
-
-    def _vrange_invalid_vlan(self, v_range_tuple, n):
-        vlan = v_range_tuple[n - 1]
-        v_range_str = '%d:%d' % v_range_tuple
-        return self._err_prefix + v_range_str + (self._err_bad_vlan % vlan)
-
-    def _vrange_invalid(self, v_range_tuple):
-        v_range_str = '%d:%d' % v_range_tuple
-        return self._err_prefix + v_range_str + self._err_range
-
-
-class TestVlanNetworkNameValid(base.BaseTestCase):
-    def parse_vlan_ranges(self, vlan_range):
-        return plugin_utils.parse_network_vlan_ranges(vlan_range)
-
-    def test_validate_provider_phynet_name_mixed(self):
-        self.assertRaises(n_exc.PhysicalNetworkNameError,
-                          self.parse_vlan_ranges,
-                          ['', ':23:30', 'physnet1',
-                           'tenant_net:100:200'])
-
-    def test_validate_provider_phynet_name_bad(self):
-        self.assertRaises(n_exc.PhysicalNetworkNameError,
-                          self.parse_vlan_ranges,
-                          [':1:34'])
-
-
-class TestVlanRangeVerifyValid(UtilTestParseVlanRanges):
-    def verify_range(self, vlan_range):
-        return plugin_utils.verify_vlan_range(vlan_range)
-
-    def test_range_valid_ranges(self):
-        self.assertIsNone(self.verify_range((1, 2)))
-        self.assertIsNone(self.verify_range((1, 1999)))
-        self.assertIsNone(self.verify_range((100, 100)))
-        self.assertIsNone(self.verify_range((100, 200)))
-        self.assertIsNone(self.verify_range((4001, 4094)))
-        self.assertIsNone(self.verify_range((1, 4094)))
-
-    def check_one_vlan_invalid(self, bad_range, which):
-        expected_msg = self._vrange_invalid_vlan(bad_range, which)
-        err = self.assertRaises(n_exc.NetworkVlanRangeError,
-                                self.verify_range, bad_range)
-        self.assertEqual(str(err), expected_msg)
-
-    def test_range_first_vlan_invalid_negative(self):
-        self.check_one_vlan_invalid((-1, 199), 1)
-
-    def test_range_first_vlan_invalid_zero(self):
-        self.check_one_vlan_invalid((0, 199), 1)
-
-    def test_range_first_vlan_invalid_limit_plus_one(self):
-        self.check_one_vlan_invalid((4095, 199), 1)
-
-    def test_range_first_vlan_invalid_too_big(self):
-        self.check_one_vlan_invalid((9999, 199), 1)
-
-    def test_range_second_vlan_invalid_negative(self):
-        self.check_one_vlan_invalid((299, -1), 2)
-
-    def test_range_second_vlan_invalid_zero(self):
-        self.check_one_vlan_invalid((299, 0), 2)
-
-    def test_range_second_vlan_invalid_limit_plus_one(self):
-        self.check_one_vlan_invalid((299, 4095), 2)
-
-    def test_range_second_vlan_invalid_too_big(self):
-        self.check_one_vlan_invalid((299, 9999), 2)
-
-    def test_range_both_vlans_invalid_01(self):
-        self.check_one_vlan_invalid((-1, 0), 1)
-
-    def test_range_both_vlans_invalid_02(self):
-        self.check_one_vlan_invalid((0, 4095), 1)
-
-    def test_range_both_vlans_invalid_03(self):
-        self.check_one_vlan_invalid((4095, 9999), 1)
-
-    def test_range_both_vlans_invalid_04(self):
-        self.check_one_vlan_invalid((9999, -1), 1)
-
-    def test_range_reversed(self):
-        bad_range = (95, 10)
-        expected_msg = self._vrange_invalid(bad_range)
-        err = self.assertRaises(n_exc.NetworkVlanRangeError,
-                                self.verify_range, bad_range)
-        self.assertEqual(str(err), expected_msg)
-
-
-class TestParseOneVlanRange(UtilTestParseVlanRanges):
-    def parse_one(self, cfg_entry):
-        return plugin_utils.parse_network_vlan_range(cfg_entry)
-
-    def test_parse_one_net_no_vlan_range(self):
-        config_str = "net1"
-        expected_networks = ("net1", None)
-        self.assertEqual(self.parse_one(config_str), expected_networks)
-
-    def test_parse_one_net_and_vlan_range(self):
-        config_str = "net1:100:199"
-        expected_networks = ("net1", (100, 199))
-        self.assertEqual(self.parse_one(config_str), expected_networks)
-
-    def test_parse_one_net_incomplete_range(self):
-        config_str = "net1:100"
-        expected_msg = self._range_too_few_err(config_str)
-        err = self.assertRaises(n_exc.NetworkVlanRangeError,
-                                self.parse_one, config_str)
-        self.assertEqual(str(err), expected_msg)
-
-    def test_parse_one_net_range_too_many(self):
-        config_str = "net1:100:150:200"
-        expected_msg = self._range_too_many_err(config_str)
-        err = self.assertRaises(n_exc.NetworkVlanRangeError,
-                                self.parse_one, config_str)
-        self.assertEqual(str(err), expected_msg)
-
-    def test_parse_one_net_vlan1_not_int(self):
-        config_str = "net1:foo:199"
-        expected_msg = self._vlan_not_int_err(config_str, 'foo')
-        err = self.assertRaises(n_exc.NetworkVlanRangeError,
-                                self.parse_one, config_str)
-        self.assertEqual(str(err), expected_msg)
-
-    def test_parse_one_net_vlan2_not_int(self):
-        config_str = "net1:100:bar"
-        expected_msg = self._vlan_not_int_err(config_str, 'bar')
-        err = self.assertRaises(n_exc.NetworkVlanRangeError,
-                                self.parse_one, config_str)
-        self.assertEqual(str(err), expected_msg)
-
-    def test_parse_one_net_and_max_range(self):
-        config_str = "net1:1:4094"
-        expected_networks = ("net1", (1, 4094))
-        self.assertEqual(self.parse_one(config_str), expected_networks)
-
-    def test_parse_one_net_range_bad_vlan1(self):
-        config_str = "net1:9000:150"
-        expected_msg = self._nrange_invalid_vlan(config_str, 1)
-        err = self.assertRaises(n_exc.NetworkVlanRangeError,
-                                self.parse_one, config_str)
-        self.assertEqual(str(err), expected_msg)
-
-    def test_parse_one_net_range_bad_vlan2(self):
-        config_str = "net1:4000:4999"
-        expected_msg = self._nrange_invalid_vlan(config_str, 2)
-        err = self.assertRaises(n_exc.NetworkVlanRangeError,
-                                self.parse_one, config_str)
-        self.assertEqual(str(err), expected_msg)
-
-
-class TestParseVlanRangeList(UtilTestParseVlanRanges):
-    def parse_list(self, cfg_entries):
-        return plugin_utils.parse_network_vlan_ranges(cfg_entries)
-
-    def test_parse_list_one_net_no_vlan_range(self):
-        config_list = ["net1"]
-        expected_networks = {"net1": []}
-        self.assertEqual(self.parse_list(config_list), expected_networks)
-
-    def test_parse_list_one_net_vlan_range(self):
-        config_list = ["net1:100:199"]
-        expected_networks = {"net1": [(100, 199)]}
-        self.assertEqual(self.parse_list(config_list), expected_networks)
-
-    def test_parse_two_nets_no_vlan_range(self):
-        config_list = ["net1",
-                       "net2"]
-        expected_networks = {"net1": [],
-                             "net2": []}
-        self.assertEqual(self.parse_list(config_list), expected_networks)
-
-    def test_parse_two_nets_range_and_no_range(self):
-        config_list = ["net1:100:199",
-                       "net2"]
-        expected_networks = {"net1": [(100, 199)],
-                             "net2": []}
-        self.assertEqual(self.parse_list(config_list), expected_networks)
-
-    def test_parse_two_nets_no_range_and_range(self):
-        config_list = ["net1",
-                       "net2:200:299"]
-        expected_networks = {"net1": [],
-                             "net2": [(200, 299)]}
-        self.assertEqual(self.parse_list(config_list), expected_networks)
-
-    def test_parse_two_nets_bad_vlan_range1(self):
-        config_list = ["net1:100",
-                       "net2:200:299"]
-        expected_msg = self._range_too_few_err(config_list[0])
-        err = self.assertRaises(n_exc.NetworkVlanRangeError,
-                                self.parse_list, config_list)
-        self.assertEqual(str(err), expected_msg)
-
-    def test_parse_two_nets_vlan_not_int2(self):
-        config_list = ["net1:100:199",
-                       "net2:200:0x200"]
-        expected_msg = self._vlan_not_int_err(config_list[1], '0x200')
-        err = self.assertRaises(n_exc.NetworkVlanRangeError,
-                                self.parse_list, config_list)
-        self.assertEqual(str(err), expected_msg)
-
-    def test_parse_two_nets_and_append_1_2(self):
-        config_list = ["net1:100:199",
-                       "net1:1000:1099",
-                       "net2:200:299"]
-        expected_networks = {"net1": [(100, 199),
-                                      (1000, 1099)],
-                             "net2": [(200, 299)]}
-        self.assertEqual(self.parse_list(config_list), expected_networks)
-
-    def test_parse_two_nets_and_append_1_3(self):
-        config_list = ["net1:100:199",
-                       "net2:200:299",
-                       "net1:1000:1099"]
-        expected_networks = {"net1": [(100, 199),
-                                      (1000, 1099)],
-                             "net2": [(200, 299)]}
-        self.assertEqual(self.parse_list(config_list), expected_networks)
-
-
-class TestDictUtils(base.BaseTestCase):
-    def test_dict2str(self):
-        dic = {"key1": "value1", "key2": "value2", "key3": "value3"}
-        expected = "key1=value1,key2=value2,key3=value3"
-        self.assertEqual(utils.dict2str(dic), expected)
-
-    def test_str2dict(self):
-        string = "key1=value1,key2=value2,key3=value3"
-        expected = {"key1": "value1", "key2": "value2", "key3": "value3"}
-        self.assertEqual(utils.str2dict(string), expected)
-
-    def test_dict_str_conversion(self):
-        dic = {"key1": "value1", "key2": "value2"}
-        self.assertEqual(utils.str2dict(utils.dict2str(dic)), dic)
-
-    def test_diff_list_of_dict(self):
-        old_list = [{"key1": "value1"},
-                    {"key2": "value2"},
-                    {"key3": "value3"}]
-        new_list = [{"key1": "value1"},
-                    {"key2": "value2"},
-                    {"key4": "value4"}]
-        added, removed = utils.diff_list_of_dict(old_list, new_list)
-        self.assertEqual(added, [dict(key4="value4")])
-        self.assertEqual(removed, [dict(key3="value3")])
-
-
-class _CachingDecorator(object):
-    def __init__(self):
-        self.func_retval = 'bar'
-        self._cache = mock.Mock()
-
-    @utils.cache_method_results
-    def func(self, *args, **kwargs):
-        return self.func_retval
-
-
-class TestCachingDecorator(base.BaseTestCase):
-    def setUp(self):
-        super(TestCachingDecorator, self).setUp()
-        self.decor = _CachingDecorator()
-        self.func_name = '%(module)s._CachingDecorator.func' % {
-            'module': self.__module__
-        }
-        self.not_cached = self.decor.func.func.__self__._not_cached
-
-    def test_cache_miss(self):
-        expected_key = (self.func_name, 1, 2, ('foo', 'bar'))
-        args = (1, 2)
-        kwargs = {'foo': 'bar'}
-        self.decor._cache.get.return_value = self.not_cached
-        retval = self.decor.func(*args, **kwargs)
-        self.decor._cache.set.assert_called_once_with(
-            expected_key, self.decor.func_retval, None)
-        self.assertEqual(self.decor.func_retval, retval)
-
-    def test_cache_hit(self):
-        expected_key = (self.func_name, 1, 2, ('foo', 'bar'))
-        args = (1, 2)
-        kwargs = {'foo': 'bar'}
-        retval = self.decor.func(*args, **kwargs)
-        self.assertFalse(self.decor._cache.set.called)
-        self.assertEqual(self.decor._cache.get.return_value, retval)
-        self.decor._cache.get.assert_called_once_with(expected_key,
-                                                      self.not_cached)
-
-    def test_get_unhashable(self):
-        expected_key = (self.func_name, [1], 2)
-        self.decor._cache.get.side_effect = TypeError
-        retval = self.decor.func([1], 2)
-        self.assertFalse(self.decor._cache.set.called)
-        self.assertEqual(self.decor.func_retval, retval)
-        self.decor._cache.get.assert_called_once_with(expected_key,
-                                                      self.not_cached)
-
-    def test_missing_cache(self):
-        delattr(self.decor, '_cache')
-        self.assertRaises(NotImplementedError, self.decor.func, (1, 2))
-
-    def test_no_cache(self):
-        self.decor._cache = False
-        retval = self.decor.func((1, 2))
-        self.assertEqual(self.decor.func_retval, retval)
-
-
-class TestDict2Tuples(base.BaseTestCase):
-    def test_dict(self):
-        input_dict = {'foo': 'bar', 42: 'baz', 'aaa': 'zzz'}
-        expected = ((42, 'baz'), ('aaa', 'zzz'), ('foo', 'bar'))
-        output_tuple = utils.dict2tuple(input_dict)
-        self.assertEqual(expected, output_tuple)
+def _port_rule_masking(port_min, port_max):
+    current = None
+    for num in range(port_min, port_max + 1):
+        port_range = _PortRange(num, prev_ref=current)
+        port_range.shake()
+        current = port_range
+    return current.get_list()
 
 
 class TestExceptionLogger(base.BaseTestCase):
@@ -491,11 +119,14 @@ class TestExceptionLogger(base.BaseTestCase):
         logger = mock.Mock()
 
         @utils.exception_logger(logger=logger)
-        def func():
-            return result
+        def func(ret):
+            ret.append(result)
 
-        gt = eventlet.spawn(func)
-        self.assertEqual(result, gt.wait())
+        ret_value = []
+        _thread = threading.Thread(target=func, args=(ret_value, ))
+        _thread.start()
+        _thread.join()
+        self.assertEqual(result, ret_value[0])
         self.assertFalse(logger.called)
 
     def test_spawn_raise(self):
@@ -506,8 +137,8 @@ class TestExceptionLogger(base.BaseTestCase):
         def func():
             raise RuntimeError(result)
 
-        gt = eventlet.spawn(func)
-        self.assertRaises(RuntimeError, gt.wait)
+        _thread = threading.Thread(target=func)
+        _thread.start()
         self.assertTrue(logger.called)
 
     def test_pool_spawn_normal(self):
@@ -518,10 +149,9 @@ class TestExceptionLogger(base.BaseTestCase):
         def func(i):
             calls(i)
 
-        pool = eventlet.GreenPool(4)
-        for i in range(0, 4):
-            pool.spawn(func, i)
-        pool.waitall()
+        with futures.ThreadPoolExecutor(max_workers=4) as executor:
+            fs = [executor.submit(func, i) for i in range(4)]
+            all(f.done() for f in fs)
 
         calls.assert_has_calls([mock.call(0), mock.call(1),
                                 mock.call(2), mock.call(3)],
@@ -536,17 +166,65 @@ class TestExceptionLogger(base.BaseTestCase):
         def func(i):
             if i == 2:
                 raise RuntimeError(2)
-            else:
-                calls(i)
+            calls(i)
 
-        pool = eventlet.GreenPool(4)
-        for i in range(0, 4):
-            pool.spawn(func, i)
-        pool.waitall()
+        with futures.ThreadPoolExecutor(max_workers=4) as executor:
+            fs = [executor.submit(func, i) for i in range(4)]
+            all(f.done() for f in fs)
 
         calls.assert_has_calls([mock.call(0), mock.call(1), mock.call(3)],
                                any_order=True)
         self.assertTrue(logger.called)
+
+    def test_wait_until_true(self):
+
+        class FalseException(Exception):
+            pass
+
+        self.assertRaises(
+            FalseException,
+            utils.wait_until_true,
+            lambda: False, timeout=1, exception=FalseException)
+
+
+class TestLogWorkerLifecycle(base.BaseTestCase):
+    @mock.patch('neutron.tests.unit.common.test_utils.logging.getLogger')
+    def test_logs_called_and_finished(self, get_logger):
+        logger = mock.Mock()
+        get_logger.return_value = logger
+
+        class Worker:
+            desc = 'test worker'
+
+            @utils.log_worker_lifecycle(lambda self: self.desc)
+            def start(self):
+                return 'ok'
+
+        self.assertEqual('ok', Worker().start())
+        logger.debug.assert_has_calls([
+            mock.call('%s %s called, description: %s',
+                      'Worker', 'start', 'test worker'),
+            mock.call('%s %s finished, description: %s',
+                      'Worker', 'start', 'test worker'),
+        ])
+
+    @mock.patch('neutron.tests.unit.common.test_utils.logging.getLogger')
+    def test_finished_only(self, get_logger):
+        logger = mock.Mock()
+        get_logger.return_value = logger
+
+        class Worker:
+            desc = 'test worker'
+
+            @utils.log_worker_lifecycle(lambda self: self.desc,
+                                        finished_only=True)
+            def reset(self):
+                pass
+
+        Worker().reset()
+        logger.debug.assert_called_once_with(
+            '%s %s finished, description: %s',
+            'Worker', 'reset', 'test worker')
 
 
 class TestDvrServices(base.BaseTestCase):
@@ -554,14 +232,23 @@ class TestDvrServices(base.BaseTestCase):
     def _test_is_dvr_serviced(self, device_owner, expected):
         self.assertEqual(expected, utils.is_dvr_serviced(device_owner))
 
-    def test_is_dvr_serviced_with_lb_port(self):
-        self._test_is_dvr_serviced(constants.DEVICE_OWNER_LOADBALANCER, True)
-
     def test_is_dvr_serviced_with_dhcp_port(self):
         self._test_is_dvr_serviced(constants.DEVICE_OWNER_DHCP, True)
 
     def test_is_dvr_serviced_with_vm_port(self):
-        self._test_is_dvr_serviced('compute:', True)
+        self._test_is_dvr_serviced(constants.DEVICE_OWNER_COMPUTE_PREFIX, True)
+
+
+class TestFipServices(base.BaseTestCase):
+
+    def _test_is_fip_serviced(self, device_owner, expected):
+        self.assertEqual(expected, utils.is_fip_serviced(device_owner))
+
+    def test_is_fip_serviced_with_dhcp_port(self):
+        self._test_is_fip_serviced(constants.DEVICE_OWNER_DHCP, False)
+
+    def test_is_fip_serviced_with_vm_port(self):
+        self._test_is_fip_serviced(constants.DEVICE_OWNER_COMPUTE_PREFIX, True)
 
 
 class TestIpToCidr(base.BaseTestCase):
@@ -623,17 +310,28 @@ class TestCidrIsHost(base.BaseTestCase):
 
 class TestIpVersionFromInt(base.BaseTestCase):
     def test_ip_version_from_int_ipv4(self):
-        self.assertEqual(utils.ip_version_from_int(4),
-                         constants.IPv4)
+        self.assertEqual(constants.IPv4,
+                         utils.ip_version_from_int(constants.IP_VERSION_4))
 
     def test_ip_version_from_int_ipv6(self):
-        self.assertEqual(utils.ip_version_from_int(6),
-                         constants.IPv6)
+        self.assertEqual(constants.IPv6,
+                         utils.ip_version_from_int(constants.IP_VERSION_6))
 
     def test_ip_version_from_int_illegal_int(self):
         self.assertRaises(ValueError,
                           utils.ip_version_from_int,
                           8)
+
+
+class TestIsVersionGreaterEqual(base.BaseTestCase):
+    def test_is_version_greater_equal_greater(self):
+        self.assertTrue(utils.is_version_greater_equal('1.6.2', '1.6.0'))
+
+    def test_is_version_greater_equal_equal(self):
+        self.assertTrue(utils.is_version_greater_equal('1.6.2', '1.6.2'))
+
+    def test_is_version_greater_equal_less(self):
+        self.assertFalse(utils.is_version_greater_equal('1.6.0', '1.6.2'))
 
 
 class TestDelayedStringRenderer(base.BaseTestCase):
@@ -663,3 +361,580 @@ class TestDelayedStringRenderer(base.BaseTestCase):
         LOG.logger.setLevel(logging.logging.DEBUG)
         LOG.debug("Hello %s", delayed)
         self.assertTrue(my_func.called)
+
+
+class TestPortRuleMasking(base.BaseTestCase):
+    def test_port_rule_wrong_input(self):
+        with testtools.ExpectedException(ValueError):
+            utils.port_rule_masking(12, 5)
+
+    def compare_port_ranges_results(self, port_min, port_max):
+        observed = utils.port_rule_masking(port_min, port_max)
+        expected = _port_rule_masking(port_min, port_max)
+        self.assertCountEqual(expected, observed)
+
+    def test_port_rule_masking_random_ranges(self):
+        # calling randint a bunch of times is really slow
+        randports = sorted(random.sample(range(1, 65536), 2000))
+        port_max = 0
+        for i in randports:
+            port_min = port_max
+            port_max = i
+            self.compare_port_ranges_results(port_min, port_max)
+
+    def test_port_rule_masking_edge_cases(self):
+        # (port_min, port_max) tuples
+        TESTING_DATA = [
+            (5, 12),
+            (20, 130),
+            (4501, 33057),
+            (0, 65535),
+            (22, 22),
+            (5001, 5001),
+            (0, 7),
+            (8, 15),
+            (1, 127),
+        ]
+        for port_min, port_max in TESTING_DATA:
+            self.compare_port_ranges_results(port_min, port_max)
+
+
+class TestExcDetails(base.BaseTestCase):
+
+    def test_attach_exc_details(self):
+        e = Exception()
+        utils.attach_exc_details(e, 'details')
+        self.assertEqual('details', utils.extract_exc_details(e))
+
+    def test_attach_exc_details_with_interpolation(self):
+        e = Exception()
+        utils.attach_exc_details(e, 'details: %s', 'foo')
+        self.assertEqual('details: foo', utils.extract_exc_details(e))
+
+    def test_attach_exc_details_with_None_interpolation(self):
+        e = Exception()
+        utils.attach_exc_details(e, 'details: %s', None)
+        self.assertEqual(
+            'details: %s' % str(None), utils.extract_exc_details(e))
+
+    def test_attach_exc_details_with_multiple_interpolation(self):
+        e = Exception()
+        utils.attach_exc_details(
+            e, 'details: %s, %s', ('foo', 'bar'))
+        self.assertEqual('details: foo, bar', utils.extract_exc_details(e))
+
+    def test_attach_exc_details_with_dict_interpolation(self):
+        e = Exception()
+        utils.attach_exc_details(
+            e, 'details: %(foo)s, %(bar)s', {'foo': 'foo', 'bar': 'bar'})
+        self.assertEqual('details: foo, bar', utils.extract_exc_details(e))
+
+    def test_extract_exc_details_no_details_attached(self):
+        self.assertIsInstance(
+            utils.extract_exc_details(Exception()), str)
+
+
+@ddt.ddt
+class ImportModulesRecursivelyTestCase(base.BaseTestCase):
+
+    @ddt.data('/', r'\\')
+    def test_recursion(self, separator):
+        expected_modules = (
+            'neutron.tests.unit.tests.example.dir.example_module',
+            'neutron.tests.unit.tests.example.dir.subdir.example_module',
+        )
+        for module in expected_modules:
+            sys.modules.pop(module, None)
+
+        topdir = re.sub(r'[/\\]+', separator, os.path.dirname(tests.__file__))
+        modules = utils.import_modules_recursively(topdir)
+        for module in expected_modules:
+            self.assertIn(module, modules)
+            self.assertIn(module, sys.modules)
+
+
+class TestThrottler(base.BaseTestCase):
+    def test_throttler(self):
+        threshold = 1
+        orig_function = mock.Mock()
+        # Add this magic name as it's required by functools
+        orig_function.__name__ = 'mock_func'
+        throttled_func = utils.throttler(threshold)(orig_function)
+
+        throttled_func()
+
+        sleep = utils.time.sleep
+
+        def sleep_mock(amount_to_sleep):
+            sleep(amount_to_sleep)
+            self.assertGreaterEqual(threshold, amount_to_sleep)
+
+        with mock.patch.object(utils.time, "sleep",
+                               side_effect=sleep_mock):
+            throttled_func()
+
+        self.assertEqual(2, orig_function.call_count)
+
+        lock_with_timer = throttled_func.__closure__[1].cell_contents
+        timestamp = lock_with_timer.timestamp - threshold
+        lock_with_timer.timestamp = timestamp
+
+        throttled_func()
+
+        self.assertEqual(3, orig_function.call_count)
+        self.assertLess(timestamp, lock_with_timer.timestamp)
+
+    def test_method_docstring_is_preserved(self):
+        class Klass:
+            @utils.throttler()
+            def method(self):
+                """Docstring"""
+
+        self.assertEqual("Docstring", Klass.method.__doc__)
+
+    def test_method_still_callable(self):
+        class Klass:
+            @utils.throttler()
+            def method(self):
+                pass
+
+        obj = Klass()
+        obj.method()
+
+
+class BaseUnitConversionTest:
+
+    def test_bytes_to_bits(self):
+        test_values = [
+            (0, 0),  # 0 bytes should be 0 bits
+            (1, 8)   # 1 byte should be 8 bits
+        ]
+        for input_bytes, expected_bits in test_values:
+            self.assertEqual(
+                expected_bits, utils.bytes_to_bits(input_bytes)
+            )
+
+
+class TestSIUnitConversions(BaseUnitConversionTest, base.BaseTestCase):
+
+    base_unit = constants.SI_BASE
+
+    def test_bits_to_kilobits(self):
+        test_values = [
+            (0, 0),  # 0 bites should be 0 kilobites
+            (1, 1),  # 1 bit should be 1 kilobit
+            (999, 1),  # 999 bits should be 1 kilobit
+            (1000, 1),  # 1000 bits should be 1 kilobit
+            (1001, 2)   # 1001 bits should be 2 kilobits
+        ]
+        for input_bits, expected_kilobits in test_values:
+            self.assertEqual(
+                expected_kilobits,
+                utils.bits_to_kilobits(input_bits, self.base_unit)
+            )
+
+
+class TestIECUnitConversions(BaseUnitConversionTest, base.BaseTestCase):
+
+    base_unit = constants.IEC_BASE
+
+    def test_bits_to_kilobits(self):
+        test_values = [
+            (0, 0),  # 0 bites should be 0 kilobites
+            (1, 1),  # 1 bit should be 1 kilobit
+            (1023, 1),  # 1023 bits should be 1 kilobit
+            (1024, 1),  # 1024 bits should be 1 kilobit
+            (1025, 2)   # 1025 bits should be 2 kilobits
+        ]
+        for input_bits, expected_kilobits in test_values:
+            self.assertEqual(
+                expected_kilobits,
+                utils.bits_to_kilobits(input_bits, self.base_unit)
+            )
+
+
+class TestRpBandwidthValidator(base.BaseTestCase):
+
+    def setUp(self):
+        super().setUp()
+        self.device_name_set = {'ens4', 'ens7'}
+        self.valid_rp_bandwidths = {
+            'ens7': {'egress': 10000, 'ingress': 10000}
+        }
+        self.not_valid_rp_bandwidth = {
+            'ens8': {'egress': 10000, 'ingress': 10000}
+        }
+
+    def test_validate_rp_bandwidth_with_device_names(self):
+        try:
+            utils.validate_rp_bandwidth(self.valid_rp_bandwidths,
+                                        self.device_name_set)
+        except ValueError:
+            self.fail("validate_rp_bandwidth failed to validate %s" %
+                      self.valid_rp_bandwidths)
+
+        self.assertRaises(ValueError, utils.validate_rp_bandwidth,
+                          self.not_valid_rp_bandwidth, self.device_name_set)
+
+
+class SpawnWithOrWithoutProfilerTestCase(base.BaseTestCase):
+
+    def _compare_profilers_in_parent_and_in_child(self, init_profiler):
+
+        q = queue.Queue()
+
+        def is_profiler_initialized(where):
+            # Instead of returning a single boolean add information so we can
+            # identify which thread produced the result without depending on
+            # queue order.
+            return {where: bool(profiler.get())}
+
+        def thread_with_no_leaked_profiler():
+            if init_profiler:
+                profiler.init(hmac_key='fake secret')
+
+            utils.spawn_n(lambda: q.put(is_profiler_initialized('in-child')))
+            q.put(is_profiler_initialized('in-parent'))
+
+        # Make sure in parent we start with an uninitialized profiler by
+        # spawning a new thread. Otherwise the unit test runner thread may
+        # leak an initialized profiler from one test to another.
+        _thread = threading.Thread(target=thread_with_no_leaked_profiler)
+        _thread.start()
+
+        # In order to have some global protection against leaking initialized
+        # profilers neutron.test.base.BaseTestCase.setup() also calls
+        # addCleanup(profiler.clean)
+
+        # Merge the results independently of queue order.
+        results = {}
+        results.update(q.get())
+        results.update(q.get())
+
+        self.assertEqual(
+            {'in-parent': init_profiler,
+             'in-child': init_profiler},
+            results)
+
+    def test_spawn_with_profiler(self):
+        self._compare_profilers_in_parent_and_in_child(init_profiler=True)
+
+    def test_spawn_without_profiler(self):
+        self._compare_profilers_in_parent_and_in_child(init_profiler=False)
+
+
+@utils.SingletonDecorator
+class _TestSingletonClass1:
+    def __init__(self, variable):
+        self.variable = variable
+
+
+@utils.SingletonDecorator
+class _TestSingletonClass2:
+    def __init__(self, variable):
+        self.variable = variable
+
+
+class SingletonDecoratorTestCase(base.BaseTestCase):
+    def setUp(self):
+        super().setUp()
+        self.instance_1 = self.instance_2 = None
+        self.addCleanup(self._destroy_instances)
+
+    def _destroy_instances(self):
+        try:
+            del self.instance_1
+        except AttributeError:
+            pass
+        try:
+            del self.instance_2
+        except AttributeError:
+            pass
+
+    def test_singleton_instance_class(self):
+        self.instance_1 = _TestSingletonClass1('value1')
+        self.instance_2 = _TestSingletonClass1('other_value_that_is_not_set')
+        self.assertIs(self.instance_1, self.instance_2)
+        self.assertEqual('value1', self.instance_2.variable)
+
+        # If one reference is deleted, the other variable (instance_2) is still
+        # referenced to the same object and the singleton decorator keeps it.
+        del self.instance_1
+        self.instance_1 = _TestSingletonClass1('again_value_that_is_not_set')
+        self.assertIs(self.instance_1, self.instance_2)
+        self.assertEqual('value1', self.instance_2.variable)
+
+    def test_singleton_several_independent_classes(self):
+        self.instance_1 = _TestSingletonClass1('value1')
+        self.instance_2 = _TestSingletonClass2('value2')
+        self.assertIsNot(self.instance_1, self.instance_2)
+        self.assertEqual('value1', self.instance_1.variable)
+        self.assertEqual('value2', self.instance_2.variable)
+
+    def test_singleton_instance_deletion(self):
+        self.instance_1 = _TestSingletonClass1('value1')
+        self.instance_2 = _TestSingletonClass2('value2')
+        self.assertIsNotNone(self.instance_1)
+        self.assertIsNotNone(self.instance_2)
+
+        # Delete instance 1, new value "value1_b" set in __init__()
+        del self.instance_1
+        self.instance_1 = _TestSingletonClass1('value1_b')
+        self.instance_2 = _TestSingletonClass2('value2_b')
+        self.assertIsNotNone(self.instance_1)
+        self.assertIsNotNone(self.instance_2)
+        self.assertEqual('value1_b', self.instance_1.variable)
+        self.assertEqual('value2', self.instance_2.variable)
+
+        # Delete instance 2, new value "value2_c" set in __init__()
+        del self.instance_2
+        self.instance_1 = _TestSingletonClass1('value1_c')
+        self.instance_2 = _TestSingletonClass2('value2_c')
+        self.assertIsNotNone(self.instance_1)
+        self.assertIsNotNone(self.instance_2)
+        self.assertEqual('value1_b', self.instance_1.variable)
+        self.assertEqual('value2_c', self.instance_2.variable)
+
+
+class DisableNotificationTestCase(base.BaseTestCase):
+
+    @utils.disable_notifications
+    def sample_method(self):
+        raise AttributeError()
+
+    def test_notification_rpc_workers_lt_one(self):
+        cfg.CONF.set_override('rpc_workers', 0)
+        self.assertIsNone(self.sample_method())
+
+    def test_notification_rpc_workers_none(self):
+        cfg.CONF.set_override('rpc_workers', None)
+        self.assertRaises(AttributeError, self.sample_method)
+
+    def test_notification_rpc_workers_one(self):
+        cfg.CONF.set_override('rpc_workers', 1)
+        self.assertRaises(AttributeError, self.sample_method)
+
+
+class SignatureTestCase(base.BaseTestCase):
+
+    def test_sign_instance_id(self):
+        conf = mock.Mock()
+        conf.metadata_proxy_shared_secret = 'secret'
+        self.assertEqual(
+            '773ba44693c7553d6ee20f61ea5d2757a9a4f4a44d2841ae4e95b52e4cd62db4',
+            utils.sign_instance_id(conf, 'foo')
+        )
+
+
+class ParsePermittedEthertypesTestCase(base.BaseTestCase):
+
+    @mock.patch.object(utils, 'LOG')
+    def test_parse_permitted_ethertypes(self, mock_log):
+        permitted_ethertypes = ['0x1234',
+                                '0x1234',
+                                '0x5678',
+                                '0XCAfe',
+                                '1112',
+                                '0x123R']
+        ret = utils.parse_permitted_ethertypes(permitted_ethertypes)
+        self.assertEqual({'0x1234', '0x5678', '0xcafe'}, ret)
+        calls = [mock.call('Custom ethertype %s is repeated', '0x1234'),
+                 mock.call('Custom ethertype %s is not a hexadecimal number.',
+                           '1112'),
+                 mock.call('Custom ethertype %s is not a hexadecimal number.',
+                           '0x123R'),
+                 ]
+        mock_log.warning.assert_has_calls(calls)
+
+
+class StringMapTestCase(base.BaseTestCase):
+    data = {'a': 1, 'b': None, 'c': 'hi'}
+
+    def test_stringmap(self):
+        expected = {'a': '1', 'b': '', 'c': 'hi'}
+
+        self.assertEqual(expected, utils.stringmap(self.data))
+
+    def test_stringmap_custom_default(self):
+        self.assertEqual('None', utils.stringmap(self.data, 'None')['b'])
+
+
+class ThreadPoolExecutorWithBlockTestCase(base.BaseTestCase):
+
+    def setUp(self):
+        super().setUp()
+        self._queue = queue.Queue()
+
+    def _check_values(self, expected_values):
+        # Retrieve all stored values
+        stored_values = []
+        while not self._queue.empty():
+            stored_values.append(self._queue.get())
+
+        for expected_value in expected_values:
+            self.assertIn(expected_value, stored_values)
+
+    def _add_tasks(self, tpool, num_tasks):
+        expected_values = []
+        for idx in range(num_tasks):
+            value1 = 'value1_%s' % idx
+            value2 = 'value2_%s' % idx
+            values = (value1, value2)
+            expected_values.append(values)
+            tpool.submit(self._task, self._queue, value1, value2=value2)
+        return expected_values
+
+    @staticmethod
+    def _task(_queue, value1, value2=None):
+        _queue.put((value1, value2))
+        time.sleep(1)
+
+    def test_simple_execution(self):
+        max_workers = 5
+        t1 = timeutils.utcnow()
+        with utils.ThreadPoolExecutorWithBlock(max_workers=max_workers) as \
+                tpool:
+            expected_values = self._add_tasks(tpool, max_workers * 3)
+
+        utils.wait_until_true(lambda: self._queue.qsize() == max_workers * 3,
+                              timeout=5, sleep=0.1)
+        t2 = timeutils.utcnow()
+        diff_seconds = (t2 - t1).total_seconds()
+        # NOTE(ralonsoh): we can't expect a 3 seconds sharp time gap, but at
+        # least the execution is contained in this interval. If each task takes
+        # 1 second, 5 threads can be executed in parallel and 15 workers are
+        # required, that will take at least 3 seconds and should complete in
+        # 6 seconds (2x).
+        self.assertTrue(3 < diff_seconds < 6)
+
+        self._check_values(expected_values)
+
+    def test_simple_execution_fast_exit(self):
+        max_workers = 5
+        t1 = timeutils.utcnow()
+        with utils.ThreadPoolExecutorWithBlock(max_workers=max_workers) as \
+                tpool:
+            expected_values = self._add_tasks(tpool, max_workers)
+            tpool.shutdown(wait=False)
+            self._add_tasks(tpool, max_workers)
+
+        utils.wait_until_true(lambda: self._queue.qsize() == max_workers,
+                              timeout=5, sleep=0.1)
+        t2 = timeutils.utcnow()
+        diff_seconds = (t2 - t1).total_seconds()
+        # Similar to above, execution will take at least 1 second and should
+        # complete in 2 seconds (2x).
+        self.assertTrue(1 < diff_seconds < 2)
+        self._check_values(expected_values)
+
+
+class TestFindUniqueSequence(base.BaseTestCase):
+    def test_empty_groups(self):
+        # Empty input should return empty list
+        result = utils.find_unique_sequence([])
+        self.assertEqual([], result)
+
+    def test_single_group_single_value(self):
+        # Single group with one value
+        result = utils.find_unique_sequence([['a']])
+        self.assertEqual(['a'], result)
+
+    def test_single_group_multiple_values(self):
+        # Single group with multiple values - returns first value
+        result = utils.find_unique_sequence([['a', 'b', 'c']])
+        self.assertEqual(['a'], result)
+
+    def test_multiple_groups_no_overlap(self):
+        # Multiple groups with distinct values - straightforward case
+        result = utils.find_unique_sequence([['a'], ['b'], ['c']])
+        self.assertEqual(['a', 'b', 'c'], result)
+
+    def test_multiple_groups_with_overlap_solvable(self):
+        # Groups with overlapping values but a solution exists
+        result = utils.find_unique_sequence(
+            [['a', 'b'], ['b', 'c'], ['c', 'a']])
+        self.assertEqual(['a', 'b', 'c'], result)
+
+    def test_backtracking_required(self):
+        # First choice in group 1 would conflict, requiring backtrack
+        # Group 0 picks 'a', group 1 must pick 'b' (not 'a'),
+        # group 2 must pick 'c'
+        result = utils.find_unique_sequence([['a'], ['a', 'b'], ['b', 'c']])
+        self.assertEqual(['a', 'b', 'c'], result)
+
+    def test_no_solution_all_same_value(self):
+        # All groups have only the same value - no valid sequence
+        result = utils.find_unique_sequence([['a'], ['a'], ['a']])
+        self.assertIsNone(result)
+
+    def test_no_solution_insufficient_unique_values(self):
+        # Not enough unique values across groups
+        result = utils.find_unique_sequence(
+            [['a', 'b'], ['a', 'b'], ['a', 'b']])
+        self.assertIsNone(result)
+
+    def test_complex_backtracking(self):
+        # Requires multiple levels of backtracking
+        # If we pick 'x' first, then 'y', we're stuck at group 2
+        # Need to backtrack and try different combinations
+        groups = [['x', 'a'], ['y', 'x', 'b'], ['x', 'y', 'c']]
+        result = utils.find_unique_sequence(groups)
+        # Verify result is valid: one per group, all unique
+        self.assertIsNotNone(result)
+        self.assertEqual(3, len(result))
+        self.assertEqual(3, len(set(result)))
+        for i, val in enumerate(result):
+            self.assertIn(val, groups[i])
+
+    def test_result_preserves_group_order(self):
+        # Result should have one element from each group in order
+        groups = [['1', '2'], ['3', '4'], ['5', '6']]
+        result = utils.find_unique_sequence(groups)
+        self.assertEqual(3, len(result))
+        self.assertIn(result[0], groups[0])
+        self.assertIn(result[1], groups[1])
+        self.assertIn(result[2], groups[2])
+
+    def test_partial_overlap(self):
+        # Some groups share values, but solution exists
+        groups = [['a', 'b', 'c'], ['b', 'c', 'd'], ['c', 'd', 'e']]
+        result = utils.find_unique_sequence(groups)
+        self.assertIsNotNone(result)
+        self.assertEqual(3, len(result))
+        self.assertEqual(3, len(set(result)))
+
+    def test_single_empty_group_in_list(self):
+        # One of the groups is empty - no solution possible
+        result = utils.find_unique_sequence([['a'], [], ['c']])
+        self.assertIsNone(result)
+
+
+class TestTimecost(base.BaseTestCase):
+    @staticmethod
+    def _call_id(message, args):
+        return re.match(r'Time-cost: call (\S+) ', message % args).group(1)
+
+    def test_call_id_per_call(self):
+        @utils.timecost
+        def decorated(value):
+            return value
+
+        with mock.patch.object(utils, 'LOG') as mock_log:
+            self.assertEqual(1, decorated(1))
+            self.assertEqual(2, decorated(2))
+
+        # LOG.debug(message, args) for the start of each call, and
+        # LOG.log(level, message, args) from time_it for the end.
+        start_ids = [self._call_id(*c.args)
+                     for c in mock_log.debug.call_args_list]
+        end_ids = [self._call_id(*c.args[1:])
+                   for c in mock_log.log.call_args_list]
+        self.assertEqual(2, len(set(start_ids)))
+        self.assertEqual(start_ids, end_ids)
+
+    def test_wraps(self):
+        @utils.timecost
+        def decorated():
+            pass
+
+        self.assertEqual('decorated', decorated.__name__)
